@@ -34,6 +34,7 @@ Read [README.md](README.md) for project goals and design.
 
 ## Repository Workflow
 
+- Before implementing a feature, use `$feature-interview`; save the plan in `plans/` and wait for explicit approval before coding.
 - Use `main` as the trunk. Do not create `dev` or `stage` branches.
 - Create short-lived `feature/*` and `fix/*` branches from up-to-date `main`; merge them back promptly and delete them after merging.
 - Tag verified commits on `main` as `vMAJOR.MINOR.PATCH`.
