@@ -55,7 +55,7 @@ Add signed and unsigned integer `div`/`rem` to the typed IR and Linux x86_64 bac
 3. **Add division operations to IR — complete.** Typed signed/unsigned `div` and `rem` are `invoke` operations with explicit normal and exceptional successors. This slice models only runtime-dependent zero; compile-time constants remain semantic analysis' responsibility.
 4. **Add x86_64 control-flow lowering — complete.** Emit conditional branches, jumps, `invoke` call normal continuations, and `phi` edge copies. Multi-block functions currently use stack locations so values remain correct across arbitrary CFG edges. A zero `branch` condition means false. Runtime exception propagation and division machine code are still pending; `resume` is currently an unreachable trap in this intermediate slice.
 5. **Emit unwind frame metadata — emission implemented.** Generate CFI for function prologues, epilogues, and return sites; add `.eh_frame` and its PC-relative relocations to ELF objects. `readelf` validates the CIE/FDE rules and relocations. Verify traversal through nested generated frames after runtime raising is wired in.
-6. **Implement the exception runtime core.** Add private heap exception records and suppressed-error ownership, stack-address capture, and `_Unwind_RaiseException` / `_Unwind_Resume` integration through the system `libgcc_s` unwinder.
+6. **Implement the exception runtime core — complete.** Add private heap exception records and suppressed-error ownership, stack-address capture, and `_Unwind_RaiseException` / `_Unwind_Resume` integration through the system `libgcc_s` unwinder.
 7. **Implement personality and LSDA.** Emit versioned Smalang call-site/action data in `.gcc_except_table`; add two-phase handler matching, landing pads, cleanup execution, catch dispatch, and replacement/suppressed exception behavior.
 8. **Lower runtime division and remainder.** Emit signed and unsigned quotient/remainder instructions, zero checks that raise `DivisionByZero`, and the `INT_MIN / -1` result rule. Test runtime divisors only; constant-zero rejection belongs to semantic analysis.
 9. **Add runtime entry and source-level traces.** Add the C runtime's process `main`, generated `__smalang_entry` catch-all wrapper, uncaught reporting, DWARF 5 line tables, minimal compile-unit metadata, and source/symbol resolution for captured PCs.
@@ -63,7 +63,7 @@ Add signed and unsigned integer `div`/`rem` to the typed IR and Linux x86_64 bac
 
 ### Current implementation checkpoint
 
-Steps 1–4 and `.eh_frame` object emission from step 5 are implemented in the feature worktree. Ordinary calls cannot yet produce runtime exceptions because no throwing machine operation is emitted; exception dispatch, suppression, LSDA, and actual unwinding remain subsequent steps. Do not treat the intermediate `resume` trap as the completed exception behavior.
+Steps 1–6 and `.eh_frame` object emission from step 5 are implemented in the feature worktree. The C runtime harness confirms that raising without a handler returns `_URC_END_OF_STACK` after preserving captured frames, and that suppressed records are owned and released as a chain. Generated-code landing pads, exception dispatch, LSDA/personality, and actual propagation through Smalang frames remain subsequent steps. Do not treat the intermediate `resume` trap as the completed exception behavior.
 
 ## Acceptance criteria
 
