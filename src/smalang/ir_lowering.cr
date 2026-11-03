@@ -70,6 +70,11 @@ module Smalang
       nil
     end
 
+    def source_location(span : SourceSpan) : IrSourceLocation
+      source_file = parsed_module.source_file
+      IrSourceLocation.new(source_file.name, source_file.position_at(span.start).line)
+    end
+
     def report(node_id : NodeId, description : String) : Nil
       report(parsed_module.arena.node(node_id).span, description)
     end
@@ -189,12 +194,14 @@ module Smalang
   class IrFunctionBodyPass < IrLoweringAstVisitor
     @parameter_values_by_symbol : Hash(SymbolId, ValueId)
     @current_function : IrFunction?
+    @current_block_id : BlockId?
     @expression_value_id : ValueId?
 
     def initialize(context : IrLoweringContext)
       super(context)
       @parameter_values_by_symbol = Hash(SymbolId, ValueId).new
       @current_function = nil
+      @current_block_id = nil
       @expression_value_id = nil
     end
 
@@ -254,7 +261,9 @@ module Smalang
       end
 
       @current_function = function
+      @current_block_id = function.entry_block_id
       visit_node(node.body)
+      @current_block_id = nil
       @current_function = nil
     end
 
@@ -268,7 +277,7 @@ module Smalang
         return
       end
 
-      function.emit_return(function.entry_block_id, value_id)
+      function.emit_return(current_block_id, value_id)
     end
 
     def visit(node : BinaryExpr) : Nil
@@ -290,9 +299,9 @@ module Smalang
 
       @expression_value_id = case node.operator
                              when BinaryOperator::Add
-                               function.emit_add(function.entry_block_id, type, left, right)
+                               function.emit_add(current_block_id, type, left, right)
                              when BinaryOperator::Subtract
-                               function.emit_subtract(function.entry_block_id, type, left, right)
+                               function.emit_subtract(current_block_id, type, left, right)
                              end
     end
 
@@ -323,18 +332,25 @@ module Smalang
         arguments << argument
       end
 
-      type_id = @context.type_of(current_node_id)
-      return unless type_id
-      type = @context.ir_type_for(type_id, node.span)
-      return unless type
-
       function = @current_function
       unless function
         @context.report(node.span, "call is not inside a function")
         return
       end
 
-      @expression_value_id = function.emit_call(function.entry_block_id, target, arguments, type)
+      normal_block = function.add_block("invoke_normal_#{function.block_count}")
+      unwind_block = function.add_block("invoke_unwind_#{function.block_count}")
+      result = function.emit_invoke_call(
+        current_block_id,
+        target,
+        arguments,
+        normal_block,
+        unwind_block,
+        @context.source_location(node.span)
+      )
+      function.emit_resume_exception(unwind_block, result.exception_id)
+      @current_block_id = normal_block
+      @expression_value_id = result.value_id
     end
 
     def visit(node : IdentifierExpr) : Nil
@@ -372,13 +388,17 @@ module Smalang
         return
       end
 
-      @expression_value_id = function.emit_constant(function.entry_block_id, type, value)
+      @expression_value_id = function.emit_constant(current_block_id, type, value)
     end
 
     private def lower_expression(node_id : NodeId) : ValueId?
       @expression_value_id = nil
       visit_node(node_id)
       @expression_value_id
+    end
+
+    private def current_block_id : BlockId
+      @current_block_id.not_nil!
     end
   end
 

@@ -21,8 +21,11 @@ describe Smalang::X86_64Backend do
     main_entry = main.entry_block_id
     argument = main.emit_constant(main_entry, Smalang::IrType::Isize, 41)
     target = ir.internal_call_target(increment.id).not_nil!
-    result = main.emit_call(main_entry, target, [argument], Smalang::IrType::Isize)
-    main.emit_return(main_entry, result)
+    normal = main.add_block("call_normal")
+    unwind = main.add_block("call_unwind")
+    result = main.emit_invoke_call(main_entry, target, [argument], normal, unwind)
+    main.emit_return(normal, result.value_id)
+    main.emit_resume_exception(unwind, result.exception_id)
 
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
@@ -49,6 +52,60 @@ describe Smalang::X86_64Backend do
     function.emit_return(entry, product)
 
     BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "emits conditional control flow and merges values through phi" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    left = function.add_block("left")
+    right = function.add_block("right")
+    join = function.add_block("join")
+    condition = function.emit_constant(entry, Smalang::IrType::Isize, 0)
+    function.emit_branch(entry, condition, left, right)
+    left_value = function.emit_constant(left, Smalang::IrType::Isize, 11)
+    function.emit_jump(left, join)
+    right_value = function.emit_constant(right, Smalang::IrType::Isize, 42)
+    function.emit_jump(right, join)
+    merged = function.emit_phi(join, Smalang::IrType::Isize, [
+      Smalang::IrPhiIncoming.new(left, left_value),
+      Smalang::IrPhiIncoming.new(right, right_value),
+    ])
+    function.emit_return(join, merged)
+
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "emits DWARF call frame information for generated functions" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    value = function.emit_constant(function.entry_block_id, Smalang::IrType::Isize, 42)
+    function.emit_return(function.entry_block_id, value)
+    object_path = File.join(Dir.tempdir, "smalang-eh-frame-#{Process.pid}.o")
+
+    begin
+      object_bytes = Smalang::X86_64Backend.new.emit(ir)
+      File.write(object_path, String.new(object_bytes.to_unsafe, object_bytes.size))
+      output = IO::Memory.new
+      error = IO::Memory.new
+      status = Process.run("readelf", ["--debug-dump=frames", object_path], output: output, error: error)
+
+      status.success?.should eq(true)
+      output.to_s.should contain("CIE")
+      output.to_s.should contain("FDE")
+      output.to_s.should contain("DW_CFA_def_cfa: r7 (rsp) ofs 8")
+      output.to_s.should contain("DW_CFA_def_cfa_register: r6 (rbp)")
+      output.to_s.should contain("DW_CFA_def_cfa_offset: 8")
+
+      relocation_output = IO::Memory.new
+      relocation_error = IO::Memory.new
+      relocation_status = Process.run("readelf", ["-r", object_path], output: relocation_output, error: relocation_error)
+      relocation_status.success?.should eq(true)
+      relocation_output.to_s.should contain(".rela.eh_frame")
+      relocation_output.to_s.should contain("R_X86_64_PC32")
+    ensure
+      File.delete(object_path) if File.exists?(object_path)
+    end
   end
 
   it "preserves the full 64-bit multiplication result" do
@@ -101,9 +158,12 @@ describe Smalang::X86_64Backend do
     live_value = main.emit_constant(entry, Smalang::IrType::Isize, 40)
     argument = main.emit_constant(entry, Smalang::IrType::Isize, 1)
     target = ir.internal_call_target(increment.id).not_nil!
-    call_result = main.emit_call(entry, target, [argument], Smalang::IrType::Isize)
-    result = main.emit_add(entry, Smalang::IrType::Isize, live_value, call_result)
-    main.emit_return(entry, result)
+    normal = main.add_block("call_normal")
+    unwind = main.add_block("call_unwind")
+    call_result = main.emit_invoke_call(entry, target, [argument], normal, unwind)
+    result = main.emit_add(normal, Smalang::IrType::Isize, live_value, call_result.value_id)
+    main.emit_return(normal, result)
+    main.emit_resume_exception(unwind, call_result.exception_id)
 
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
@@ -144,8 +204,11 @@ describe Smalang::X86_64Backend do
       main.emit_constant(main_entry, Smalang::IrType::Isize, value)
     end
     target = ir.internal_call_target(sum_function.id).not_nil!
-    sum = main.emit_call(main_entry, target, arguments, Smalang::IrType::Isize)
-    main.emit_return(main_entry, sum)
+    normal = main.add_block("call_normal")
+    unwind = main.add_block("call_unwind")
+    sum = main.emit_invoke_call(main_entry, target, arguments, normal, unwind)
+    main.emit_return(normal, sum.value_id)
+    main.emit_resume_exception(unwind, sum.exception_id)
 
     BackendSpecHelpers.link_and_run(ir).should eq(28)
   end
