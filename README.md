@@ -88,6 +88,8 @@ Typed IR перевіряється до передачі наступному �
 
 Backend генеруватиме ELF64 relocatable object files. Системний C compiler driver `cc` компонуватиме їх із C runtime та зовнішнім linker-ом. Усі функції smalang для Linux x86_64 використовуватимуть System V AMD64 calling convention. Для майбутнього FFI IR має залишатися придатним до опису типізованих зовнішніх викликів, а ABI-логіка належатиме backend-у.
 
+Перший backend-зріз прийматиме перевірений typed IR і сам формуватиме ELF64 relocatable object; він не генеруватиме assembly для зовнішнього assembler-а. Розподіл SSA-значень почнеться з linear scan: значення отримують регістр або spill slot, а значення, живі через виклик, тимчасово зберігаються у стеку. Backend також відповідатиме за System V AMD64 аргументи, повернення, вирівнювання стеку й relocations для внутрішніх викликів. AST-to-IR lowering і compiler CLI залишаються окремими кроками.
+
 ## Roadmap
 
 - Develop the compiler in separate features: lexer → parser + AST → typed IR → native backend.

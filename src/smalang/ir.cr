@@ -73,6 +73,7 @@ module Smalang
     abstract def symbol : String
     abstract def signature : IrFunctionSignature
     abstract def resolve_signature(ir_module : IrModule) : IrFunctionSignature?
+    abstract def module_function_id : FunctionId?
   end
 
   class InternalFunctionTarget < IrCallTarget
@@ -94,6 +95,18 @@ module Smalang
       return nil unless function.signature == @signature
       function.signature
     end
+
+    def module_function_id : FunctionId?
+      @function_id
+    end
+  end
+
+  abstract class IrInstructionVisitor
+    abstract def visit(instruction : IrConstantInstruction) : Nil
+    abstract def visit(instruction : IrAddInstruction) : Nil
+    abstract def visit(instruction : IrSubtractInstruction) : Nil
+    abstract def visit(instruction : IrCallInstruction) : Nil
+    abstract def visit(instruction : IrReturnInstruction) : Nil
   end
 
   abstract class IrInstruction
@@ -109,6 +122,7 @@ module Smalang
     abstract def expression : String
     abstract def terminator? : Bool
     abstract def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+    abstract def accept(visitor : IrInstructionVisitor) : Nil
   end
 
   class IrConstantInstruction < IrInstruction
@@ -128,6 +142,10 @@ module Smalang
 
     def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
       [] of String
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
     end
 
     def expression : String
@@ -174,12 +192,20 @@ module Smalang
   end
 
   class IrAddInstruction < IrBinaryInstruction
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+
     protected def operator_name : String
       "add"
     end
   end
 
   class IrSubtractInstruction < IrBinaryInstruction
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+
     protected def operator_name : String
       "sub"
     end
@@ -237,6 +263,10 @@ module Smalang
       call = (["call", @target.symbol] + operands).join(" ")
       "(%v#{@result_id.not_nil!} #{@result_type.not_nil!.label} (#{call}))"
     end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
   end
 
   class IrReturnInstruction < IrInstruction
@@ -264,6 +294,10 @@ module Smalang
 
     def expression : String
       "(return %v#{@value_id})"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
     end
   end
 
