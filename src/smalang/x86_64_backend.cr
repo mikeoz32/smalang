@@ -69,6 +69,12 @@ module Smalang
       write_u64((value.to_i128 & 0xffff_ffff_ffff_ffff_i128).to_u64)
     end
 
+    def overwrite_u32(offset : Int32, value : UInt32) : Nil
+      4.times do |index|
+        @bytes[offset + index] = ((value >> (index * 8)) & 0xff_u32).to_u8
+      end
+    end
+
     def write_bytes(values : Array(UInt8)) : Nil
       @bytes.concat(values)
     end
@@ -253,8 +259,15 @@ module Smalang
     getter result_id : ValueId
     getter function_id : FunctionId
     getter arguments : Array(ValueId)
+    getter normal_successor_label : Int32
 
-    def initialize(position : Int32, @result_id : ValueId, @function_id : FunctionId, arguments : Array(ValueId))
+    def initialize(
+      position : Int32,
+      @result_id : ValueId,
+      @function_id : FunctionId,
+      arguments : Array(ValueId),
+      @normal_successor_label : Int32,
+    )
       super(position)
       @arguments = arguments.dup
     end
@@ -277,6 +290,141 @@ module Smalang
 
     def emit(context : X86_64EmissionContext) : Nil
       context.emit_call(self)
+      context.code.jump_to(@normal_successor_label)
+    end
+  end
+
+  class MachineLabel < MachineInstruction
+    getter label : Int32
+
+    def initialize(position : Int32, @label : Int32)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [] of ValueId
+    end
+
+    def result_value_id : ValueId?
+      nil
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.code.mark_label(@label)
+    end
+  end
+
+  class MachinePhi < MachineInstruction
+    getter result_id : ValueId
+
+    def initialize(position : Int32, @result_id : ValueId)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [] of ValueId
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+    end
+  end
+
+  class MachineEdgeCopy < MachineInstruction
+    getter source_id : ValueId
+    getter destination_id : ValueId
+
+    def initialize(position : Int32, @source_id : ValueId, @destination_id : ValueId)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@source_id]
+    end
+
+    def result_value_id : ValueId?
+      nil
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.location(@source_id).load_to(context.code, X86_64Register::Rax, context.frame)
+      context.location(@destination_id).store_from(context.code, X86_64Register::Rax, context.frame)
+    end
+  end
+
+  class MachineJump < MachineInstruction
+    getter target_label : Int32
+
+    def initialize(position : Int32, @target_label : Int32)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [] of ValueId
+    end
+
+    def result_value_id : ValueId?
+      nil
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.code.jump_to(@target_label)
+    end
+  end
+
+  class MachineBranch < MachineInstruction
+    getter condition_id : ValueId
+    getter true_label : Int32
+    getter false_label : Int32
+
+    def initialize(position : Int32, @condition_id : ValueId, @true_label : Int32, @false_label : Int32)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@condition_id]
+    end
+
+    def result_value_id : ValueId?
+      nil
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.location(@condition_id).load_to(context.code, X86_64Register::Rax, context.frame)
+      context.code.test_register(X86_64Register::Rax)
+      context.code.jump_if_not_zero_to(@true_label)
+      context.code.jump_to(@false_label)
+    end
+  end
+
+  class MachineTrap < MachineInstruction
+    def initialize(position : Int32)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [] of ValueId
+    end
+
+    def result_value_id : ValueId?
+      nil
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.code.emit_trap
+    end
+  end
+
+  struct MachinePhiEdge
+    getter source_block_id : BlockId
+    getter target_block_id : BlockId
+    getter label : Int32
+    getter copies : Array(Tuple(ValueId, ValueId))
+
+    def initialize(@source_block_id : BlockId, @target_block_id : BlockId, @label : Int32, @copies : Array(Tuple(ValueId, ValueId)))
     end
   end
 
@@ -303,19 +451,40 @@ module Smalang
 
   class X86_64InstructionSelector < IrInstructionVisitor
     @instructions : Array(MachineInstruction)
+    @block_labels : Hash(BlockId, Int32)
+    @phi_edges : Hash(Tuple(BlockId, BlockId), MachinePhiEdge)
+    @phi_edge_order : Array(MachinePhiEdge)
 
     def initialize
       @instructions = [] of MachineInstruction
+      @block_labels = {} of BlockId => Int32
+      @phi_edges = {} of Tuple(BlockId, BlockId) => MachinePhiEdge
+      @phi_edge_order = [] of MachinePhiEdge
     end
 
     def lower(function : IrFunction) : Array(MachineInstruction)
       @instructions.clear
+      @block_labels.clear
+      @phi_edges.clear
+      @phi_edge_order.clear
+      function.each_block { |block| @block_labels[block.id] = block.id }
+      prepare_phi_edges(function)
+
       function.each_block do |block|
+        @instructions << MachineLabel.new(@instructions.size, @block_labels[block.id])
         block.instruction_ids.each do |instruction_id|
           instruction = function.instruction(instruction_id)
           raise X86_64BackendFailure.new("unknown IR instruction #{instruction_id}") unless instruction
           instruction.accept(self)
         end
+      end
+
+      @phi_edge_order.each do |edge|
+        @instructions << MachineLabel.new(@instructions.size, edge.label)
+        edge.copies.each do |source_id, destination_id|
+          @instructions << MachineEdgeCopy.new(@instructions.size, source_id, destination_id)
+        end
+        @instructions << MachineJump.new(@instructions.size, @block_labels[edge.target_block_id])
       end
       @instructions.dup
     end
@@ -339,22 +508,79 @@ module Smalang
       append_binary(instruction, MachineMultiplyOperation.new)
     end
 
-    def visit(instruction : IrCallInstruction) : Nil
-      result_id = instruction.result_id
-      function_id = instruction.target.module_function_id
-      raise X86_64BackendFailure.new("call target is not an internal function") unless function_id
-      raise X86_64BackendFailure.new("call is missing its result") unless result_id
-      @instructions << MachineCall.new(@instructions.size, result_id, function_id, instruction.arguments)
-    end
-
     def visit(instruction : IrReturnInstruction) : Nil
       @instructions << MachineReturn.new(@instructions.size, instruction.value_id)
+    end
+
+    def visit(instruction : IrPhiInstruction) : Nil
+      result_id = instruction.result_id
+      raise X86_64BackendFailure.new("phi is missing its result") unless result_id
+      @instructions << MachinePhi.new(@instructions.size, result_id)
+    end
+
+    def visit(instruction : IrJumpInstruction) : Nil
+      @instructions << MachineJump.new(@instructions.size, target_label(instruction.block_id, instruction.target_block_id))
+    end
+
+    def visit(instruction : IrBranchInstruction) : Nil
+      true_label = target_label(instruction.block_id, instruction.true_block_id)
+      false_label = target_label(instruction.block_id, instruction.false_block_id)
+      @instructions << MachineBranch.new(@instructions.size, instruction.condition_id, true_label, false_label)
+    end
+
+    def visit(instruction : IrInvokeInstruction) : Nil
+      operation = instruction.operation.as?(IrCallOperation)
+      raise X86_64BackendFailure.new("only call invokes are currently supported by code generation") unless operation
+      result_id = instruction.normal_result_id
+      function_id = operation.target.module_function_id
+      raise X86_64BackendFailure.new("call target is not an internal function") unless function_id
+      normal_label = target_label(instruction.block_id, instruction.normal_successor)
+      @instructions << MachineCall.new(@instructions.size, result_id, function_id, operation.arguments, normal_label)
+    end
+
+    def visit(instruction : IrResumeExceptionInstruction) : Nil
+      @instructions << MachineTrap.new(@instructions.size)
+    end
+
+    def visit(instruction : IrExceptionDispatchInstruction) : Nil
+      raise X86_64BackendFailure.new("exception dispatch code generation is not implemented")
+    end
+
+    def visit(instruction : IrSuppressExceptionInstruction) : Nil
+      raise X86_64BackendFailure.new("exception suppression code generation is not implemented")
     end
 
     private def append_binary(instruction : IrBinaryInstruction, operation : MachineBinaryOperation) : Nil
       result_id = instruction.result_id
       raise X86_64BackendFailure.new("binary operation is missing its result") unless result_id
       @instructions << MachineBinary.new(@instructions.size, result_id, instruction.left, instruction.right, operation)
+    end
+
+    private def prepare_phi_edges(function : IrFunction) : Nil
+      next_label = function.block_count
+      function.each_block do |block|
+        phi_instructions = block.instruction_ids.compact_map do |instruction_id|
+          function.instruction(instruction_id).as?(IrPhiInstruction)
+        end
+        next if phi_instructions.empty?
+
+        predecessors = phi_instructions.first.incoming.map(&.predecessor_block_id)
+        predecessors.each do |predecessor_id|
+          copies = phi_instructions.map do |phi|
+            incoming = phi.incoming.find { |candidate| candidate.predecessor_block_id == predecessor_id }
+            raise X86_64BackendFailure.new("phi is missing an incoming edge") unless incoming
+            {incoming.value_id, phi.result_id.not_nil!}
+          end
+          edge = MachinePhiEdge.new(predecessor_id, block.id, next_label, copies)
+          @phi_edges[{predecessor_id, block.id}] = edge
+          @phi_edge_order << edge
+          next_label += 1
+        end
+      end
+    end
+
+    private def target_label(source_block_id : BlockId, target_block_id : BlockId) : Int32
+      @phi_edges[{source_block_id, target_block_id}]?.try(&.label) || @block_labels[target_block_id]
     end
   end
 
@@ -413,6 +639,8 @@ module Smalang
     ]
 
     def allocate(function : IrFunction, instructions : Array(MachineInstruction)) : RegisterAllocation
+      return allocate_stack_only(function) if function.block_count > 1
+
       intervals = build_intervals(function, instructions)
       locations = {} of ValueId => ValueLocation
       active = [] of ActiveInterval
@@ -449,6 +677,14 @@ module Smalang
 
       call_spills = allocate_call_spills(intervals, instructions, locations, spill_slot_count)
       RegisterAllocation.new(locations, call_spills[:spills], call_spills[:slot_count])
+    end
+
+    private def allocate_stack_only(function : IrFunction) : RegisterAllocation
+      locations = {} of ValueId => ValueLocation
+      function.value_count.times do |value_id|
+        locations[value_id] = SpillValueLocation.new(value_id)
+      end
+      RegisterAllocation.new(locations, {} of Int32 => Array(CallSpill), function.value_count)
     end
 
     private def build_intervals(function : IrFunction, instructions : Array(MachineInstruction)) : Array(LiveInterval)
@@ -552,12 +788,25 @@ module Smalang
     end
   end
 
+  struct X86_64CfiEvent
+    getter code_offset : Int32
+    getter instructions : Array(UInt8)
+
+    def initialize(@code_offset : Int32, instructions : Array(UInt8))
+      @instructions = instructions.dup
+    end
+  end
+
   class X86_64CodeBuffer
     getter bytes : Array(UInt8)
+    getter cfi_events : Array(X86_64CfiEvent)
 
     def initialize
       @buffer = ByteBuffer.new
       @bytes = @buffer.bytes
+      @labels = {} of Int32 => Int32
+      @branch_fixups = [] of Tuple(Int32, Int32)
+      @cfi_events = [] of X86_64CfiEvent
     end
 
     def size : Int32
@@ -627,15 +876,22 @@ module Smalang
 
     def emit_prologue(frame_size : Int32) : Nil
       @buffer.write_u8(0x55_u8)
+      record_cfi_event([0x0e_u8, 16_u8, 0x86_u8, 2_u8])
       @buffer.write_bytes([0x48_u8, 0x89_u8, 0xe5_u8])
+      record_cfi_event([0x0d_u8, 6_u8])
       return if frame_size == 0
       @buffer.write_bytes([0x48_u8, 0x81_u8, 0xec_u8])
       @buffer.write_u32(frame_size.to_u32)
     end
 
     def emit_epilogue : Nil
+      record_cfi_event([0x0a_u8])
       @buffer.write_bytes([0x48_u8, 0x89_u8, 0xec_u8])
-      @buffer.write_bytes([0x5d_u8, 0xc3_u8])
+      record_cfi_event([0x0d_u8, 7_u8])
+      @buffer.write_u8(0x5d_u8)
+      record_cfi_event([0x0e_u8, 8_u8, 0xc6_u8])
+      @buffer.write_u8(0xc3_u8)
+      record_cfi_event([0x0b_u8])
     end
 
     def emit_call : Int32
@@ -643,6 +899,46 @@ module Smalang
       displacement_offset = @buffer.size
       @buffer.write_u32(0_u32)
       displacement_offset
+    end
+
+    def mark_label(label : Int32) : Nil
+      raise X86_64BackendFailure.new("machine label #{label} is defined more than once") if @labels.has_key?(label)
+      @labels[label] = @buffer.size
+    end
+
+    def jump_to(label : Int32) : Nil
+      @buffer.write_u8(0xe9_u8)
+      record_branch_fixup(label)
+    end
+
+    def jump_if_not_zero_to(label : Int32) : Nil
+      @buffer.write_bytes([0x0f_u8, 0x85_u8])
+      record_branch_fixup(label)
+    end
+
+    def test_register(register : X86_64Register) : Nil
+      write_rex(true, register, register)
+      @buffer.write_u8(0x85_u8)
+      write_modrm(0b11_u8, register, register)
+    end
+
+    def emit_trap : Nil
+      @buffer.write_bytes([0x0f_u8, 0x0b_u8])
+    end
+
+    def resolve_labels : Nil
+      @branch_fixups.each do |fixup|
+        displacement_offset, target_label = fixup
+        target_offset = @labels[target_label]?
+        raise X86_64BackendFailure.new("machine branch targets undefined label #{target_label}") unless target_offset
+        displacement = target_offset - (displacement_offset + 4)
+        unless Int32::MIN <= displacement <= Int32::MAX
+          raise X86_64BackendFailure.new("machine branch to label #{target_label} is out of range")
+        end
+        4.times do |index|
+          @bytes[displacement_offset + index] = ((displacement >> (index * 8)) & 0xff).to_u8
+        end
+      end
     end
 
     def align(alignment : Int32) : Nil
@@ -654,6 +950,16 @@ module Smalang
       write_rex(true, destination, base)
       @buffer.write_u8(0x8b_u8)
       write_memory_operand(destination, base, offset)
+    end
+
+    private def record_branch_fixup(label : Int32) : Nil
+      displacement_offset = @buffer.size
+      @buffer.write_u32(0_u32)
+      @branch_fixups << {displacement_offset, label}
+    end
+
+    private def record_cfi_event(instructions : Array(UInt8)) : Nil
+      @cfi_events << X86_64CfiEvent.new(@buffer.size, instructions)
     end
 
     private def write_memory_store(base : X86_64Register, offset : Int32, source : X86_64Register) : Nil
@@ -687,6 +993,14 @@ module Smalang
     getter function_id : FunctionId
 
     def initialize(@offset : Int32, @function_id : FunctionId)
+    end
+  end
+
+  struct X86_64EhFrameRelocation
+    getter offset : Int32
+    getter text_offset : Int32
+
+    def initialize(@offset : Int32, @text_offset : Int32)
     end
   end
 
@@ -784,8 +1098,15 @@ module Smalang
     getter function : IrFunction
     getter bytes : Array(UInt8)
     getter relocations : Array(X86_64Relocation)
+    getter cfi_events : Array(X86_64CfiEvent)
 
-    def initialize(@function : IrFunction, @bytes : Array(UInt8), @relocations : Array(X86_64Relocation))
+    def initialize(
+      @function : IrFunction,
+      @bytes : Array(UInt8),
+      @relocations : Array(X86_64Relocation),
+      cfi_events : Array(X86_64CfiEvent),
+    )
+      @cfi_events = cfi_events.dup
     end
   end
 
@@ -805,8 +1126,9 @@ module Smalang
       context = X86_64EmissionContext.new(code, frame, allocation)
       context.initialize_parameters(function)
       instructions.each(&.emit(context))
+      code.resolve_labels
 
-      EmittedFunction.new(function, code.bytes.dup, context.relocations.dup)
+      EmittedFunction.new(function, code.bytes.dup, context.relocations.dup, code.cfi_events)
     end
   end
 
@@ -824,6 +1146,83 @@ module Smalang
 
     def elf_name : String
       global? ? "main" : ".Lsmalang_fn_#{@function.id}"
+    end
+  end
+
+  struct X86_64EhFrameImage
+    getter bytes : Array(UInt8)
+    getter relocations : Array(X86_64EhFrameRelocation)
+
+    def initialize(@bytes : Array(UInt8), @relocations : Array(X86_64EhFrameRelocation))
+    end
+  end
+
+  class X86_64EhFrameWriter
+    def write(
+      functions : Array(ElfFunctionSymbol),
+      cfi_events_by_function : Hash(FunctionId, Array(X86_64CfiEvent)),
+    ) : X86_64EhFrameImage
+      section = ByteBuffer.new
+      append_cie(section)
+      relocations = [] of X86_64EhFrameRelocation
+      functions.each do |function|
+        events = cfi_events_by_function[function.function.id]? || [] of X86_64CfiEvent
+        append_fde(section, function, events, relocations)
+      end
+      X86_64EhFrameImage.new(section.bytes.dup, relocations)
+    end
+
+    private def append_cie(section : ByteBuffer) : Nil
+      cie = ByteBuffer.new
+      cie.write_u32(0_u32)
+      cie.write_u32(0_u32)
+      cie.write_u8(1_u8)
+      cie.write_bytes([0x7a_u8, 0x52_u8, 0_u8]) # zR
+      cie.write_u8(1_u8)                        # code alignment factor
+      cie.write_u8(0x78_u8)                     # data alignment factor: -8
+      cie.write_u8(16_u8)                       # return address register: RIP
+      cie.write_u8(1_u8)                        # augmentation data length
+      cie.write_u8(0x1b_u8)                     # DW_EH_PE_pcrel | DW_EH_PE_sdata4
+      cie.write_bytes([0x0c_u8, 0x07_u8, 0x08_u8, 0x90_u8, 0x01_u8])
+      cie.align(4)
+      cie.overwrite_u32(0, (cie.size - 4).to_u32)
+      section.write_bytes(cie.bytes)
+    end
+
+    private def append_fde(
+      section : ByteBuffer,
+      function : ElfFunctionSymbol,
+      events : Array(X86_64CfiEvent),
+      relocations : Array(X86_64EhFrameRelocation),
+    ) : Nil
+      fde_offset = section.size
+      fde = ByteBuffer.new
+      fde.write_u32(0_u32)
+      cie_pointer_field = fde_offset + fde.size
+      fde.write_u32(cie_pointer_field.to_u32)
+      initial_location_offset = fde_offset + fde.size
+      fde.write_u32(0_u32)
+      fde.write_u32(function.size.to_u32)
+      fde.write_u8(0_u8) # no FDE augmentation data
+      append_cfi_instructions(fde, events)
+      fde.align(4)
+      fde.overwrite_u32(0, (fde.size - 4).to_u32)
+      section.write_bytes(fde.bytes)
+      relocations << X86_64EhFrameRelocation.new(initial_location_offset, function.offset)
+    end
+
+    private def append_cfi_instructions(buffer : ByteBuffer, events : Array(X86_64CfiEvent)) : Nil
+      previous_offset = 0
+      events.each do |event|
+        delta = event.code_offset - previous_offset
+        raise X86_64BackendFailure.new("CFI events are not ordered by code offset") if delta < 0
+        if delta > 0
+          buffer.write_u8(0x04_u8) # DW_CFA_advance_loc4
+          buffer.write_u32(delta.to_u32)
+        end
+        buffer.write_bytes(event.instructions)
+        previous_offset = event.code_offset
+      end
     end
   end
 
@@ -923,17 +1322,40 @@ module Smalang
     STB_GLOBAL     =    1_u8
     STT_FUNC       =    2_u8
     STT_SECTION    =    3_u8
+    R_X86_64_PC32  =   2_u32
     R_X86_64_PLT32 =   4_u32
 
-    def write(text : Array(UInt8), functions : Array(ElfFunctionSymbol), relocations : Array(X86_64Relocation)) : Array(UInt8)
+    TEXT_SECTION_INDEX        = 1_u32
+    TEXT_SECTION_SYMBOL_INDEX = 1_u32
+    EH_FRAME_SECTION_INDEX    = 3_u32
+    SYMTAB_SECTION_INDEX      = 5_u32
+    STRTAB_SECTION_INDEX      = 6_u32
+    SHSTRTAB_SECTION_INDEX    = 7_u16
+
+    def write(
+      text : Array(UInt8),
+      functions : Array(ElfFunctionSymbol),
+      relocations : Array(X86_64Relocation),
+      eh_frame : Array(UInt8),
+      eh_frame_relocations : Array(X86_64EhFrameRelocation),
+    ) : Array(UInt8)
       ensure_unique_main(functions)
 
       string_table = ElfStringTable.new
       symbols, symbol_indices, first_global_symbol = build_symbols(functions, string_table)
       rela_bytes = encode_relocations(relocations, symbol_indices)
+      rela_eh_frame_bytes = encode_eh_frame_relocations(eh_frame_relocations)
       symbol_bytes = encode_symbols(symbols)
       section_names = ElfStringTable.new
-      section_headers, section_data = build_sections(text, rela_bytes, symbol_bytes, string_table.bytes, section_names)
+      section_headers, section_data = build_sections(
+        text,
+        rela_bytes,
+        eh_frame,
+        rela_eh_frame_bytes,
+        symbol_bytes,
+        string_table.bytes,
+        section_names
+      )
       write_object(section_headers, section_data, first_global_symbol)
     end
 
@@ -948,6 +1370,7 @@ module Smalang
     ) : Tuple(Array(ElfSymbolEntry), Hash(FunctionId, UInt32), UInt32)
       symbols = [ElfSymbolEntry.new(0_u32, 0_u8, 0_u16, 0_u64, 0_u64)]
       symbols << ElfSymbolEntry.new(0_u32, (STB_LOCAL << 4) | STT_SECTION, 1_u16, 0_u64, 0_u64)
+      symbols << ElfSymbolEntry.new(0_u32, (STB_LOCAL << 4) | STT_SECTION, EH_FRAME_SECTION_INDEX.to_u16, 0_u64, 0_u64)
       function_indices = {} of FunctionId => UInt32
       local_functions = functions.reject(&.global?)
       global_functions = functions.select(&.global?)
@@ -995,15 +1418,32 @@ module Smalang
       buffer.bytes
     end
 
+    private def encode_eh_frame_relocations(
+      relocations : Array(X86_64EhFrameRelocation),
+    ) : Array(UInt8)
+      buffer = ByteBuffer.new
+      relocations.each do |relocation|
+        info = (TEXT_SECTION_SYMBOL_INDEX.to_u64 << 32) | R_X86_64_PC32.to_u64
+        buffer.write_u64(relocation.offset.to_u64)
+        buffer.write_u64(info)
+        buffer.write_i64(relocation.text_offset.to_i64)
+      end
+      buffer.bytes
+    end
+
     private def build_sections(
       text : Array(UInt8),
-      rela : Array(UInt8),
+      rela_text : Array(UInt8),
+      eh_frame : Array(UInt8),
+      rela_eh_frame : Array(UInt8),
       symbols : Array(UInt8),
       strings : Array(UInt8),
       section_names : ElfStringTable,
     ) : Tuple(Array(ElfSectionHeader), Array(NamedTuple(name: String, bytes: Array(UInt8), alignment: Int32)))
       text_name = section_names.add(".text")
-      rela_name = section_names.add(".rela.text")
+      rela_text_name = section_names.add(".rela.text")
+      eh_frame_name = section_names.add(".eh_frame")
+      rela_eh_frame_name = section_names.add(".rela.eh_frame")
       symtab_name = section_names.add(".symtab")
       strtab_name = section_names.add(".strtab")
       shstrtab_name = section_names.add(".shstrtab")
@@ -1011,7 +1451,9 @@ module Smalang
 
       data = [
         {name: ".text", bytes: text, alignment: 16},
-        {name: ".rela.text", bytes: rela, alignment: 8},
+        {name: ".rela.text", bytes: rela_text, alignment: 8},
+        {name: ".eh_frame", bytes: eh_frame, alignment: 8},
+        {name: ".rela.eh_frame", bytes: rela_eh_frame, alignment: 8},
         {name: ".symtab", bytes: symbols, alignment: 8},
         {name: ".strtab", bytes: strings, alignment: 1},
         {name: ".shstrtab", bytes: section_names.bytes, alignment: 1},
@@ -1028,8 +1470,10 @@ module Smalang
       end
 
       headers << ElfSectionHeader.new(text_name, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, offsets[".text"], text.size.to_u64, 0_u32, 0_u32, 16_u64, 0_u64)
-      headers << ElfSectionHeader.new(rela_name, SHT_RELA, 0_u64, offsets[".rela.text"], rela.size.to_u64, 3_u32, 1_u32, 8_u64, 24_u64)
-      headers << ElfSectionHeader.new(symtab_name, SHT_SYMTAB, 0_u64, offsets[".symtab"], symbols.size.to_u64, 4_u32, 0_u32, 8_u64, 24_u64)
+      headers << ElfSectionHeader.new(rela_text_name, SHT_RELA, 0_u64, offsets[".rela.text"], rela_text.size.to_u64, SYMTAB_SECTION_INDEX, TEXT_SECTION_INDEX, 8_u64, 24_u64)
+      headers << ElfSectionHeader.new(eh_frame_name, SHT_PROGBITS, SHF_ALLOC, offsets[".eh_frame"], eh_frame.size.to_u64, 0_u32, 0_u32, 8_u64, 0_u64)
+      headers << ElfSectionHeader.new(rela_eh_frame_name, SHT_RELA, 0_u64, offsets[".rela.eh_frame"], rela_eh_frame.size.to_u64, SYMTAB_SECTION_INDEX, EH_FRAME_SECTION_INDEX, 8_u64, 24_u64)
+      headers << ElfSectionHeader.new(symtab_name, SHT_SYMTAB, 0_u64, offsets[".symtab"], symbols.size.to_u64, STRTAB_SECTION_INDEX, 0_u32, 8_u64, 24_u64)
       headers << ElfSectionHeader.new(strtab_name, SHT_STRTAB, 0_u64, offsets[".strtab"], strings.size.to_u64, 0_u32, 0_u32, 1_u64, 0_u64)
       headers << ElfSectionHeader.new(shstrtab_name, SHT_STRTAB, 0_u64, offsets[".shstrtab"], section_names.bytes.size.to_u64, 0_u32, 0_u32, 1_u64, 0_u64)
       headers << ElfSectionHeader.new(stack_name, SHT_PROGBITS, 0_u64, offsets[".note.GNU-stack"], 0_u64, 0_u32, 0_u32, 1_u64, 0_u64)
@@ -1051,12 +1495,12 @@ module Smalang
       buffer.align(8)
       section_header_offset = buffer.size
       headers.each_with_index do |header, index|
-        if index == 3
+        if index == SYMTAB_SECTION_INDEX
           header = ElfSectionHeader.new(header.name_offset, header.type, header.flags, header.offset, header.size, header.link, first_global_symbol, header.alignment, header.entry_size)
         end
         header.write_to(buffer)
       end
-      write_elf_header(buffer.bytes, section_header_offset.to_u64, headers.size.to_u16, 5_u16)
+      write_elf_header(buffer.bytes, section_header_offset.to_u64, headers.size.to_u16, SHSTRTAB_SECTION_INDEX)
     end
 
     private def write_elf_header(file_bytes : Array(UInt8), section_header_offset : UInt64, section_count : UInt16, section_name_index : UInt16) : Array(UInt8)
@@ -1097,18 +1541,21 @@ module Smalang
       text = ByteBuffer.new
       function_symbols = [] of ElfFunctionSymbol
       relocations = [] of X86_64Relocation
+      cfi_events_by_function = {} of FunctionId => Array(X86_64CfiEvent)
       ir_module.each_function do |function|
         text.align(16)
         text_offset = text.size
         emitted = X86_64FunctionEmitter.new.emit(function)
         text.write_bytes(emitted.bytes)
         function_symbols << ElfFunctionSymbol.new(function, text_offset, emitted.bytes.size)
+        cfi_events_by_function[function.id] = emitted.cfi_events
         emitted.relocations.each do |relocation|
           relocations << X86_64Relocation.new(text_offset + relocation.offset, relocation.function_id)
         end
       end
 
-      X86_64ElfObjectWriter.new.write(text.bytes, function_symbols, relocations)
+      eh_frame = X86_64EhFrameWriter.new.write(function_symbols, cfi_events_by_function)
+      X86_64ElfObjectWriter.new.write(text.bytes, function_symbols, relocations, eh_frame.bytes, eh_frame.relocations)
     end
   end
 end

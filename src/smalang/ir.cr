@@ -7,10 +7,15 @@ module Smalang
   enum IrType : UInt8
     Isize
     Usize
+    Exception
 
     def label : String
       to_s.downcase
     end
+  end
+
+  enum IrExceptionKind : UInt8
+    DivisionByZero
   end
 
   class IrBuildFailure < Exception
@@ -45,8 +50,68 @@ module Smalang
   struct IrValueInfo
     getter type : IrType
     getter defining_instruction_id : InstructionId?
+    getter defining_block_id : BlockId?
+    getter edge_source_block_id : BlockId?
 
-    def initialize(@type : IrType, @defining_instruction_id : InstructionId?)
+    def initialize(
+      @type : IrType,
+      @defining_instruction_id : InstructionId?,
+      @defining_block_id : BlockId? = nil,
+      @edge_source_block_id : BlockId? = nil,
+    )
+    end
+
+    def edge_defined? : Bool
+      !@edge_source_block_id.nil?
+    end
+  end
+
+  struct IrPhiIncoming
+    getter predecessor_block_id : BlockId
+    getter value_id : ValueId
+
+    def initialize(@predecessor_block_id : BlockId, @value_id : ValueId)
+    end
+  end
+
+  struct IrExceptionCase
+    getter kind : IrExceptionKind?
+    getter target_block_id : BlockId
+
+    def initialize(@kind : IrExceptionKind?, @target_block_id : BlockId)
+    end
+
+    def catch_all? : Bool
+      @kind.nil?
+    end
+  end
+
+  struct IrInvokeResults
+    getter value_id : ValueId
+    getter exception_id : ValueId
+
+    def initialize(@value_id : ValueId, @exception_id : ValueId)
+    end
+  end
+
+  struct IrValueDefinition
+    getter value_id : ValueId
+    getter type : IrType
+    getter defining_block_id : BlockId
+    getter instruction_index : Int32
+    getter edge_source_block_id : BlockId?
+
+    def initialize(
+      @value_id : ValueId,
+      @type : IrType,
+      @defining_block_id : BlockId,
+      @instruction_index : Int32,
+      @edge_source_block_id : BlockId? = nil,
+    )
+    end
+
+    def edge_defined? : Bool
+      !@edge_source_block_id.nil?
     end
   end
 
@@ -106,8 +171,14 @@ module Smalang
     abstract def visit(instruction : IrAddInstruction) : Nil
     abstract def visit(instruction : IrSubtractInstruction) : Nil
     abstract def visit(instruction : IrMultiplyInstruction) : Nil
-    abstract def visit(instruction : IrCallInstruction) : Nil
     abstract def visit(instruction : IrReturnInstruction) : Nil
+    abstract def visit(instruction : IrPhiInstruction) : Nil
+    abstract def visit(instruction : IrJumpInstruction) : Nil
+    abstract def visit(instruction : IrBranchInstruction) : Nil
+    abstract def visit(instruction : IrInvokeInstruction) : Nil
+    abstract def visit(instruction : IrResumeExceptionInstruction) : Nil
+    abstract def visit(instruction : IrExceptionDispatchInstruction) : Nil
+    abstract def visit(instruction : IrSuppressExceptionInstruction) : Nil
   end
 
   abstract class IrInstruction
@@ -124,6 +195,21 @@ module Smalang
     abstract def terminator? : Bool
     abstract def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
     abstract def accept(visitor : IrInstructionVisitor) : Nil
+
+    def successor_block_ids : Array(BlockId)
+      [] of BlockId
+    end
+
+    def value_definitions(instruction_index : Int32) : Array(IrValueDefinition)
+      value_id = @result_id
+      value_type = @result_type
+      return [] of IrValueDefinition unless value_id && value_type
+      [IrValueDefinition.new(value_id, value_type, @block_id, instruction_index)] of IrValueDefinition
+    end
+
+    def dump(function : IrFunction) : String
+      expression
+    end
   end
 
   class IrConstantInstruction < IrInstruction
@@ -142,7 +228,10 @@ module Smalang
     end
 
     def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
-      [] of String
+      type = @result_type
+      return [] of String unless type
+      return [] of String if type == IrType::Isize || type == IrType::Usize
+      [context.error("const result must have an integer type, got #{type.label}")]
     end
 
     def accept(visitor : IrInstructionVisitor) : Nil
@@ -175,6 +264,14 @@ module Smalang
       left_type = operand_types[0]?
       right_type = operand_types[1]?
       result_type = @result_type
+
+      [left_type, right_type, result_type].each do |type|
+        next unless type
+        unless type == IrType::Isize || type == IrType::Usize
+          errors << context.error("#{operator_name} requires integer operands and result, got #{type.label}")
+          break
+        end
+      end
 
       if left_type && right_type && left_type != right_type
         errors << context.error("#{operator_name} operands must have matching types")
@@ -222,64 +319,6 @@ module Smalang
     end
   end
 
-  class IrCallInstruction < IrInstruction
-    getter target : IrCallTarget
-
-    @arguments : Array(ValueId)
-
-    def initialize(id : InstructionId, block_id : BlockId, result_id : ValueId, result_type : IrType, @target : IrCallTarget, arguments : Array(ValueId))
-      super(id, block_id, result_id, result_type)
-      @arguments = arguments.dup
-    end
-
-    def arguments : Array(ValueId)
-      @arguments.dup
-    end
-
-    def used_values : Array(ValueId)
-      @arguments.dup
-    end
-
-    def terminator? : Bool
-      false
-    end
-
-    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
-      signature = @target.resolve_signature(context.ir_module)
-      return [context.error("call target #{@target.symbol} does not resolve to a matching function signature")] of String unless signature
-
-      errors = [] of String
-      if signature.parameter_types.size != @arguments.size
-        errors << context.error("call #{@target.symbol} expects #{signature.parameter_types.size} arguments, got #{@arguments.size}")
-      end
-
-      @arguments.each_with_index do |_, index|
-        expected_type = signature.parameter_types[index]?
-        actual_type = operand_types[index]?
-        next unless expected_type && actual_type
-        if actual_type != expected_type
-          errors << context.error("call argument #{index} has type #{actual_type.label}, expected #{expected_type.label}")
-        end
-      end
-
-      result_type = @result_type
-      if result_type && result_type != signature.result_type
-        errors << context.error("call result has type #{result_type.label}, expected #{signature.result_type.label}")
-      end
-      errors
-    end
-
-    def expression : String
-      operands = @arguments.map { |value_id| "%v#{value_id}" }
-      call = (["call", @target.symbol] + operands).join(" ")
-      "(%v#{@result_id.not_nil!} #{@result_type.not_nil!.label} (#{call}))"
-    end
-
-    def accept(visitor : IrInstructionVisitor) : Nil
-      visitor.visit(self)
-    end
-  end
-
   class IrReturnInstruction < IrInstruction
     getter value_id : ValueId
 
@@ -312,6 +351,471 @@ module Smalang
     end
   end
 
+  abstract class IrInvokeOperation
+    abstract def used_values : Array(ValueId)
+    abstract def result_type : IrType
+    abstract def expression : String
+    abstract def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+  end
+
+  class IrCallOperation < IrInvokeOperation
+    getter target : IrCallTarget
+
+    @arguments : Array(ValueId)
+
+    def initialize(@target : IrCallTarget, arguments : Array(ValueId))
+      @arguments = arguments.dup
+    end
+
+    def arguments : Array(ValueId)
+      @arguments.dup
+    end
+
+    def used_values : Array(ValueId)
+      @arguments.dup
+    end
+
+    def result_type : IrType
+      @target.signature.result_type
+    end
+
+    def expression : String
+      operands = @arguments.map { |value_id| "%v#{value_id}" }
+      call = (["call", @target.symbol] + operands).join(" ")
+      "(#{call})"
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      signature = @target.resolve_signature(context.ir_module)
+      return [context.error("call target #{@target.symbol} does not resolve to a matching function signature")] of String unless signature
+
+      errors = [] of String
+      if signature.parameter_types.size != @arguments.size
+        errors << context.error("call #{@target.symbol} expects #{signature.parameter_types.size} arguments, got #{@arguments.size}")
+      end
+
+      @arguments.each_with_index do |_, index|
+        expected_type = signature.parameter_types[index]?
+        actual_type = operand_types[index]?
+        next unless expected_type && actual_type
+        if actual_type != expected_type
+          errors << context.error("call argument #{index} has type #{actual_type.label}, expected #{expected_type.label}")
+        end
+      end
+      errors
+    end
+  end
+
+  abstract class IrIntegerBinaryInvokeOperation < IrInvokeOperation
+    getter left : ValueId
+    getter right : ValueId
+    getter type : IrType
+
+    def initialize(@type : IrType, @left : ValueId, @right : ValueId)
+    end
+
+    def used_values : Array(ValueId)
+      [@left, @right]
+    end
+
+    def result_type : IrType
+      @type
+    end
+
+    def expression : String
+      "(#{operator_name} %v#{@left} %v#{@right})"
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      unless @type == IrType::Isize || @type == IrType::Usize
+        errors << context.error("#{operator_name} result must have an integer type, got #{@type.label}")
+      end
+      left_type = operand_types[0]?
+      right_type = operand_types[1]?
+      if left_type && left_type != @type
+        errors << context.error("#{operator_name} left operand has type #{left_type.label}, expected #{@type.label}")
+      end
+      if right_type && right_type != @type
+        errors << context.error("#{operator_name} right operand has type #{right_type.label}, expected #{@type.label}")
+      end
+      errors
+    end
+
+    protected abstract def operator_name : String
+  end
+
+  class IrDivideOperation < IrIntegerBinaryInvokeOperation
+    def initialize(type : IrType, left : ValueId, right : ValueId)
+      super(type, left, right)
+    end
+
+    protected def operator_name : String
+      "div"
+    end
+  end
+
+  class IrRemainderOperation < IrIntegerBinaryInvokeOperation
+    def initialize(type : IrType, left : ValueId, right : ValueId)
+      super(type, left, right)
+    end
+
+    protected def operator_name : String
+      "rem"
+    end
+  end
+
+  class IrPhiInstruction < IrInstruction
+    @incoming : Array(IrPhiIncoming)
+
+    def initialize(id : InstructionId, block_id : BlockId, result_id : ValueId, result_type : IrType, incoming : Array(IrPhiIncoming))
+      super(id, block_id, result_id, result_type)
+      @incoming = incoming.dup
+    end
+
+    def incoming : Array(IrPhiIncoming)
+      @incoming.dup
+    end
+
+    def used_values : Array(ValueId)
+      @incoming.map(&.value_id)
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      expected_type = @result_type
+      @incoming.each_with_index do |_, index|
+        actual_type = operand_types[index]?
+        next unless expected_type && actual_type
+        if actual_type != expected_type
+          errors << context.error("phi incoming value has type #{actual_type.label}, expected #{expected_type.label}")
+        end
+      end
+      errors
+    end
+
+    def expression : String
+      inputs = @incoming.map do |input|
+        "[@#{input.predecessor_block_id} %v#{input.value_id}]"
+      end
+      "(%v#{@result_id.not_nil!} #{@result_type.not_nil!.label} (phi #{inputs.join(" ")}))"
+    end
+
+    def dump(function : IrFunction) : String
+      inputs = @incoming.map do |input|
+        "[@#{function.block_name(input.predecessor_block_id)} %v#{input.value_id}]"
+      end
+      "(%v#{@result_id.not_nil!} #{@result_type.not_nil!.label} (phi #{inputs.join(" ")}))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrJumpInstruction < IrInstruction
+    getter target_block_id : BlockId
+
+    def initialize(id : InstructionId, block_id : BlockId, @target_block_id : BlockId)
+      super(id, block_id, nil, nil)
+    end
+
+    def used_values : Array(ValueId)
+      [] of ValueId
+    end
+
+    def successor_block_ids : Array(BlockId)
+      [@target_block_id]
+    end
+
+    def terminator? : Bool
+      true
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      [] of String
+    end
+
+    def expression : String
+      "(jump @#{@target_block_id})"
+    end
+
+    def dump(function : IrFunction) : String
+      "(jump @#{function.block_name(@target_block_id)})"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrBranchInstruction < IrInstruction
+    getter condition_id : ValueId
+    getter true_block_id : BlockId
+    getter false_block_id : BlockId
+
+    def initialize(id : InstructionId, block_id : BlockId, @condition_id : ValueId, @true_block_id : BlockId, @false_block_id : BlockId)
+      super(id, block_id, nil, nil)
+    end
+
+    def used_values : Array(ValueId)
+      [@condition_id]
+    end
+
+    def successor_block_ids : Array(BlockId)
+      [@true_block_id, @false_block_id]
+    end
+
+    def terminator? : Bool
+      true
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      type = operand_types.first?
+      return [] of String unless type
+      return [] of String if type == IrType::Isize || type == IrType::Usize
+      [context.error("branch condition must be an integer, got #{type.label}")]
+    end
+
+    def expression : String
+      "(branch %v#{@condition_id} @#{@true_block_id} @#{@false_block_id})"
+    end
+
+    def dump(function : IrFunction) : String
+      "(branch %v#{@condition_id} @#{function.block_name(@true_block_id)} @#{function.block_name(@false_block_id)})"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrInvokeInstruction < IrInstruction
+    getter operation : IrInvokeOperation
+    getter normal_successor : BlockId
+    getter exception_successor : BlockId
+    getter normal_result_id : ValueId
+    getter exception_result_id : ValueId
+
+    def initialize(
+      id : InstructionId,
+      block_id : BlockId,
+      @operation : IrInvokeOperation,
+      @normal_successor : BlockId,
+      @exception_successor : BlockId,
+      @normal_result_id : ValueId,
+      @exception_result_id : ValueId,
+    )
+      super(id, block_id, nil, nil)
+    end
+
+    def used_values : Array(ValueId)
+      @operation.used_values
+    end
+
+    def successor_block_ids : Array(BlockId)
+      [@normal_successor, @exception_successor]
+    end
+
+    def value_definitions(instruction_index : Int32) : Array(IrValueDefinition)
+      [
+        IrValueDefinition.new(@normal_result_id, @operation.result_type, @normal_successor, -1, @block_id),
+        IrValueDefinition.new(@exception_result_id, IrType::Exception, @exception_successor, -1, @block_id),
+      ] of IrValueDefinition
+    end
+
+    def terminator? : Bool
+      true
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      @operation.validate(context, operand_types)
+    end
+
+    def expression : String
+      "(invoke #{@operation.expression} (normal @#{@normal_successor} %v#{@normal_result_id}) (exception @#{@exception_successor} %v#{@exception_result_id}))"
+    end
+
+    def dump(function : IrFunction) : String
+      "(invoke #{@operation.expression} (normal @#{function.block_name(@normal_successor)} %v#{@normal_result_id}) (exception @#{function.block_name(@exception_successor)} %v#{@exception_result_id}))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrResumeExceptionInstruction < IrInstruction
+    getter exception_id : ValueId
+
+    def initialize(id : InstructionId, block_id : BlockId, @exception_id : ValueId)
+      super(id, block_id, nil, nil)
+    end
+
+    def used_values : Array(ValueId)
+      [@exception_id]
+    end
+
+    def terminator? : Bool
+      true
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      type = operand_types.first?
+      return [] of String unless type
+      return [] of String if type == IrType::Exception
+      [context.error("resume requires an exception value, got #{type.label}")]
+    end
+
+    def expression : String
+      "(resume %v#{@exception_id})"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrExceptionDispatchInstruction < IrInstruction
+    getter exception_id : ValueId
+    getter default_block_id : BlockId?
+
+    @cases : Array(IrExceptionCase)
+
+    def initialize(
+      id : InstructionId,
+      block_id : BlockId,
+      @exception_id : ValueId,
+      cases : Array(IrExceptionCase),
+      @default_block_id : BlockId?,
+    )
+      super(id, block_id, nil, nil)
+      @cases = cases.dup
+    end
+
+    def cases : Array(IrExceptionCase)
+      @cases.dup
+    end
+
+    def used_values : Array(ValueId)
+      [@exception_id]
+    end
+
+    def successor_block_ids : Array(BlockId)
+      targets = @cases.map(&.target_block_id)
+      targets << @default_block_id.not_nil! if @default_block_id
+      targets
+    end
+
+    def terminator? : Bool
+      true
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      exception_type = operand_types.first?
+      if exception_type && exception_type != IrType::Exception
+        errors << context.error("exception dispatch requires an exception value, got #{exception_type.label}")
+      end
+
+      seen_kinds = {} of IrExceptionKind => Bool
+      has_catch_all = false
+      @cases.each_with_index do |exception_case, index|
+        if exception_case.catch_all?
+          if has_catch_all
+            errors << context.error("exception dispatch has more than one catch-all case")
+          end
+          if index != @cases.size - 1
+            errors << context.error("exception dispatch catch-all must be the final case")
+          end
+          has_catch_all = true
+        elsif kind = exception_case.kind
+          if seen_kinds.has_key?(kind)
+            errors << context.error("exception dispatch repeats kind #{kind}")
+          end
+          seen_kinds[kind] = true
+        end
+      end
+
+      if has_catch_all && @default_block_id
+        errors << context.error("exception dispatch cannot have a default after a catch-all case")
+      elsif !has_catch_all && !@default_block_id
+        errors << context.error("exception dispatch without catch-all requires a default successor")
+      end
+      errors
+    end
+
+    def expression : String
+      cases = @cases.map do |exception_case|
+        target = "@#{exception_case.target_block_id}"
+        if kind = exception_case.kind
+          "(kind #{kind} #{target})"
+        else
+          "(catch-all #{target})"
+        end
+      end
+      cases << "(default @#{@default_block_id.not_nil!})" if @default_block_id
+      "(exception-switch %v#{@exception_id} #{cases.join(" ")})"
+    end
+
+    def dump(function : IrFunction) : String
+      cases = @cases.map do |exception_case|
+        target = "@#{function.block_name(exception_case.target_block_id)}"
+        if kind = exception_case.kind
+          "(kind #{kind} #{target})"
+        else
+          "(catch-all #{target})"
+        end
+      end
+      cases << "(default @#{function.block_name(@default_block_id.not_nil!)})" if @default_block_id
+      "(exception-switch %v#{@exception_id} #{cases.join(" ")})"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrSuppressExceptionInstruction < IrInstruction
+    getter new_exception_id : ValueId
+    getter old_exception_id : ValueId
+
+    def initialize(id : InstructionId, block_id : BlockId, result_id : ValueId, @new_exception_id : ValueId, @old_exception_id : ValueId)
+      super(id, block_id, result_id, IrType::Exception)
+    end
+
+    def used_values : Array(ValueId)
+      [@new_exception_id, @old_exception_id]
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      operand_types.each_with_index do |type, index|
+        next unless type
+        next if type == IrType::Exception
+        label = index == 0 ? "new" : "old"
+        errors << context.error("suppress #{label} operand must be exception, got #{type.label}")
+      end
+      errors
+    end
+
+    def expression : String
+      "(%v#{@result_id.not_nil!} exception (suppress %v#{@new_exception_id} %v#{@old_exception_id}))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
   class IrFunction
     getter id : FunctionId
     getter name : String
@@ -331,7 +835,7 @@ module Smalang
       @blocks << IrBasicBlock.new(@entry_block_id, "entry")
       @signature.parameter_types.each do |type|
         value_id = @values.size
-        @values << IrValueInfo.new(type, nil)
+        @values << IrValueInfo.new(type, nil, @entry_block_id)
         @parameters << IrParameter.new(value_id, type)
       end
     end
@@ -355,6 +859,12 @@ module Smalang
       @blocks[block_id]?
     end
 
+    def block_name(block_id : BlockId) : String
+      basic_block = block(block_id)
+      raise IrBuildFailure.new("unknown block #{block_id} in function #{@name}") unless basic_block
+      basic_block.name
+    end
+
     def instruction(instruction_id : InstructionId) : IrInstruction?
       return nil if instruction_id < 0
       @instructions[instruction_id]?
@@ -370,6 +880,12 @@ module Smalang
 
     def block_count : Int32
       @blocks.size
+    end
+
+    def add_block(name : String) : BlockId
+      block_id = @blocks.size
+      @blocks << IrBasicBlock.new(block_id, name)
+      block_id
     end
 
     def emit_constant(block_id : BlockId, type : IrType, value : Int128) : ValueId
@@ -396,9 +912,76 @@ module Smalang
       end
     end
 
-    def emit_call(block_id : BlockId, target : IrCallTarget, arguments : Array(ValueId), result_type : IrType) : ValueId
-      append_result(block_id, result_type) do |instruction_id, result_id|
-        IrCallInstruction.new(instruction_id, block_id, result_id, result_type, target, arguments)
+    def emit_invoke_call(
+      block_id : BlockId,
+      target : IrCallTarget,
+      arguments : Array(ValueId),
+      normal_successor : BlockId,
+      exception_successor : BlockId,
+    ) : IrInvokeResults
+      append_invoke(block_id, IrCallOperation.new(target, arguments), normal_successor, exception_successor)
+    end
+
+    def emit_invoke_divide(
+      block_id : BlockId,
+      type : IrType,
+      left : ValueId,
+      right : ValueId,
+      normal_successor : BlockId,
+      exception_successor : BlockId,
+    ) : IrInvokeResults
+      append_invoke(block_id, IrDivideOperation.new(type, left, right), normal_successor, exception_successor)
+    end
+
+    def emit_invoke_remainder(
+      block_id : BlockId,
+      type : IrType,
+      left : ValueId,
+      right : ValueId,
+      normal_successor : BlockId,
+      exception_successor : BlockId,
+    ) : IrInvokeResults
+      append_invoke(block_id, IrRemainderOperation.new(type, left, right), normal_successor, exception_successor)
+    end
+
+    def emit_phi(block_id : BlockId, type : IrType, incoming : Array(IrPhiIncoming)) : ValueId
+      append_result(block_id, type) do |instruction_id, result_id|
+        IrPhiInstruction.new(instruction_id, block_id, result_id, type, incoming)
+      end
+    end
+
+    def emit_jump(block_id : BlockId, target_block_id : BlockId) : Nil
+      append_terminator(block_id) do |instruction_id|
+        IrJumpInstruction.new(instruction_id, block_id, target_block_id)
+      end
+    end
+
+    def emit_branch(block_id : BlockId, condition_id : ValueId, true_block_id : BlockId, false_block_id : BlockId) : Nil
+      append_terminator(block_id) do |instruction_id|
+        IrBranchInstruction.new(instruction_id, block_id, condition_id, true_block_id, false_block_id)
+      end
+    end
+
+    def emit_resume_exception(block_id : BlockId, exception_id : ValueId) : Nil
+      append_terminator(block_id) do |instruction_id|
+        IrResumeExceptionInstruction.new(instruction_id, block_id, exception_id)
+      end
+    end
+
+    def emit_exception_dispatch(
+      block_id : BlockId,
+      exception_id : ValueId,
+      cases : Array(IrExceptionCase),
+      default_block_id : BlockId? = nil,
+    ) : Nil
+      append_terminator(block_id) do |instruction_id|
+        IrExceptionDispatchInstruction.new(instruction_id, block_id, exception_id, cases, default_block_id)
+      end
+    end
+
+    def emit_suppress_exception(block_id : BlockId, new_exception_id : ValueId, old_exception_id : ValueId) : ValueId
+      append_result(block_id, IrType::Exception) do |instruction_id, result_id|
+        IrSuppressExceptionInstruction.new(instruction_id, block_id, result_id, new_exception_id, old_exception_id)
       end
     end
 
@@ -413,6 +996,10 @@ module Smalang
       @blocks.each(&block)
     end
 
+    def each_block_with_index(&block : IrBasicBlock, Int32 ->) : Nil
+      @blocks.each_with_index(&block)
+    end
+
     private def append_result(block_id : BlockId, type : IrType, &build : InstructionId, ValueId -> IrInstruction) : ValueId
       block = require_block(block_id)
       instruction_id = @instructions.size
@@ -420,9 +1007,49 @@ module Smalang
       instruction = build.call(instruction_id, result_id)
 
       @instructions << instruction
-      @values << IrValueInfo.new(type, instruction_id)
+      @values << IrValueInfo.new(type, instruction_id, block_id)
       block.append_instruction(instruction_id)
       result_id
+    end
+
+    private def append_invoke(
+      block_id : BlockId,
+      operation : IrInvokeOperation,
+      normal_successor : BlockId,
+      exception_successor : BlockId,
+    ) : IrInvokeResults
+      block = require_block(block_id)
+      require_block(normal_successor)
+      require_block(exception_successor)
+      if normal_successor == exception_successor
+        raise IrBuildFailure.new("invoke normal and exception successors must be different")
+      end
+
+      instruction_id = @instructions.size
+      normal_result_id = @values.size
+      exception_result_id = normal_result_id + 1
+      instruction = IrInvokeInstruction.new(
+        instruction_id,
+        block_id,
+        operation,
+        normal_successor,
+        exception_successor,
+        normal_result_id,
+        exception_result_id
+      )
+
+      @instructions << instruction
+      @values << IrValueInfo.new(operation.result_type, instruction_id, normal_successor, block_id)
+      @values << IrValueInfo.new(IrType::Exception, instruction_id, exception_successor, block_id)
+      block.append_instruction(instruction_id)
+      IrInvokeResults.new(normal_result_id, exception_result_id)
+    end
+
+    private def append_terminator(block_id : BlockId, &build : InstructionId -> IrInstruction) : Nil
+      block = require_block(block_id)
+      instruction_id = @instructions.size
+      @instructions << build.call(instruction_id)
+      block.append_instruction(instruction_id)
     end
 
     private def require_block(block_id : BlockId) : IrBasicBlock
@@ -500,10 +1127,14 @@ module Smalang
     private def verify_function(ir_module : IrModule, function : IrFunction) : Array(String)
       diagnostics = [] of String
       context = IrVerificationContext.new(ir_module, function)
-      available_types = {} of ValueId => IrType
+      definition_sites = {} of ValueId => IrValueDefinition
+      value_types = {} of ValueId => IrType
+      block_instructions = {} of BlockId => Array(IrInstruction)
+      predecessor_blocks = {} of BlockId => Array(BlockId)
+      seen_instruction_ids = {} of InstructionId => Bool
 
       function.parameters.each_with_index do |parameter, index|
-        if available_types.has_key?(parameter.value_id)
+        if definition_sites.has_key?(parameter.value_id)
           diagnostics << context.error("duplicate definition of %v#{parameter.value_id}")
           next
         end
@@ -515,6 +1146,12 @@ module Smalang
           if info.defining_instruction_id
             diagnostics << context.error("parameter %v#{parameter.value_id} has an instruction definition")
           end
+          if info.defining_block_id != function.entry_block_id
+            diagnostics << context.error("parameter %v#{parameter.value_id} is not defined in the entry block")
+          end
+          if info.edge_defined?
+            diagnostics << context.error("parameter %v#{parameter.value_id} cannot be edge-defined")
+          end
         else
           diagnostics << context.error("parameter %v#{parameter.value_id} has no value metadata")
         end
@@ -522,20 +1159,32 @@ module Smalang
         if parameter.value_id != index
           diagnostics << context.error("parameter #{index} has unexpected value id %v#{parameter.value_id}")
         end
-        available_types[parameter.value_id] = parameter.type
+        if parameter.type == IrType::Exception
+          diagnostics << context.error("function parameter #{index} cannot have exception type")
+        end
+        definition_sites[parameter.value_id] = IrValueDefinition.new(parameter.value_id, parameter.type, function.entry_block_id, -1)
+        value_types[parameter.value_id] = parameter.type
       end
 
-      if function.block_count != 1
-        diagnostics << context.error("must contain exactly one entry block in this IR subset")
+      if function.signature.result_type == IrType::Exception
+        diagnostics << context.error("function result cannot have exception type")
       end
 
       unless function.block(function.entry_block_id)
         diagnostics << context.error("entry block #{function.entry_block_id} does not exist")
       end
 
-      seen_instruction_ids = {} of InstructionId => Bool
-      saw_terminator = false
-      function.each_block do |basic_block|
+      function.each_block_with_index do |basic_block, expected_id|
+        if basic_block.id != expected_id
+          diagnostics << context.error("block #{basic_block.name} has id #{basic_block.id}, expected #{expected_id}")
+        end
+
+        instructions = [] of IrInstruction
+        block_instructions[basic_block.id] = instructions
+        predecessor_blocks[basic_block.id] = [] of BlockId
+        saw_non_phi = false
+        saw_terminator = false
+
         basic_block.instruction_ids.each_with_index do |instruction_id, index|
           if seen_instruction_ids.has_key?(instruction_id)
             diagnostics << context.error("instruction #{instruction_id} appears more than once")
@@ -548,6 +1197,7 @@ module Smalang
             diagnostics << context.error("instruction #{instruction_id} does not exist")
             next
           end
+          instructions << instruction
 
           if instruction.block_id != basic_block.id
             diagnostics << context.error("instruction #{instruction_id} belongs to block #{instruction.block_id}, not #{basic_block.id}")
@@ -555,60 +1205,254 @@ module Smalang
           if saw_terminator
             diagnostics << context.error("instruction #{instruction_id} appears after a terminator")
           end
-
-          operand_types = instruction.used_values.map do |value_id|
-            value_type = available_types[value_id]?
-            unless value_type
-              diagnostics << context.error("%v#{value_id} is not defined before use")
+          if instruction.is_a?(IrPhiInstruction)
+            if saw_non_phi
+              diagnostics << context.error("phi instruction #{instruction_id} must appear before non-phi instructions")
             end
-            value_type
-          end
-          diagnostics.concat(instruction.validate(context, operand_types))
-
-          if result_id = instruction.result_id
-            if result_type = instruction.result_type
-              if available_types.has_key?(result_id)
-                diagnostics << context.error("duplicate definition of %v#{result_id}")
-              else
-                if info = function.value_info(result_id)
-                  if info.type != result_type
-                    diagnostics << context.error("%v#{result_id} metadata has type #{info.type.label}, instruction defines #{result_type.label}")
-                  end
-                  if info.defining_instruction_id != instruction.id
-                    diagnostics << context.error("%v#{result_id} points to the wrong defining instruction")
-                  end
-                else
-                  diagnostics << context.error("%v#{result_id} has no value metadata")
-                end
-                available_types[result_id] = result_type
-              end
-            else
-              diagnostics << context.error("instruction #{instruction_id} defines %v#{result_id} without a result type")
-            end
-          elsif instruction.result_type
-            diagnostics << context.error("instruction #{instruction_id} has a result type without a result value")
+          else
+            saw_non_phi = true
           end
 
           if instruction.terminator?
             if index != basic_block.instruction_ids.size - 1
               diagnostics << context.error("terminator must be the final instruction in its block")
             end
+            if saw_terminator
+              diagnostics << context.error("block #{basic_block.name} has more than one terminator")
+            end
             saw_terminator = true
           end
+
+          successors = instruction.successor_block_ids
+          successors.each do |successor_id|
+            unless function.block(successor_id)
+              diagnostics << context.error("instruction #{instruction_id} targets unknown block #{successor_id}")
+            end
+          end
+
+          instruction.value_definitions(index).each do |definition|
+            if definition_sites.has_key?(definition.value_id)
+              diagnostics << context.error("duplicate definition of %v#{definition.value_id}")
+              next
+            end
+            unless info = function.value_info(definition.value_id)
+              diagnostics << context.error("%v#{definition.value_id} has no value metadata")
+              next
+            end
+            if info.type != definition.type
+              diagnostics << context.error("%v#{definition.value_id} metadata has type #{info.type.label}, instruction defines #{definition.type.label}")
+            end
+            if info.defining_instruction_id != instruction.id
+              diagnostics << context.error("%v#{definition.value_id} points to the wrong defining instruction")
+            end
+            if info.defining_block_id != definition.defining_block_id
+              diagnostics << context.error("%v#{definition.value_id} metadata points to the wrong defining block")
+            end
+            if info.edge_source_block_id != definition.edge_source_block_id
+              diagnostics << context.error("%v#{definition.value_id} metadata points to the wrong defining edge")
+            end
+            definition_sites[definition.value_id] = definition
+            value_types[definition.value_id] = definition.type
+          end
+        end
+
+        unless saw_terminator
+          diagnostics << context.error("block #{basic_block.name} must end with a terminator")
         end
       end
 
       if seen_instruction_ids.size != function.instruction_count
         diagnostics << context.error("some instructions are not attached to a block")
       end
-      unless saw_terminator
-        diagnostics << context.error("must end with return")
-      end
-      if available_types.size != function.value_count
+      if definition_sites.size != function.value_count
         diagnostics << context.error("contains unreferenced SSA value definitions")
       end
 
+      block_instructions.each do |block_id, instructions|
+        next if instructions.empty?
+        terminator = instructions.last
+        terminator.successor_block_ids.each do |successor_id|
+          next unless predecessor_blocks.has_key?(successor_id)
+          predecessor_blocks[successor_id] << block_id unless predecessor_blocks[successor_id].includes?(block_id)
+        end
+      end
+
+      reachable_blocks = find_reachable_blocks(function, block_instructions)
+      dominators = compute_dominators(function, predecessor_blocks, reachable_blocks)
+
+      block_instructions.each do |block_id, instructions|
+        instructions.each_with_index do |instruction, instruction_index|
+          operand_types = instruction.used_values.map do |value_id|
+            value_type = value_types[value_id]?
+            diagnostics << context.error("%v#{value_id} is not defined") unless value_type
+            value_type
+          end
+          diagnostics.concat(instruction.validate(context, operand_types))
+
+          if phi = instruction.as?(IrPhiInstruction)
+            verify_phi_inputs(context, phi, block_id, predecessor_blocks, definition_sites, value_types, dominators, block_instructions, diagnostics)
+          else
+            instruction.used_values.each do |value_id|
+              next unless definition_sites.has_key?(value_id)
+              unless value_available_at?(value_id, block_id, instruction_index, nil, predecessor_blocks, definition_sites, dominators)
+                diagnostics << context.error("%v#{value_id} does not dominate its use in block #{function.block_name(block_id)}")
+              end
+            end
+          end
+        end
+      end
+
       diagnostics
+    end
+
+    private def find_reachable_blocks(function : IrFunction, block_instructions : Hash(BlockId, Array(IrInstruction))) : Array(BlockId)
+      reachable = [function.entry_block_id]
+      index = 0
+      while index < reachable.size
+        block_id = reachable[index]
+        index += 1
+        instructions = block_instructions[block_id]?
+        next unless instructions && !instructions.empty?
+        instructions.last.successor_block_ids.each do |successor_id|
+          reachable << successor_id if function.block(successor_id) && !reachable.includes?(successor_id)
+        end
+      end
+      reachable
+    end
+
+    private def compute_dominators(
+      function : IrFunction,
+      predecessor_blocks : Hash(BlockId, Array(BlockId)),
+      reachable_blocks : Array(BlockId),
+    ) : Hash(BlockId, Array(BlockId))
+      dominators = {} of BlockId => Array(BlockId)
+      function.block_count.times do |block_id|
+        dominators[block_id] = if block_id == function.entry_block_id
+                                 [block_id]
+                               elsif reachable_blocks.includes?(block_id)
+                                 reachable_blocks.dup
+                               else
+                                 [block_id]
+                               end
+      end
+
+      changed = true
+      while changed
+        changed = false
+        reachable_blocks.each do |block_id|
+          next if block_id == function.entry_block_id
+          predecessors = predecessor_blocks[block_id]?.try(&.select { |predecessor| reachable_blocks.includes?(predecessor) }) || [] of BlockId
+          next if predecessors.empty?
+
+          new_dominators = dominators[predecessors.first].dup
+          predecessors.skip(1).each do |predecessor|
+            new_dominators.select! { |candidate| dominators[predecessor].includes?(candidate) }
+          end
+          new_dominators << block_id unless new_dominators.includes?(block_id)
+          if dominators[block_id] != new_dominators
+            dominators[block_id] = new_dominators
+            changed = true
+          end
+        end
+      end
+      dominators
+    end
+
+    private def verify_phi_inputs(
+      context : IrVerificationContext,
+      phi : IrPhiInstruction,
+      block_id : BlockId,
+      predecessor_blocks : Hash(BlockId, Array(BlockId)),
+      definition_sites : Hash(ValueId, IrValueDefinition),
+      value_types : Hash(ValueId, IrType),
+      dominators : Hash(BlockId, Array(BlockId)),
+      block_instructions : Hash(BlockId, Array(IrInstruction)),
+      diagnostics : Array(String),
+    ) : Nil
+      expected_predecessors = predecessor_blocks[block_id]? || [] of BlockId
+      actual_predecessors = [] of BlockId
+      phi.incoming.each do |incoming|
+        if actual_predecessors.includes?(incoming.predecessor_block_id)
+          diagnostics << context.error("phi repeats predecessor block #{function_block_name(context.function, incoming.predecessor_block_id)}")
+          next
+        end
+        actual_predecessors << incoming.predecessor_block_id
+        unless expected_predecessors.includes?(incoming.predecessor_block_id)
+          diagnostics << context.error("phi input block #{function_block_name(context.function, incoming.predecessor_block_id)} is not a predecessor")
+          next
+        end
+
+        site = definition_sites[incoming.value_id]?
+        unless site
+          diagnostics << context.error("phi input %v#{incoming.value_id} is not defined")
+          next
+        end
+        if type = value_types[incoming.value_id]?
+          phi_type = phi.result_type.not_nil!
+          if type != phi_type
+            diagnostics << context.error("phi input %v#{incoming.value_id} has type #{type.label}, expected #{phi_type.label}")
+          end
+        end
+        unless phi_value_available?(incoming.value_id, block_id, incoming.predecessor_block_id, predecessor_blocks, definition_sites, dominators, block_instructions)
+          diagnostics << context.error("phi input %v#{incoming.value_id} is not available on predecessor edge from #{function_block_name(context.function, incoming.predecessor_block_id)}")
+        end
+      end
+
+      unless actual_predecessors.sort == expected_predecessors.sort
+        diagnostics << context.error("phi inputs do not match the block predecessors")
+      end
+    end
+
+    private def phi_value_available?(
+      value_id : ValueId,
+      phi_block_id : BlockId,
+      predecessor_id : BlockId,
+      predecessor_blocks : Hash(BlockId, Array(BlockId)),
+      definition_sites : Hash(ValueId, IrValueDefinition),
+      dominators : Hash(BlockId, Array(BlockId)),
+      block_instructions : Hash(BlockId, Array(IrInstruction)),
+    ) : Bool
+      definition = definition_sites[value_id]?
+      return false unless definition
+      if definition.edge_defined? && definition.defining_block_id == phi_block_id && definition.edge_source_block_id == predecessor_id
+        return true
+      end
+
+      predecessor_instruction_count = block_instructions[predecessor_id]?.try(&.size) || 0
+      value_available_at?(value_id, predecessor_id, predecessor_instruction_count, nil, predecessor_blocks, definition_sites, dominators)
+    end
+
+    private def value_available_at?(
+      value_id : ValueId,
+      use_block_id : BlockId,
+      use_instruction_index : Int32,
+      phi_predecessor_id : BlockId?,
+      predecessor_blocks : Hash(BlockId, Array(BlockId)),
+      definition_sites : Hash(ValueId, IrValueDefinition),
+      dominators : Hash(BlockId, Array(BlockId)),
+    ) : Bool
+      definition = definition_sites[value_id]?
+      return false unless definition
+
+      if definition.edge_defined?
+        edge_source = definition.edge_source_block_id.not_nil!
+        if phi_predecessor_id == edge_source && definition.defining_block_id == use_block_id
+          return true
+        end
+
+        defining_predecessors = predecessor_blocks[definition.defining_block_id]?
+        return false unless defining_predecessors && defining_predecessors.size == 1 && defining_predecessors.first == edge_source
+      end
+
+      if definition.defining_block_id == use_block_id
+        return definition.instruction_index < use_instruction_index
+      end
+
+      dominators[use_block_id]?.try(&.includes?(definition.defining_block_id)) || false
+    end
+
+    private def function_block_name(function : IrFunction, block_id : BlockId) : String
+      function.block(block_id).try(&.name) || block_id.to_s
     end
   end
 
@@ -634,7 +1478,7 @@ module Smalang
         block.instruction_ids.each do |instruction_id|
           instruction = function.instruction(instruction_id)
           raise IrBuildFailure.new("unknown instruction #{instruction_id} in function #{function.name}") unless instruction
-          lines << "      #{instruction.expression}"
+          lines << "      #{instruction.dump(function)}"
         end
         lines << "    )"
       end

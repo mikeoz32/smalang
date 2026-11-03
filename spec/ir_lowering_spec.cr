@@ -24,8 +24,13 @@ module IrLoweringSpecHelpers
   end
 
   def self.instructions(function : Smalang::IrFunction) : Array(Smalang::IrInstruction)
-    block = function.block(function.entry_block_id).not_nil!
-    block.instruction_ids.map { |id| function.instruction(id).not_nil! }
+    instructions = [] of Smalang::IrInstruction
+    function.each_block do |block|
+      block.instruction_ids.each do |instruction_id|
+        instructions << function.instruction(instruction_id).not_nil!
+      end
+    end
+    instructions
   end
 end
 
@@ -66,13 +71,13 @@ describe Smalang::IrLowerer do
     odd = ir.function(1).not_nil!
     main = ir.function(2).not_nil!
 
-    even_call = IrLoweringSpecHelpers.instructions(even).find! { |instruction| instruction.is_a?(Smalang::IrCallInstruction) }.as(Smalang::IrCallInstruction)
-    odd_call = IrLoweringSpecHelpers.instructions(odd).find! { |instruction| instruction.is_a?(Smalang::IrCallInstruction) }.as(Smalang::IrCallInstruction)
-    main_call = IrLoweringSpecHelpers.instructions(main).find! { |instruction| instruction.is_a?(Smalang::IrCallInstruction) }.as(Smalang::IrCallInstruction)
+    even_call = IrLoweringSpecHelpers.instructions(even).find! { |instruction| instruction.is_a?(Smalang::IrInvokeInstruction) }.as(Smalang::IrInvokeInstruction)
+    odd_call = IrLoweringSpecHelpers.instructions(odd).find! { |instruction| instruction.is_a?(Smalang::IrInvokeInstruction) }.as(Smalang::IrInvokeInstruction)
+    main_call = IrLoweringSpecHelpers.instructions(main).find! { |instruction| instruction.is_a?(Smalang::IrInvokeInstruction) }.as(Smalang::IrInvokeInstruction)
 
-    even_call.target.module_function_id.should eq(odd.id)
-    odd_call.target.module_function_id.should eq(even.id)
-    main_call.target.module_function_id.should eq(even.id)
+    even_call.operation.as(Smalang::IrCallOperation).target.module_function_id.should eq(odd.id)
+    odd_call.operation.as(Smalang::IrCallOperation).target.module_function_id.should eq(even.id)
+    main_call.operation.as(Smalang::IrCallOperation).target.module_function_id.should eq(even.id)
     ir.verify.should be_empty
   end
 end
