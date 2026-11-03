@@ -8,18 +8,23 @@ module Smalang
   enum SemanticType : UInt8
     Int
     UInt
+    Bool
   end
 
   class SemanticTypeTable
     getter int_type_id : TypeId
     getter uint_type_id : TypeId
+    getter bool_type_id : TypeId
 
     @types : Array(SemanticType)
+    @integer_arithmetic_type_ids : Array(TypeId)
 
     def initialize
-      @types = [SemanticType::Int, SemanticType::UInt]
+      @types = [SemanticType::Int, SemanticType::UInt, SemanticType::Bool]
       @int_type_id = 0
       @uint_type_id = 1
+      @bool_type_id = 2
+      @integer_arithmetic_type_ids = [@int_type_id, @uint_type_id]
     end
 
     def id_for(source_type : AstType) : TypeId
@@ -28,6 +33,8 @@ module Smalang
         @int_type_id
       when AstType::UInt
         @uint_type_id
+      when AstType::Bool
+        @bool_type_id
       else
         raise ArgumentError.new("unsupported AST type #{source_type}")
       end
@@ -35,6 +42,10 @@ module Smalang
 
     def label(type_id : TypeId) : String
       @types[type_id].to_s.downcase
+    end
+
+    def supports_integer_arithmetic?(type_id : TypeId) : Bool
+      @integer_arithmetic_type_ids.includes?(type_id)
     end
   end
 
@@ -302,6 +313,9 @@ module Smalang
     def visit(node : IntegerLiteralExpr) : Nil
     end
 
+    def visit(node : BooleanLiteralExpr) : Nil
+    end
+
     def visit(node : ErrorNode) : Nil
       @context.report(node.span, "cannot analyze syntax with parse errors")
     end
@@ -398,6 +412,12 @@ module Smalang
         return
       end
 
+      unless @context.type_table.supports_integer_arithmetic?(left_type)
+        operator = node.operator == BinaryOperator::Add ? "+" : "-"
+        @context.report(node.span, "operator '#{operator}' requires integer operands")
+        return
+      end
+
       @context.set_type(current_node_id, left_type)
     end
 
@@ -447,6 +467,10 @@ module Smalang
 
     def visit(node : IntegerLiteralExpr) : Nil
       @context.set_type(current_node_id, @context.type_table.int_type_id)
+    end
+
+    def visit(node : BooleanLiteralExpr) : Nil
+      @context.set_type(current_node_id, @context.type_table.bool_type_id)
     end
 
     private def analyze_expression(node_id : NodeId) : TypeId?

@@ -134,6 +134,10 @@ module Smalang
     def visit(node : IntegerLiteralExpr) : Nil
     end
 
+    def visit(node : BooleanLiteralExpr) : Nil
+      @context.report(node.span, "boolean literals are not supported by IR lowering")
+    end
+
     def visit(node : ErrorNode) : Nil
       @context.report(node.span, "cannot lower syntax containing parse errors")
     end

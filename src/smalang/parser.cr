@@ -4,6 +4,7 @@ module Smalang
   enum AstType : UInt8
     Int
     UInt
+    Bool
   end
 
   enum BinaryOperator : UInt8
@@ -88,6 +89,14 @@ module Smalang
     end
   end
 
+  struct BooleanLiteralExpr
+    getter span : SourceSpan
+    getter value : Bool
+
+    def initialize(@span : SourceSpan, @value : Bool)
+    end
+  end
+
   struct ErrorNode
     getter span : SourceSpan
     getter recovered_node : NodeId?
@@ -96,7 +105,7 @@ module Smalang
     end
   end
 
-  alias AstNode = ModuleNode | FunctionNode | ParameterNode | ReturnNode | BinaryExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | ErrorNode
+  alias AstNode = ModuleNode | FunctionNode | ParameterNode | ReturnNode | BinaryExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
 
   abstract class AstVisitor
     abstract def visit(node : ModuleNode) : Nil
@@ -107,6 +116,7 @@ module Smalang
     abstract def visit(node : CallExpr) : Nil
     abstract def visit(node : IdentifierExpr) : Nil
     abstract def visit(node : IntegerLiteralExpr) : Nil
+    abstract def visit(node : BooleanLiteralExpr) : Nil
     abstract def visit(node : ErrorNode) : Nil
   end
 
@@ -153,6 +163,12 @@ module Smalang
   end
 
   struct IntegerLiteralExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct BooleanLiteralExpr
     def accept(visitor : AstVisitor) : Nil
       visitor.visit(self)
     end
@@ -372,8 +388,11 @@ module Smalang
       when TokenKind::UIntType
         advance
         AstType::UInt
+      when TokenKind::BoolType
+        advance
+        AstType::Bool
       else
-        fail("expected 'int' or 'uint' as a type")
+        fail("expected 'int', 'uint', or 'bool' as a type")
       end
     end
 
@@ -443,6 +462,12 @@ module Smalang
       when TokenKind::IntegerLiteral
         token = advance
         arena.add(IntegerLiteralExpr.new(token.span))
+      when TokenKind::TrueLiteral
+        token = advance
+        arena.add(BooleanLiteralExpr.new(token.span, true))
+      when TokenKind::FalseLiteral
+        token = advance
+        arena.add(BooleanLiteralExpr.new(token.span, false))
       when TokenKind::Identifier
         name = advance.span
         if current_token.kind == TokenKind::LeftParen

@@ -68,6 +68,65 @@ describe Smalang::SemanticAnalyzer do
     semantic.type_of(expression.left).should eq(semantic.type_table.uint_type_id)
   end
 
+  it "checks bool parameters, results, literals, and calls" do
+    result = SemanticSpecHelpers.analyze(
+      "def identity(value: bool) -> bool:\n    return value\n\ndef truth() -> bool:\n    return identity(true)\n\ndef falsehood() -> bool:\n    return identity(false)\n\ndef main() -> int:\n    return 0\n"
+    )
+
+    result.success?.should eq(true)
+    semantic = result.semantic_module.not_nil!
+    semantic.type_table.label(semantic.type_table.bool_type_id).should eq("bool")
+
+    parsed = semantic.parsed_module
+    module_node = parsed.arena.node(parsed.root_id).as(Smalang::ModuleNode)
+    identity_id = parsed.arena.child(module_node.functions, 0)
+    identity = parsed.arena.node(identity_id).as(Smalang::FunctionNode)
+    parameter_id = parsed.arena.child(identity.parameters, 0)
+    returned_parameter = parsed.arena.node(identity.body).as(Smalang::ReturnNode).value
+    semantic.type_of(returned_parameter).should eq(semantic.type_table.bool_type_id)
+    semantic.symbol_for(returned_parameter).should eq(semantic.symbol_for(parameter_id))
+
+    truth = parsed.arena.node(parsed.arena.child(module_node.functions, 1)).as(Smalang::FunctionNode)
+    truth_call_id = parsed.arena.node(truth.body).as(Smalang::ReturnNode).value
+    truth_call = parsed.arena.node(truth_call_id).as(Smalang::CallExpr)
+    true_literal_id = parsed.arena.child(truth_call.arguments, 0)
+    semantic.type_of(true_literal_id).should eq(semantic.type_table.bool_type_id)
+    semantic.type_of(truth_call_id).should eq(semantic.type_table.bool_type_id)
+
+    falsehood = parsed.arena.node(parsed.arena.child(module_node.functions, 2)).as(Smalang::FunctionNode)
+    false_call_id = parsed.arena.node(falsehood.body).as(Smalang::ReturnNode).value
+    false_call = parsed.arena.node(false_call_id).as(Smalang::CallExpr)
+    false_literal_id = parsed.arena.child(false_call.arguments, 0)
+    semantic.type_of(false_literal_id).should eq(semantic.type_table.bool_type_id)
+  end
+
+  it "rejects implicit conversions between bool and integer types" do
+    result = SemanticSpecHelpers.analyze(
+      "def identity(value: bool) -> bool:\n    return value\n\ndef main() -> int:\n    return identity(1)\n"
+    )
+
+    result.success?.should eq(false)
+    result.diagnostic.not_nil!.message.should contain("argument 0 has type int, expected bool")
+  end
+
+  it "rejects a bool return from an int function" do
+    result = SemanticSpecHelpers.analyze(
+      "def wrong() -> int:\n    return true\n\ndef main() -> int:\n    return 0\n"
+    )
+
+    result.success?.should eq(false)
+    result.diagnostic.not_nil!.message.should contain("return has type bool, expected int")
+  end
+
+  it "rejects arithmetic on bool values" do
+    result = SemanticSpecHelpers.analyze(
+      "def add(left: bool, right: bool) -> bool:\n    return left + right\n\ndef main() -> int:\n    return 0\n"
+    )
+
+    result.success?.should eq(false)
+    result.diagnostic.not_nil!.message.should contain("operator '+' requires integer operands")
+  end
+
   it "resolves forward and mutually recursive function calls" do
     source = "def is_even(value: int) -> int:\n    return is_odd(value)\n\ndef is_odd(value: int) -> int:\n    return is_even(value)\n\ndef main() -> int:\n    return is_even(0)\n"
     tokens = Smalang::Lexer.new.tokenize(source)

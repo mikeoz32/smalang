@@ -4,8 +4,11 @@ module Smalang
     Return
     IntType
     UIntType
+    BoolType
     Identifier
     IntegerLiteral
+    TrueLiteral
+    FalseLiteral
     Plus
     Minus
     LeftParen
@@ -265,6 +268,10 @@ module Smalang
         return TokenKind::IntType if matches_keyword?(start, "int")
       when 4
         return TokenKind::UIntType if matches_keyword?(start, "uint")
+        return TokenKind::BoolType if matches_keyword?(start, "bool")
+        return TokenKind::TrueLiteral if matches_keyword?(start, "true")
+      when 5
+        return TokenKind::FalseLiteral if matches_keyword?(start, "false")
       when 6
         return TokenKind::Return if matches_keyword?(start, "return")
       end
