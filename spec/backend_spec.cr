@@ -120,6 +120,89 @@ describe Smalang::X86_64Backend do
     BackendSpecHelpers.link_and_compare_full_width_result(ir, 8_589_934_593_u64).should eq(0)
   end
 
+  it "wraps signed runtime addition, subtraction, and multiplication at 64 bits" do
+    BackendSpecHelpers.link_binary_and_compare_full_width_result(
+      Smalang::IrType::Isize,
+      Int64::MAX,
+      1_i64,
+      0x8000_0000_0000_0000_u64
+    ) do |function, entry, left, right|
+      function.emit_add(entry, Smalang::IrType::Isize, left, right)
+    end.should eq(0)
+
+    BackendSpecHelpers.link_binary_and_compare_full_width_result(
+      Smalang::IrType::Isize,
+      Int64::MIN,
+      1_i64,
+      0x7fff_ffff_ffff_ffff_u64
+    ) do |function, entry, left, right|
+      function.emit_subtract(entry, Smalang::IrType::Isize, left, right)
+    end.should eq(0)
+
+    BackendSpecHelpers.link_binary_and_compare_full_width_result(
+      Smalang::IrType::Isize,
+      Int64::MAX,
+      2_i64,
+      0xffff_ffff_ffff_fffe_u64
+    ) do |function, entry, left, right|
+      function.emit_multiply(entry, Smalang::IrType::Isize, left, right)
+    end.should eq(0)
+  end
+
+  it "wraps unsigned runtime addition, subtraction, and multiplication at 64 bits" do
+    addition_ir = Smalang::IrModule.new
+    addition = addition_ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Usize)
+    entry = addition.entry_block_id
+    half = addition.emit_constant(entry, Smalang::IrType::Usize, 4_611_686_018_427_387_904_i64)
+    two = addition.emit_constant(entry, Smalang::IrType::Usize, 2)
+    two_to_63 = addition.emit_multiply(entry, Smalang::IrType::Usize, half, two)
+    wrapped_sum = addition.emit_add(entry, Smalang::IrType::Usize, two_to_63, two_to_63)
+    addition.emit_return(entry, wrapped_sum)
+    BackendSpecHelpers.link_and_compare_full_width_result(addition_ir, 0_u64).should eq(0)
+
+    BackendSpecHelpers.link_binary_and_compare_full_width_result(
+      Smalang::IrType::Usize,
+      0_i64,
+      1_i64,
+      UInt64::MAX
+    ) do |function, entry, left, right|
+      function.emit_subtract(entry, Smalang::IrType::Usize, left, right)
+    end.should eq(0)
+
+    BackendSpecHelpers.link_binary_and_compare_full_width_result(
+      Smalang::IrType::Usize,
+      Int64::MAX,
+      3_i64,
+      0x7fff_ffff_ffff_fffd_u64
+    ) do |function, entry, left, right|
+      function.emit_multiply(entry, Smalang::IrType::Usize, left, right)
+    end.should eq(0)
+  end
+
+  it "preserves signed overflow results under register pressure" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    values = [] of Smalang::ValueId
+    values << function.emit_constant(entry, Smalang::IrType::Isize, Int64::MAX)
+    values << function.emit_constant(entry, Smalang::IrType::Isize, 2)
+    (1..10).each do |value|
+      values << function.emit_constant(entry, Smalang::IrType::Isize, value)
+    end
+
+    product = function.emit_multiply(entry, Smalang::IrType::Isize, values[0], values[1])
+    retained_values = values[2, values.size - 2]
+    increased = retained_values.reduce(product) do |result, value|
+      function.emit_add(entry, Smalang::IrType::Isize, result, value)
+    end
+    restored = retained_values.reduce(increased) do |result, value|
+      function.emit_subtract(entry, Smalang::IrType::Isize, result, value)
+    end
+    function.emit_return(entry, restored)
+
+    BackendSpecHelpers.link_and_compare_full_width_result(ir, 0xffff_ffff_ffff_fffe_u64).should eq(0)
+  end
+
   it "multiplies a value spilled under register pressure" do
     ir = Smalang::IrModule.new
     function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)

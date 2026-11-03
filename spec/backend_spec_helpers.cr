@@ -65,4 +65,22 @@ module BackendSpecHelpers
       end
     end
   end
+
+  def self.link_binary_and_compare_full_width_result(
+    type : Smalang::IrType,
+    left_value : Int64,
+    right_value : Int64,
+    expected_result : UInt64,
+    &operation : Smalang::IrFunction, Smalang::BlockId, Smalang::ValueId, Smalang::ValueId -> Smalang::ValueId
+  ) : Int32
+    ir = Smalang::IrModule.new
+    function = ir.add_function("main", Array(Smalang::IrType).new, type)
+    entry = function.entry_block_id
+    left = function.emit_constant(entry, type, left_value)
+    right = function.emit_constant(entry, type, right_value)
+    result = operation.call(function, entry, left, right)
+    function.emit_return(entry, result)
+
+    link_and_compare_full_width_result(ir, expected_result)
+  end
 end

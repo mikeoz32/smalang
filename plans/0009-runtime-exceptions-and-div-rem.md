@@ -34,7 +34,6 @@ Add signed and unsigned `div`/`rem` to typed IR and Linux x86_64 code generation
 - Add user-defined exception types or foreign exception interoperability.
 - Add thread support; the initial compiler has no source threading feature and uses one process-level frame chain.
 - Add compile-time constant-expression validation to IR or backend; known zero divisors are rejected by semantic analysis.
-- Define overflow behavior for arithmetic other than `INT_MIN / -1`.
 
 ## Implementation steps
 
