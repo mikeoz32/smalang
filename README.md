@@ -49,7 +49,7 @@ def main() -> int:
 Потік компіляції:
 
 ```text
-код smalang → lexer → parser + AST → semantic analysis → typed IR → власний backend Linux x86_64 → нативний бінарник
+код smalang → lexer → parser + AST → semantic analysis → AST-to-IR lowering → typed IR → власний backend Linux x86_64 → нативний бінарник
 ```
 
 IR буде власним і не залежатиме від конкретної архітектури чи WebAssembly. Його зручно читати у WAT-подібній формі S-expression, але це буде лише запозичення текстового стилю: команди й семантика IR належатимуть smalang. WAT сам по собі є текстовим поданням саме WebAssembly, а не універсальним IR ([специфікація](https://webassembly.github.io/spec/core/text/conventions.html)).
@@ -88,7 +88,7 @@ Typed IR перевіряється до передачі наступному �
 
 Backend генеруватиме ELF64 relocatable object files. Системний C compiler driver `cc` компонуватиме їх із C runtime та зовнішнім linker-ом. Усі функції smalang для Linux x86_64 використовуватимуть System V AMD64 calling convention. Для майбутнього FFI IR має залишатися придатним до опису типізованих зовнішніх викликів, а ABI-логіка належатиме backend-у.
 
-Перший backend-зріз прийматиме перевірений typed IR і сам формуватиме ELF64 relocatable object; він не генеруватиме assembly для зовнішнього assembler-а. Розподіл SSA-значень почнеться з linear scan: значення отримують регістр або spill slot, а значення, живі через виклик, тимчасово зберігаються у стеку. Backend також відповідатиме за System V AMD64 аргументи, повернення, вирівнювання стеку й relocations для внутрішніх викликів. AST-to-IR lowering і compiler CLI залишаються окремими кроками.
+Перший backend-зріз прийматиме перевірений typed IR і сам формуватиме ELF64 relocatable object; він не генеруватиме assembly для зовнішнього assembler-а. Розподіл SSA-значень почнеться з linear scan: значення отримують регістр або spill slot, а значення, живі через виклик, тимчасово зберігаються у стеку. Backend також відповідатиме за System V AMD64 аргументи, повернення, вирівнювання стеку й relocations для внутрішніх викликів. AST-to-IR lowering є окремим проходом; compiler CLI залишається окремою майбутньою фічею.
 
 ## Roadmap
 
