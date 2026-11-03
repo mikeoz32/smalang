@@ -39,6 +39,46 @@ describe Smalang::X86_64Backend do
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
 
+  it "emits 64-bit multiplication" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    six = function.emit_constant(entry, Smalang::IrType::Isize, 6)
+    seven = function.emit_constant(entry, Smalang::IrType::Isize, 7)
+    product = function.emit_multiply(entry, Smalang::IrType::Isize, six, seven)
+    function.emit_return(entry, product)
+
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "preserves the full 64-bit multiplication result" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    left = function.emit_constant(entry, Smalang::IrType::Isize, 4_294_967_297_i64)
+    right = function.emit_constant(entry, Smalang::IrType::Isize, 4_294_967_297_i64)
+    product = function.emit_multiply(entry, Smalang::IrType::Isize, left, right)
+    function.emit_return(entry, product)
+
+    BackendSpecHelpers.link_and_compare_full_width_result(ir, 8_589_934_593_u64).should eq(0)
+  end
+
+  it "multiplies a value spilled under register pressure" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    values = (1..10).map do |value|
+      function.emit_constant(entry, Smalang::IrType::Isize, value)
+    end
+    product = function.emit_multiply(entry, Smalang::IrType::Isize, values.first, values.last)
+    result = values.reduce(product) do |sum, value|
+      function.emit_add(entry, Smalang::IrType::Isize, sum, value)
+    end
+    function.emit_return(entry, result)
+
+    BackendSpecHelpers.link_and_run(ir).should eq(65)
+  end
+
   it "preserves signed 64-bit constants" do
     ir = Smalang::IrModule.new
     function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)

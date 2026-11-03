@@ -204,6 +204,16 @@ module Smalang
     end
   end
 
+  class MachineMultiplyOperation < MachineBinaryOperation
+    def apply_to_register(code : X86_64CodeBuffer, destination : X86_64Register, source : X86_64Register) : Nil
+      code.multiply_register(destination, source)
+    end
+
+    def apply_to_spill(code : X86_64CodeBuffer, destination : X86_64Register, offset : Int32) : Nil
+      code.multiply_rbp_memory(destination, offset)
+    end
+  end
+
   class MachineBinary < MachineInstruction
     getter result_id : ValueId
     getter left_id : ValueId
@@ -323,6 +333,10 @@ module Smalang
 
     def visit(instruction : IrSubtractInstruction) : Nil
       append_binary(instruction, MachineSubtractOperation.new)
+    end
+
+    def visit(instruction : IrMultiplyInstruction) : Nil
+      append_binary(instruction, MachineMultiplyOperation.new)
     end
 
     def visit(instruction : IrCallInstruction) : Nil
@@ -596,6 +610,18 @@ module Smalang
     def subtract_rbp_memory(destination : X86_64Register, offset : Int32) : Nil
       write_rex(true, destination, X86_64Register::Rbp)
       @buffer.write_u8(0x2b_u8)
+      write_memory_operand(destination, X86_64Register::Rbp, offset)
+    end
+
+    def multiply_register(destination : X86_64Register, source : X86_64Register) : Nil
+      write_rex(true, destination, source)
+      @buffer.write_bytes([0x0f_u8, 0xaf_u8])
+      write_modrm(0b11_u8, destination, source)
+    end
+
+    def multiply_rbp_memory(destination : X86_64Register, offset : Int32) : Nil
+      write_rex(true, destination, X86_64Register::Rbp)
+      @buffer.write_bytes([0x0f_u8, 0xaf_u8])
       write_memory_operand(destination, X86_64Register::Rbp, offset)
     end
 

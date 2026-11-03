@@ -105,6 +105,7 @@ module Smalang
     abstract def visit(instruction : IrConstantInstruction) : Nil
     abstract def visit(instruction : IrAddInstruction) : Nil
     abstract def visit(instruction : IrSubtractInstruction) : Nil
+    abstract def visit(instruction : IrMultiplyInstruction) : Nil
     abstract def visit(instruction : IrCallInstruction) : Nil
     abstract def visit(instruction : IrReturnInstruction) : Nil
   end
@@ -208,6 +209,16 @@ module Smalang
 
     protected def operator_name : String
       "sub"
+    end
+  end
+
+  class IrMultiplyInstruction < IrBinaryInstruction
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+
+    protected def operator_name : String
+      "mul"
     end
   end
 
@@ -376,6 +387,12 @@ module Smalang
     def emit_subtract(block_id : BlockId, type : IrType, left : ValueId, right : ValueId) : ValueId
       append_result(block_id, type) do |instruction_id, result_id|
         IrSubtractInstruction.new(instruction_id, block_id, result_id, type, left, right)
+      end
+    end
+
+    def emit_multiply(block_id : BlockId, type : IrType, left : ValueId, right : ValueId) : ValueId
+      append_result(block_id, type) do |instruction_id, result_id|
+        IrMultiplyInstruction.new(instruction_id, block_id, result_id, type, left, right)
       end
     end
 

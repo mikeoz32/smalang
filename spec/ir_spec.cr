@@ -34,6 +34,30 @@ describe Smalang::IrModule do
     ir.verify.should be_empty
   end
 
+  it "represents multiplication as a typed SSA operation" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("multiply", [Smalang::IrType::Isize, Smalang::IrType::Isize], Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    left = function.parameters[0].value_id
+    right = function.parameters[1].value_id
+    product = function.emit_multiply(entry, Smalang::IrType::Isize, left, right)
+    function.emit_return(entry, product)
+
+    Smalang::IrSExpressionDumper.new.dump(ir).should contain("(%v2 isize (mul %v0 %v1))")
+    ir.verify.should be_empty
+
+    unsigned_function = ir.add_function("multiply_unsigned", [Smalang::IrType::Usize, Smalang::IrType::Usize], Smalang::IrType::Usize)
+    unsigned_product = unsigned_function.emit_multiply(
+      unsigned_function.entry_block_id,
+      Smalang::IrType::Usize,
+      unsigned_function.parameters[0].value_id,
+      unsigned_function.parameters[1].value_id
+    )
+    unsigned_function.emit_return(unsigned_function.entry_block_id, unsigned_product)
+    Smalang::IrSExpressionDumper.new.dump(ir).should contain("(%v2 usize (mul %v0 %v1))")
+    ir.verify.should be_empty
+  end
+
   it "reports operand type mismatches and uses that are not defined earlier" do
     ir = Smalang::IrModule.new
     function = ir.add_function("broken", Array(Smalang::IrType).new, Smalang::IrType::Isize)
@@ -41,11 +65,15 @@ describe Smalang::IrModule do
     signed = function.emit_constant(entry, Smalang::IrType::Isize, 1)
     unsigned = function.emit_constant(entry, Smalang::IrType::Usize, 2)
     function.emit_add(entry, Smalang::IrType::Isize, signed, unsigned)
+    function.emit_multiply(entry, Smalang::IrType::Isize, signed, unsigned)
+    function.emit_multiply(entry, Smalang::IrType::Isize, unsigned, unsigned)
     undefined_sum = function.emit_add(entry, Smalang::IrType::Isize, 99, signed)
     function.emit_return(entry, undefined_sum)
 
     diagnostics = ir.verify.join("\n")
     diagnostics.should contain("add operands must have matching types")
+    diagnostics.should contain("mul operands must have matching types")
+    diagnostics.should contain("mul result has type isize, expected usize")
     diagnostics.should contain("%v99 is not defined before use")
   end
 
