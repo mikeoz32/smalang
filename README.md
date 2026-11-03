@@ -97,6 +97,8 @@ IR і backend працюють із перевіреним IR. Відоме пі
 
 Початкова модель генерує винятки лише з runtime-перевірок; явного користувацького `raise` і нових мовних enum/class/struct для винятків немає. Види помилок є внутрішніми мітками runtime; IR може зіставляти їх за видом або приймати будь-який виняток. Потенційно виняткова операція, зокрема кожен виклик функції в першій версії, завершує блок через `invoke` із звичайним та винятковим наступниками. Обробник отримує непрозоре SSA-значення винятку; злиття значень задаються явними `phi`. Cleanup-блоки є частиною моделі IR. Якщо cleanup породжує новий виняток під час розкручування, він стає активним, а попередній зберігається як suppressed error.
 
+Переповнення runtime-операцій `add`, `sub` і `mul` визначене для обох цілочисельних типів. Для `uint` результат обчислюється modulo `2^n`, де `n` — ширина типу. Для `int` зберігаються молодші `n` біт результату, які інтерпретуються як знакове число у двійковому доповняльному коді. Переповнення не породжує виняток; для Linux x86_64 ширина обох типів дорівнює 64 біти.
+
 Винятки поширюються через приватний ABI згенерованих функцій: `RAX` повертає звичайне значення, `RDX` — exception pointer або нуль. `invoke` перевіряє `RDX` і переходить до звичайного чи виняткового наступника; `resume` повертає exception caller-у. IR явно передає ownership винятку через `phi`, dispatch і suppression; спійманий виняток звільняється через `exception.release`.
 
 Backend генерує власні runtime-функції та ланцюг кадрів. Під час створення винятку runtime копіює до 64 кадрів із назвами функцій і source locations. Непійманий виняток друкується через Linux `write`; пам'ять exception records виділяється та звільняється через `mmap`/`munmap`. `_start` викликає `__smalang_user_main` і завершує процес через syscall `exit`. Згенерований об'єкт не потребує C runtime, libc, `libgcc_s` чи LLVM `libunwind`; `.eh_frame` і DWARF залишаються для звичайних налагоджувачів. Виняткова модель, IR і backend не додають синтаксис `try/catch` чи `finally` до мови.
@@ -114,4 +116,3 @@ Backend приймає перевірений typed IR і сам формує EL
 ## Roadmap
 
 - Develop the compiler in separate features: lexer → parser + AST → semantic analysis → typed IR → native backend.
-- Define and implement explicit overflow semantics for `int` and `uint`. The initial compiler slice does not guarantee behavior for overflowing arithmetic.
