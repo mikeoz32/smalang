@@ -16,6 +16,12 @@ Read [README.md](README.md) for project goals and design.
 - Use polymorphism instead of type- or variant-based conditional dispatch. Keep simple value mappings conditional.
 - Prefer instance methods. Use static methods only when they cannot benefit from instance state or polymorphism.
 
+## Context Management
+
+- Keep the primary agent's context as compact as possible. Delegate context-heavy investigations and independent or parallelizable subtasks to subagents when available.
+- Ask subagents to return concise findings, decisions, and changed-file references. Keep detailed exploration in their contexts; bring only the facts needed to continue into the primary context.
+- Do not delegate trivial work or tightly coupled steps when delegation would add more overhead than context it saves.
+
 ## Compilation
 
 - Resolve at compile time everything whose inputs are known then. Defer only runtime-dependent work.
