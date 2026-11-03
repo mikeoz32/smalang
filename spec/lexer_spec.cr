@@ -118,6 +118,21 @@ describe Smalang::Lexer do
     ])
   end
 
+  it "recognizes bool types and boolean literals without splitting similar identifiers" do
+    stream = Smalang::Lexer.new.tokenize(
+      "def booleanish(boolish: bool) -> bool:\n    return true\n\ndef falsehood() -> bool:\n    return false\n"
+    )
+
+    stream.tokens.map(&.kind).should contain(Smalang::TokenKind::BoolType)
+    stream.tokens.map(&.kind).should contain(Smalang::TokenKind::TrueLiteral)
+    stream.tokens.map(&.kind).should contain(Smalang::TokenKind::FalseLiteral)
+
+    identifiers = stream.tokens.select { |token| token.kind == Smalang::TokenKind::Identifier }
+    identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("booleanish")
+    identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("boolish")
+    identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("falsehood")
+  end
+
   it "ignores blank lines, accepts CRLF, and inserts the final newline" do
     stream = Smalang::Lexer.new.tokenize(
       "\r\n    \r\ndef main() -> int:\r\n    return 1"

@@ -54,6 +54,10 @@ class ParserSpecVisitor < Smalang::AstVisitor
     @visited << :integer
   end
 
+  def visit(node : Smalang::BooleanLiteralExpr) : Nil
+    @visited << :boolean
+  end
+
   def visit(node : Smalang::ErrorNode) : Nil
     @visited << :error
   end
@@ -119,6 +123,24 @@ describe Smalang::Parser do
     left.type.should eq(Smalang::AstType::UInt)
     parsed.source_file.slice(right.name).should eq("right")
     right.type.should eq(Smalang::AstType::Int)
+  end
+
+  it "parses bool annotations and boolean literals into the AST" do
+    result = ParserSpecHelpers.parse(
+      "def identity(value: bool) -> bool:\n    return value\n\ndef truth() -> bool:\n    return true\n\ndef main() -> int:\n    return 0\n"
+    )
+    result.diagnostics.should be_empty
+
+    parsed = result.parsed_module
+    identity = ParserSpecHelpers.function_at(parsed, 0)
+    identity.return_type.should eq(Smalang::AstType::Bool)
+    parameter = parsed.arena.node(parsed.arena.child(identity.parameters, 0)).as(Smalang::ParameterNode)
+    parameter.type.should eq(Smalang::AstType::Bool)
+
+    truth = ParserSpecHelpers.function_at(parsed, 1)
+    returned = parsed.arena.node(truth.body).as(Smalang::ReturnNode)
+    literal = parsed.arena.node(returned.value).as(Smalang::BooleanLiteralExpr)
+    parsed.source_file.slice(literal.span).should eq("true")
   end
 
   it "builds nested calls and left-associative arithmetic expressions" do
