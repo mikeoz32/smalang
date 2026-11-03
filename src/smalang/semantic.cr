@@ -23,7 +23,14 @@ module Smalang
     end
 
     def id_for(source_type : AstType) : TypeId
-      source_type == AstType::Int ? @int_type_id : @uint_type_id
+      case source_type
+      when AstType::Int
+        @int_type_id
+      when AstType::UInt
+        @uint_type_id
+      else
+        raise ArgumentError.new("unsupported AST type #{source_type}")
+      end
     end
 
     def label(type_id : TypeId) : String
