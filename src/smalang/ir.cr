@@ -18,6 +18,18 @@ module Smalang
     DivisionByZero
   end
 
+  struct IrSourceLocation
+    getter file : String
+    getter line : Int32
+
+    def initialize(@file : String, @line : Int32)
+    end
+
+    def dump : String
+      "(at #{@file.inspect} #{@line})"
+    end
+  end
+
   class IrBuildFailure < Exception
   end
 
@@ -166,7 +178,13 @@ module Smalang
     end
   end
 
-  abstract class IrInstructionVisitor
+  abstract class IrInvokeOperationVisitor
+    abstract def visit(operation : IrCallOperation, instruction : IrInvokeInstruction) : Nil
+    abstract def visit(operation : IrDivideOperation, instruction : IrInvokeInstruction) : Nil
+    abstract def visit(operation : IrRemainderOperation, instruction : IrInvokeInstruction) : Nil
+  end
+
+  abstract class IrInstructionVisitor < IrInvokeOperationVisitor
     abstract def visit(instruction : IrConstantInstruction) : Nil
     abstract def visit(instruction : IrAddInstruction) : Nil
     abstract def visit(instruction : IrSubtractInstruction) : Nil
@@ -179,6 +197,7 @@ module Smalang
     abstract def visit(instruction : IrResumeExceptionInstruction) : Nil
     abstract def visit(instruction : IrExceptionDispatchInstruction) : Nil
     abstract def visit(instruction : IrSuppressExceptionInstruction) : Nil
+    abstract def visit(instruction : IrExceptionReleaseInstruction) : Nil
   end
 
   abstract class IrInstruction
@@ -356,6 +375,7 @@ module Smalang
     abstract def result_type : IrType
     abstract def expression : String
     abstract def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+    abstract def accept(visitor : IrInvokeOperationVisitor, instruction : IrInvokeInstruction) : Nil
   end
 
   class IrCallOperation < IrInvokeOperation
@@ -403,6 +423,10 @@ module Smalang
         end
       end
       errors
+    end
+
+    def accept(visitor : IrInvokeOperationVisitor, instruction : IrInvokeInstruction) : Nil
+      visitor.visit(self, instruction)
     end
   end
 
@@ -453,6 +477,10 @@ module Smalang
     protected def operator_name : String
       "div"
     end
+
+    def accept(visitor : IrInvokeOperationVisitor, instruction : IrInvokeInstruction) : Nil
+      visitor.visit(self, instruction)
+    end
   end
 
   class IrRemainderOperation < IrIntegerBinaryInvokeOperation
@@ -462,6 +490,10 @@ module Smalang
 
     protected def operator_name : String
       "rem"
+    end
+
+    def accept(visitor : IrInvokeOperationVisitor, instruction : IrInvokeInstruction) : Nil
+      visitor.visit(self, instruction)
     end
   end
 
@@ -600,6 +632,7 @@ module Smalang
     getter exception_successor : BlockId
     getter normal_result_id : ValueId
     getter exception_result_id : ValueId
+    getter source_location : IrSourceLocation?
 
     def initialize(
       id : InstructionId,
@@ -609,6 +642,7 @@ module Smalang
       @exception_successor : BlockId,
       @normal_result_id : ValueId,
       @exception_result_id : ValueId,
+      @source_location : IrSourceLocation?,
     )
       super(id, block_id, nil, nil)
     end
@@ -637,11 +671,15 @@ module Smalang
     end
 
     def expression : String
-      "(invoke #{@operation.expression} (normal @#{@normal_successor} %v#{@normal_result_id}) (exception @#{@exception_successor} %v#{@exception_result_id}))"
+      "(invoke #{@operation.expression} (normal @#{@normal_successor} %v#{@normal_result_id}) (exception @#{@exception_successor} %v#{@exception_result_id})#{location_dump})"
     end
 
     def dump(function : IrFunction) : String
-      "(invoke #{@operation.expression} (normal @#{function.block_name(@normal_successor)} %v#{@normal_result_id}) (exception @#{function.block_name(@exception_successor)} %v#{@exception_result_id}))"
+      "(invoke #{@operation.expression} (normal @#{function.block_name(@normal_successor)} %v#{@normal_result_id}) (exception @#{function.block_name(@exception_successor)} %v#{@exception_result_id})#{location_dump})"
+    end
+
+    private def location_dump : String
+      @source_location.try { |location| " #{location.dump}" } || ""
     end
 
     def accept(visitor : IrInstructionVisitor) : Nil
@@ -798,6 +836,9 @@ module Smalang
 
     def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
       errors = [] of String
+      if @new_exception_id == @old_exception_id
+        errors << context.error("suppress operands must have distinct exception values")
+      end
       operand_types.each_with_index do |type, index|
         next unless type
         next if type == IrType::Exception
@@ -809,6 +850,37 @@ module Smalang
 
     def expression : String
       "(%v#{@result_id.not_nil!} exception (suppress %v#{@new_exception_id} %v#{@old_exception_id}))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrExceptionReleaseInstruction < IrInstruction
+    getter exception_id : ValueId
+
+    def initialize(id : InstructionId, block_id : BlockId, @exception_id : ValueId)
+      super(id, block_id, nil, nil)
+    end
+
+    def used_values : Array(ValueId)
+      [@exception_id]
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      type = operand_types.first?
+      return [] of String unless type
+      return [] of String if type == IrType::Exception
+      [context.error("exception.release requires an exception value, got #{type.label}")]
+    end
+
+    def expression : String
+      "(exception.release %v#{@exception_id})"
     end
 
     def accept(visitor : IrInstructionVisitor) : Nil
@@ -918,8 +990,9 @@ module Smalang
       arguments : Array(ValueId),
       normal_successor : BlockId,
       exception_successor : BlockId,
+      source_location : IrSourceLocation? = nil,
     ) : IrInvokeResults
-      append_invoke(block_id, IrCallOperation.new(target, arguments), normal_successor, exception_successor)
+      append_invoke(block_id, IrCallOperation.new(target, arguments), normal_successor, exception_successor, source_location)
     end
 
     def emit_invoke_divide(
@@ -929,8 +1002,9 @@ module Smalang
       right : ValueId,
       normal_successor : BlockId,
       exception_successor : BlockId,
+      source_location : IrSourceLocation? = nil,
     ) : IrInvokeResults
-      append_invoke(block_id, IrDivideOperation.new(type, left, right), normal_successor, exception_successor)
+      append_invoke(block_id, IrDivideOperation.new(type, left, right), normal_successor, exception_successor, source_location)
     end
 
     def emit_invoke_remainder(
@@ -940,8 +1014,9 @@ module Smalang
       right : ValueId,
       normal_successor : BlockId,
       exception_successor : BlockId,
+      source_location : IrSourceLocation? = nil,
     ) : IrInvokeResults
-      append_invoke(block_id, IrRemainderOperation.new(type, left, right), normal_successor, exception_successor)
+      append_invoke(block_id, IrRemainderOperation.new(type, left, right), normal_successor, exception_successor, source_location)
     end
 
     def emit_phi(block_id : BlockId, type : IrType, incoming : Array(IrPhiIncoming)) : ValueId
@@ -966,6 +1041,13 @@ module Smalang
       append_terminator(block_id) do |instruction_id|
         IrResumeExceptionInstruction.new(instruction_id, block_id, exception_id)
       end
+    end
+
+    def emit_exception_release(block_id : BlockId, exception_id : ValueId) : Nil
+      block = require_block(block_id)
+      instruction_id = @instructions.size
+      @instructions << IrExceptionReleaseInstruction.new(instruction_id, block_id, exception_id)
+      block.append_instruction(instruction_id)
     end
 
     def emit_exception_dispatch(
@@ -1017,6 +1099,7 @@ module Smalang
       operation : IrInvokeOperation,
       normal_successor : BlockId,
       exception_successor : BlockId,
+      source_location : IrSourceLocation?,
     ) : IrInvokeResults
       block = require_block(block_id)
       require_block(normal_successor)
@@ -1035,7 +1118,8 @@ module Smalang
         normal_successor,
         exception_successor,
         normal_result_id,
-        exception_result_id
+        exception_result_id,
+        source_location
       )
 
       @instructions << instruction
@@ -1302,7 +1386,196 @@ module Smalang
         end
       end
 
+      if diagnostics.empty?
+        diagnostics.concat(verify_exception_ownership(context, function, block_instructions, reachable_blocks))
+      end
+
       diagnostics
+    end
+
+    private def verify_exception_ownership(
+      context : IrVerificationContext,
+      function : IrFunction,
+      block_instructions : Hash(BlockId, Array(IrInstruction)),
+      reachable_blocks : Array(BlockId),
+    ) : Array(String)
+      diagnostics = [] of String
+      worklist = [] of Tuple(BlockId, Array(ValueId))
+      visited_states = {} of String => Bool
+      worklist << {function.entry_block_id, [] of ValueId}
+
+      until worklist.empty?
+        block_id, state = worklist.shift
+        state.sort!
+        state_key = "#{block_id}:#{state.join(",")}"
+        next if visited_states.has_key?(state_key)
+        visited_states[state_key] = true
+
+        instructions = block_instructions[block_id]?
+        next unless instructions
+        instructions.each do |instruction|
+          case instruction
+          when IrPhiInstruction
+            next
+          when IrExceptionReleaseInstruction
+            consume_exception_owner(context, instruction.exception_id, block_id, state, diagnostics)
+          when IrSuppressExceptionInstruction
+            new_exception_id = instruction.new_exception_id
+            old_exception_id = instruction.old_exception_id
+            new_owned = consume_exception_owner(context, new_exception_id, block_id, state, diagnostics)
+            old_owned = consume_exception_owner(context, old_exception_id, block_id, state, diagnostics)
+            if new_owned && old_owned
+              result_id = instruction.result_id
+              if result_id
+                add_exception_owner(context, result_id, block_id, state, diagnostics)
+              end
+            end
+          when IrExceptionDispatchInstruction
+            require_exception_owner(context, instruction.exception_id, block_id, state, diagnostics)
+          when IrResumeExceptionInstruction
+            consume_exception_owner(context, instruction.exception_id, block_id, state, diagnostics)
+            report_unconsumed_exception_owners(context, block_id, state, "resume", diagnostics)
+          when IrReturnInstruction
+            report_unconsumed_exception_owners(context, block_id, state, "return", diagnostics)
+          end
+        end
+
+        terminator = instructions.last
+        case terminator
+        when IrInvokeInstruction
+          enqueue_exception_ownership_edge(
+            context,
+            function,
+            block_id,
+            terminator.normal_successor,
+            state,
+            block_instructions,
+            reachable_blocks,
+            worklist,
+            diagnostics
+          )
+          exceptional_state = state.dup
+          add_exception_owner(
+            context,
+            terminator.exception_result_id,
+            terminator.exception_successor,
+            exceptional_state,
+            diagnostics
+          )
+          enqueue_exception_ownership_edge(
+            context,
+            function,
+            block_id,
+            terminator.exception_successor,
+            exceptional_state,
+            block_instructions,
+            reachable_blocks,
+            worklist,
+            diagnostics
+          )
+        else
+          terminator.successor_block_ids.each do |successor_id|
+            enqueue_exception_ownership_edge(
+              context,
+              function,
+              block_id,
+              successor_id,
+              state,
+              block_instructions,
+              reachable_blocks,
+              worklist,
+              diagnostics
+            )
+          end
+        end
+      end
+
+      diagnostics.uniq
+    end
+
+    private def enqueue_exception_ownership_edge(
+      context : IrVerificationContext,
+      function : IrFunction,
+      predecessor_id : BlockId,
+      successor_id : BlockId,
+      state : Array(ValueId),
+      block_instructions : Hash(BlockId, Array(IrInstruction)),
+      reachable_blocks : Array(BlockId),
+      worklist : Array(Tuple(BlockId, Array(ValueId))),
+      diagnostics : Array(String),
+    ) : Nil
+      return unless reachable_blocks.includes?(successor_id)
+      edge_state = state.dup
+      instructions = block_instructions[successor_id]?
+      return unless instructions
+
+      instructions.each do |instruction|
+        phi = instruction.as?(IrPhiInstruction)
+        break unless phi
+        next unless phi.result_type == IrType::Exception
+
+        incoming = phi.incoming.find { |candidate| candidate.predecessor_block_id == predecessor_id }
+        next unless incoming
+        if edge_state.includes?(incoming.value_id)
+          edge_state.delete(incoming.value_id)
+          result_id = phi.result_id
+          add_exception_owner(context, result_id, successor_id, edge_state, diagnostics) if result_id
+        else
+          diagnostics << context.error("exception %v#{incoming.value_id} is not owned on edge from #{function.block_name(predecessor_id)} to #{function.block_name(successor_id)}")
+        end
+      end
+
+      worklist << {successor_id, edge_state}
+    end
+
+    private def add_exception_owner(
+      context : IrVerificationContext,
+      exception_id : ValueId,
+      block_id : BlockId,
+      state : Array(ValueId),
+      diagnostics : Array(String),
+    ) : Nil
+      if state.includes?(exception_id)
+        diagnostics << context.error("exception %v#{exception_id} is already owned in block #{context.function.block_name(block_id)}")
+      else
+        state << exception_id
+      end
+    end
+
+    private def require_exception_owner(
+      context : IrVerificationContext,
+      exception_id : ValueId,
+      block_id : BlockId,
+      state : Array(ValueId),
+      diagnostics : Array(String),
+    ) : Bool
+      return true if state.includes?(exception_id)
+      diagnostics << context.error("exception %v#{exception_id} is not owned in block #{context.function.block_name(block_id)}")
+      false
+    end
+
+    private def consume_exception_owner(
+      context : IrVerificationContext,
+      exception_id : ValueId,
+      block_id : BlockId,
+      state : Array(ValueId),
+      diagnostics : Array(String),
+    ) : Bool
+      return false unless require_exception_owner(context, exception_id, block_id, state, diagnostics)
+      state.delete(exception_id)
+      true
+    end
+
+    private def report_unconsumed_exception_owners(
+      context : IrVerificationContext,
+      block_id : BlockId,
+      state : Array(ValueId),
+      terminator : String,
+      diagnostics : Array(String),
+    ) : Nil
+      state.each do |exception_id|
+        diagnostics << context.error("exception %v#{exception_id} remains owned at #{terminator} in block #{context.function.block_name(block_id)}")
+      end
     end
 
     private def find_reachable_blocks(function : IrFunction, block_instructions : Hash(BlockId, Array(IrInstruction))) : Array(BlockId)

@@ -70,6 +70,11 @@ module Smalang
       nil
     end
 
+    def source_location(span : SourceSpan) : IrSourceLocation
+      source_file = parsed_module.source_file
+      IrSourceLocation.new(source_file.name, source_file.position_at(span.start).line)
+    end
+
     def report(node_id : NodeId, description : String) : Nil
       report(parsed_module.arena.node(node_id).span, description)
     end
@@ -335,7 +340,14 @@ module Smalang
 
       normal_block = function.add_block("invoke_normal_#{function.block_count}")
       unwind_block = function.add_block("invoke_unwind_#{function.block_count}")
-      result = function.emit_invoke_call(current_block_id, target, arguments, normal_block, unwind_block)
+      result = function.emit_invoke_call(
+        current_block_id,
+        target,
+        arguments,
+        normal_block,
+        unwind_block,
+        @context.source_location(node.span)
+      )
       function.emit_resume_exception(unwind_block, result.exception_id)
       @current_block_id = normal_block
       @expression_value_id = result.value_id

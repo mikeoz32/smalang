@@ -78,6 +78,7 @@ describe Smalang::IrLowerer do
     even_call.operation.as(Smalang::IrCallOperation).target.module_function_id.should eq(odd.id)
     odd_call.operation.as(Smalang::IrCallOperation).target.module_function_id.should eq(even.id)
     main_call.operation.as(Smalang::IrCallOperation).target.module_function_id.should eq(even.id)
+    main_call.source_location.should eq(Smalang::IrSourceLocation.new("ir_lowering_spec.py", 8))
     ir.verify.should be_empty
   end
 end

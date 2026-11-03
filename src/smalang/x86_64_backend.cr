@@ -1,4 +1,11 @@
 module Smalang
+  module X86_64RuntimeSymbols
+    ENTRY             = -1
+    DIVISION_BY_ZERO  = -2
+    EXCEPTION_RELEASE = -3
+    REPORT_UNCAUGHT   = -4
+  end
+
   class X86_64BackendFailure < Exception
   end
 
@@ -152,6 +159,11 @@ module Smalang
     abstract def result_value_id : ValueId?
     abstract def emit(context : X86_64EmissionContext) : Nil
 
+    def defined_value_ids : Array(ValueId)
+      result = result_value_id
+      result ? [result] : Array(ValueId).new
+    end
+
     def call_boundary? : Bool
       false
     end
@@ -257,16 +269,20 @@ module Smalang
 
   class MachineCall < MachineInstruction
     getter result_id : ValueId
+    getter exception_id : ValueId
     getter function_id : FunctionId
     getter arguments : Array(ValueId)
     getter normal_successor_label : Int32
+    getter exception_successor_label : Int32
 
     def initialize(
       position : Int32,
       @result_id : ValueId,
+      @exception_id : ValueId,
       @function_id : FunctionId,
       arguments : Array(ValueId),
       @normal_successor_label : Int32,
+      @exception_successor_label : Int32,
     )
       super(position)
       @arguments = arguments.dup
@@ -280,6 +296,10 @@ module Smalang
       @result_id
     end
 
+    def defined_value_ids : Array(ValueId)
+      [@result_id, @exception_id]
+    end
+
     def call_boundary? : Bool
       true
     end
@@ -289,8 +309,131 @@ module Smalang
     end
 
     def emit(context : X86_64EmissionContext) : Nil
-      context.emit_call(self)
-      context.code.jump_to(@normal_successor_label)
+      context.emit_invoke(self)
+    end
+  end
+
+  class MachineIntegerDivision < MachineInstruction
+    getter result_id : ValueId
+    getter exception_id : ValueId
+    getter left_id : ValueId
+    getter right_id : ValueId
+    getter type : IrType
+    getter normal_successor_label : Int32
+    getter exception_successor_label : Int32
+
+    @remainder : Bool
+
+    def remainder? : Bool
+      @remainder
+    end
+
+    def initialize(
+      position : Int32,
+      @result_id : ValueId,
+      @exception_id : ValueId,
+      @left_id : ValueId,
+      @right_id : ValueId,
+      @type : IrType,
+      remainder : Bool,
+      @normal_successor_label : Int32,
+      @exception_successor_label : Int32,
+    )
+      @remainder = remainder
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@left_id, @right_id]
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def defined_value_ids : Array(ValueId)
+      [@result_id, @exception_id]
+    end
+
+    def call_boundary? : Bool
+      true
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_integer_division(self)
+    end
+  end
+
+  class MachineExceptionDispatch < MachineInstruction
+    getter exception_id : ValueId
+    getter cases : Array(Tuple(IrExceptionKind?, Int32))
+    getter default_label : Int32?
+
+    def initialize(position : Int32, @exception_id : ValueId, cases : Array(Tuple(IrExceptionKind?, Int32)), @default_label : Int32?)
+      super(position)
+      @cases = cases.dup
+    end
+
+    def used_values : Array(ValueId)
+      [@exception_id]
+    end
+
+    def result_value_id : ValueId?
+      nil
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_exception_dispatch(self)
+    end
+  end
+
+  class MachineSuppressException < MachineInstruction
+    getter result_id : ValueId
+    getter new_exception_id : ValueId
+    getter old_exception_id : ValueId
+
+    def initialize(position : Int32, @result_id : ValueId, @new_exception_id : ValueId, @old_exception_id : ValueId)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@new_exception_id, @old_exception_id]
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def call_boundary? : Bool
+      true
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_suppress_exception(self)
+    end
+  end
+
+  class MachineExceptionRelease < MachineInstruction
+    getter exception_id : ValueId
+
+    def initialize(position : Int32, @exception_id : ValueId)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@exception_id]
+    end
+
+    def result_value_id : ValueId?
+      nil
+    end
+
+    def call_boundary? : Bool
+      true
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_exception_release(self)
     end
   end
 
@@ -311,6 +454,26 @@ module Smalang
 
     def emit(context : X86_64EmissionContext) : Nil
       context.code.mark_label(@label)
+    end
+  end
+
+  class MachineSetSourceLocation < MachineInstruction
+    getter source_location : IrSourceLocation
+
+    def initialize(position : Int32, @source_location : IrSourceLocation)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      Array(ValueId).new
+    end
+
+    def result_value_id : ValueId?
+      nil
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.set_source_location(@source_location)
     end
   end
 
@@ -445,6 +608,28 @@ module Smalang
 
     def emit(context : X86_64EmissionContext) : Nil
       context.location(@value_id).load_to(context.code, X86_64Register::Rax, context.frame)
+      context.code.xor_register(X86_64Register::Rdx)
+      context.code.emit_epilogue
+    end
+  end
+
+  class MachineResumeException < MachineInstruction
+    getter exception_id : ValueId
+
+    def initialize(position : Int32, @exception_id : ValueId)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@exception_id]
+    end
+
+    def result_value_id : ValueId?
+      nil
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.location(@exception_id).load_to(context.code, X86_64Register::Rdx, context.frame)
       context.code.emit_epilogue
     end
   end
@@ -529,31 +714,79 @@ module Smalang
     end
 
     def visit(instruction : IrInvokeInstruction) : Nil
-      operation = instruction.operation.as?(IrCallOperation)
-      raise X86_64BackendFailure.new("only call invokes are currently supported by code generation") unless operation
-      result_id = instruction.normal_result_id
+      source_location = instruction.source_location || IrSourceLocation.new("<ir>", 0)
+      @instructions << MachineSetSourceLocation.new(@instructions.size, source_location)
+      instruction.operation.accept(self, instruction)
+    end
+
+    def visit(operation : IrCallOperation, instruction : IrInvokeInstruction) : Nil
       function_id = operation.target.module_function_id
       raise X86_64BackendFailure.new("call target is not an internal function") unless function_id
       normal_label = target_label(instruction.block_id, instruction.normal_successor)
-      @instructions << MachineCall.new(@instructions.size, result_id, function_id, operation.arguments, normal_label)
+      exception_label = target_label(instruction.block_id, instruction.exception_successor)
+      @instructions << MachineCall.new(
+        @instructions.size,
+        instruction.normal_result_id,
+        instruction.exception_result_id,
+        function_id,
+        operation.arguments,
+        normal_label,
+        exception_label
+      )
+    end
+
+    def visit(operation : IrDivideOperation, instruction : IrInvokeInstruction) : Nil
+      append_integer_division(instruction, operation, false)
+    end
+
+    def visit(operation : IrRemainderOperation, instruction : IrInvokeInstruction) : Nil
+      append_integer_division(instruction, operation, true)
     end
 
     def visit(instruction : IrResumeExceptionInstruction) : Nil
-      @instructions << MachineTrap.new(@instructions.size)
+      @instructions << MachineResumeException.new(@instructions.size, instruction.exception_id)
     end
 
     def visit(instruction : IrExceptionDispatchInstruction) : Nil
-      raise X86_64BackendFailure.new("exception dispatch code generation is not implemented")
+      cases = instruction.cases.map do |exception_case|
+        {exception_case.kind, target_label(instruction.block_id, exception_case.target_block_id)}
+      end
+      default_label = instruction.default_block_id.try { |block_id| target_label(instruction.block_id, block_id) }
+      @instructions << MachineExceptionDispatch.new(@instructions.size, instruction.exception_id, cases, default_label)
     end
 
     def visit(instruction : IrSuppressExceptionInstruction) : Nil
-      raise X86_64BackendFailure.new("exception suppression code generation is not implemented")
+      result_id = instruction.result_id
+      raise X86_64BackendFailure.new("exception suppression is missing its result") unless result_id
+      @instructions << MachineSuppressException.new(@instructions.size, result_id, instruction.new_exception_id, instruction.old_exception_id)
+    end
+
+    def visit(instruction : IrExceptionReleaseInstruction) : Nil
+      @instructions << MachineExceptionRelease.new(@instructions.size, instruction.exception_id)
     end
 
     private def append_binary(instruction : IrBinaryInstruction, operation : MachineBinaryOperation) : Nil
       result_id = instruction.result_id
       raise X86_64BackendFailure.new("binary operation is missing its result") unless result_id
       @instructions << MachineBinary.new(@instructions.size, result_id, instruction.left, instruction.right, operation)
+    end
+
+    private def append_integer_division(
+      instruction : IrInvokeInstruction,
+      operation : IrIntegerBinaryInvokeOperation,
+      remainder : Bool,
+    ) : Nil
+      @instructions << MachineIntegerDivision.new(
+        @instructions.size,
+        instruction.normal_result_id,
+        instruction.exception_result_id,
+        operation.left,
+        operation.right,
+        operation.type,
+        remainder,
+        target_label(instruction.block_id, instruction.normal_successor),
+        target_label(instruction.block_id, instruction.exception_successor)
+      )
     end
 
     private def prepare_phi_edges(function : IrFunction) : Nil
@@ -694,7 +927,7 @@ module Smalang
       end
 
       instructions.each do |instruction|
-        if result_id = instruction.result_value_id
+        instruction.defined_value_ids.each do |result_id|
           intervals[result_id] = LiveInterval.new(result_id, instruction.position, instruction.position)
         end
       end
@@ -749,6 +982,8 @@ module Smalang
   end
 
   class X86_64FrameLayout
+    FIXED_FRAME_BYTES = 80
+
     getter frame_size : Int32
 
     @spill_offsets : Array(Int32)
@@ -758,16 +993,52 @@ module Smalang
     def initialize(spill_slot_count : Int32, argument_stage_count : Int32, @outgoing_stack_argument_count : Int32)
       @spill_offsets = [] of Int32
       spill_slot_count.times do |slot|
-        @spill_offsets << -((slot + 1) * 8)
+        @spill_offsets << -(FIXED_FRAME_BYTES + (slot + 1) * 8)
       end
 
       @argument_stage_offsets = [] of Int32
       argument_stage_count.times do |index|
-        @argument_stage_offsets << -((spill_slot_count + index + 1) * 8)
+        @argument_stage_offsets << -(FIXED_FRAME_BYTES + (spill_slot_count + index + 1) * 8)
       end
 
-      local_bytes = (spill_slot_count + argument_stage_count + @outgoing_stack_argument_count) * 8
+      local_bytes = FIXED_FRAME_BYTES + (spill_slot_count + argument_stage_count + @outgoing_stack_argument_count) * 8
       @frame_size = align_to(local_bytes, 16)
+    end
+
+    def frame_link_offset : Int32
+      -8
+    end
+
+    def function_name_offset : Int32
+      -16
+    end
+
+    def function_name_length_offset : Int32
+      -24
+    end
+
+    def source_file_offset : Int32
+      -32
+    end
+
+    def source_file_length_offset : Int32
+      -40
+    end
+
+    def source_line_offset : Int32
+      -48
+    end
+
+    def source_line_length_offset : Int32
+      -56
+    end
+
+    def invoke_normal_result_offset : Int32
+      -64
+    end
+
+    def invoke_exception_offset : Int32
+      -72
     end
 
     def spill_offset(slot : Int32) : Int32
@@ -806,11 +1077,23 @@ module Smalang
       @bytes = @buffer.bytes
       @labels = {} of Int32 => Int32
       @branch_fixups = [] of Tuple(Int32, Int32)
+      @rip_relative_fixups = [] of Tuple(Int32, Int32)
+      @next_private_label = -1
       @cfi_events = [] of X86_64CfiEvent
     end
 
     def size : Int32
       @buffer.size
+    end
+
+    def write_bytes(bytes : Array(UInt8)) : Nil
+      @buffer.write_bytes(bytes)
+    end
+
+    def new_label : Int32
+      label = @next_private_label
+      @next_private_label -= 1
+      label
     end
 
     def move_register(destination : X86_64Register, source : X86_64Register) : Nil
@@ -838,10 +1121,72 @@ module Smalang
       write_memory_store(X86_64Register::Rsp, offset, source)
     end
 
+    def move_register_from_memory(destination : X86_64Register, base : X86_64Register, offset : Int32) : Nil
+      write_memory_move(destination, base, offset)
+    end
+
+    def move_memory_from_register(base : X86_64Register, offset : Int32, source : X86_64Register) : Nil
+      write_memory_store(base, offset, source)
+    end
+
+    def move_immediate_to_memory(base : X86_64Register, offset : Int32, value : UInt32) : Nil
+      write_rex(true, X86_64Register::Rax, base)
+      @buffer.write_u8(0xc7_u8)
+      write_memory_operand(X86_64Register::Rax, base, offset)
+      @buffer.write_u32(value)
+    end
+
+    def compare_register_immediate(register : X86_64Register, value : Int32) : Nil
+      write_rex(true, X86_64Register::Rax, register)
+      @buffer.write_u8(0x81_u8)
+      @buffer.write_u8(0xc0_u8 | (0x07_u8 << 3) | register.code)
+      @buffer.write_i32(value)
+    end
+
+    def lea_rip_relative(destination : X86_64Register, label : Int32) : Nil
+      write_rex(true, destination, X86_64Register::Rbp)
+      @buffer.write_u8(0x8d_u8)
+      @buffer.write_u8((destination.code << 3) | X86_64Register::Rbp.code)
+      displacement_offset = @buffer.size
+      @buffer.write_u32(0_u32)
+      @rip_relative_fixups << {displacement_offset, label}
+    end
+
     def add_register(destination : X86_64Register, source : X86_64Register) : Nil
       write_rex(true, source, destination)
       @buffer.write_u8(0x01_u8)
       write_modrm(0b11_u8, source, destination)
+    end
+
+    def add_immediate_register(register : X86_64Register, value : Int32) : Nil
+      write_rex(true, X86_64Register::Rax, register)
+      @buffer.write_u8(0x81_u8)
+      @buffer.write_u8(0xc0_u8 | register.code)
+      @buffer.write_i32(value)
+    end
+
+    def compare_registers(left : X86_64Register, right : X86_64Register) : Nil
+      write_rex(true, right, left)
+      @buffer.write_u8(0x39_u8)
+      write_modrm(0b11_u8, right, left)
+    end
+
+    def shift_left_register(register : X86_64Register, amount : UInt8) : Nil
+      write_rex(true, X86_64Register::Rax, register)
+      @buffer.write_u8(0xc1_u8)
+      @buffer.write_u8(0xe0_u8 | register.code)
+      @buffer.write_u8(amount)
+    end
+
+    def sign_extend_rax_to_rdx : Nil
+      @buffer.write_bytes([0x48_u8, 0x99_u8])
+    end
+
+    def divide_by_register(divisor : X86_64Register, signed : Bool) : Nil
+      write_rex(true, X86_64Register::Rax, divisor)
+      @buffer.write_u8(0xf7_u8)
+      extension = signed ? 7_u8 : 6_u8
+      @buffer.write_u8(0xc0_u8 | (extension << 3) | divisor.code)
     end
 
     def add_rbp_memory(destination : X86_64Register, offset : Int32) : Nil
@@ -879,12 +1224,16 @@ module Smalang
       record_cfi_event([0x0e_u8, 16_u8, 0x86_u8, 2_u8])
       @buffer.write_bytes([0x48_u8, 0x89_u8, 0xe5_u8])
       record_cfi_event([0x0d_u8, 6_u8])
-      return if frame_size == 0
-      @buffer.write_bytes([0x48_u8, 0x81_u8, 0xec_u8])
-      @buffer.write_u32(frame_size.to_u32)
+      unless frame_size == 0
+        @buffer.write_bytes([0x48_u8, 0x81_u8, 0xec_u8])
+        @buffer.write_u32(frame_size.to_u32)
+      end
+      move_rbp_from_register(-8, X86_64Register::R15)
+      move_register(X86_64Register::R15, X86_64Register::Rbp)
     end
 
     def emit_epilogue : Nil
+      move_register_from_rbp(X86_64Register::R15, -8)
       record_cfi_event([0x0a_u8])
       @buffer.write_bytes([0x48_u8, 0x89_u8, 0xec_u8])
       record_cfi_event([0x0d_u8, 7_u8])
@@ -916,6 +1265,43 @@ module Smalang
       record_branch_fixup(label)
     end
 
+    def jump_if_zero_to(label : Int32) : Nil
+      @buffer.write_bytes([0x0f_u8, 0x84_u8])
+      record_branch_fixup(label)
+    end
+
+    def jump_if_equal_to(label : Int32) : Nil
+      jump_if_zero_to(label)
+    end
+
+    def jump_if_not_equal_to(label : Int32) : Nil
+      jump_if_not_zero_to(label)
+    end
+
+    def jump_if_sign_to(label : Int32) : Nil
+      @buffer.write_bytes([0x0f_u8, 0x88_u8])
+      record_branch_fixup(label)
+    end
+
+    def jump_if_greater_equal_to(label : Int32) : Nil
+      @buffer.write_bytes([0x0f_u8, 0x8d_u8])
+      record_branch_fixup(label)
+    end
+
+    def xor_register(register : X86_64Register) : Nil
+      write_rex(true, register, register)
+      @buffer.write_u8(0x31_u8)
+      write_modrm(0b11_u8, register, register)
+    end
+
+    def emit_syscall : Nil
+      @buffer.write_bytes([0x0f_u8, 0x05_u8])
+    end
+
+    def emit_return_instruction : Nil
+      @buffer.write_u8(0xc3_u8)
+    end
+
     def test_register(register : X86_64Register) : Nil
       write_rex(true, register, register)
       @buffer.write_u8(0x85_u8)
@@ -934,6 +1320,18 @@ module Smalang
         displacement = target_offset - (displacement_offset + 4)
         unless Int32::MIN <= displacement <= Int32::MAX
           raise X86_64BackendFailure.new("machine branch to label #{target_label} is out of range")
+        end
+        4.times do |index|
+          @bytes[displacement_offset + index] = ((displacement >> (index * 8)) & 0xff).to_u8
+        end
+      end
+      @rip_relative_fixups.each do |fixup|
+        displacement_offset, target_label = fixup
+        target_offset = @labels[target_label]?
+        raise X86_64BackendFailure.new("RIP-relative reference targets undefined label #{target_label}") unless target_offset
+        displacement = target_offset - (displacement_offset + 4)
+        unless Int32::MIN <= displacement <= Int32::MAX
+          raise X86_64BackendFailure.new("RIP-relative reference to label #{target_label} is out of range")
         end
         4.times do |index|
           @bytes[displacement_offset + index] = ((displacement >> (index * 8)) & 0xff).to_u8
@@ -976,7 +1374,7 @@ module Smalang
     private def write_modrm(mode : UInt8, reg_field : X86_64Register, rm_field : X86_64Register) : Nil
       value = (mode << 6) | (reg_field.code << 3) | rm_field.code
       @buffer.write_u8(value)
-      @buffer.write_u8(0x24_u8) if mode != 0b11_u8 && rm_field == X86_64Register::Rsp
+      @buffer.write_u8(0x24_u8) if mode != 0b11_u8 && rm_field.code == X86_64Register::Rsp.code
     end
 
     private def write_rex(wide : Bool, reg_field : X86_64Register, rm_field : X86_64Register) : Nil
@@ -1019,9 +1417,13 @@ module Smalang
     getter relocations : Array(X86_64Relocation)
 
     @allocation : RegisterAllocation
+    @literal_labels : Hash(String, Int32)
+    @literal_order : Array(Tuple(String, Int32))
 
     def initialize(@code : X86_64CodeBuffer, @frame : X86_64FrameLayout, @allocation : RegisterAllocation)
       @relocations = [] of X86_64Relocation
+      @literal_labels = {} of String => Int32
+      @literal_order = [] of Tuple(String, Int32)
     end
 
     def location(value_id : ValueId) : ValueLocation
@@ -1064,7 +1466,32 @@ module Smalang
       end
     end
 
-    def emit_call(call : MachineCall) : Nil
+    def initialize_frame(function : IrFunction) : Nil
+      set_function_name(function.name)
+      set_source_location(IrSourceLocation.new("<ir>", 0))
+    end
+
+    def set_source_location(location : IrSourceLocation) : Nil
+      label = intern_literal(location.file)
+      @code.lea_rip_relative(X86_64Register::Rax, label)
+      @code.move_rbp_from_register(@frame.source_file_offset, X86_64Register::Rax)
+      @code.move_immediate_to_memory(X86_64Register::Rbp, @frame.source_file_length_offset, location.file.bytesize.to_u32)
+      line = location.line.to_s
+      line_label = intern_literal(line)
+      @code.lea_rip_relative(X86_64Register::Rax, line_label)
+      @code.move_rbp_from_register(@frame.source_line_offset, X86_64Register::Rax)
+      @code.move_immediate_to_memory(X86_64Register::Rbp, @frame.source_line_length_offset, line.bytesize.to_u32)
+    end
+
+    def append_string_literals : Nil
+      @literal_order.each do |value, label|
+        @code.mark_label(label)
+        @code.write_bytes(value.to_slice.to_a)
+        @code.write_bytes([0_u8])
+      end
+    end
+
+    def emit_invoke(call : MachineCall) : Nil
       @allocation.call_spills_at(call.position).each do |spill|
         @code.move_rbp_from_register(@frame.spill_offset(spill.slot), spill.register)
       end
@@ -1087,10 +1514,165 @@ module Smalang
       relocation_offset = @code.emit_call
       @relocations << X86_64Relocation.new(relocation_offset, call.function_id)
 
+      @code.move_rbp_from_register(@frame.invoke_normal_result_offset, X86_64Register::Rax)
+      @code.move_rbp_from_register(@frame.invoke_exception_offset, X86_64Register::Rdx)
+
       @allocation.call_spills_at(call.position).each do |spill|
         @code.move_register_from_rbp(spill.register, @frame.spill_offset(spill.slot))
       end
+
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_exception_offset)
+      @code.test_register(X86_64Register::Rax)
+      exception_result_label = @code.new_label
+      @code.jump_if_not_zero_to(exception_result_label)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_normal_result_offset)
       location(call.result_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.jump_to(call.normal_successor_label)
+      @code.mark_label(exception_result_label)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_exception_offset)
+      location(call.exception_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.jump_to(call.exception_successor_label)
+    end
+
+    def emit_integer_division(division : MachineIntegerDivision) : Nil
+      spills = @allocation.call_spills_at(division.position)
+      save_call_spills(spills)
+      zero_divisor_label = @code.new_label
+      normal_divisor = location(division.right_id)
+      normal_divisor.load_to(@code, X86_64Register::Rcx, @frame)
+      @code.test_register(X86_64Register::Rcx)
+      @code.jump_if_zero_to(zero_divisor_label)
+
+      location(division.left_id).load_to(@code, X86_64Register::Rax, @frame)
+      normal_divisor.load_to(@code, X86_64Register::Rcx, @frame)
+      if division.type == IrType::Isize
+        emit_signed_division(division, zero_divisor_label)
+      else
+        @code.xor_register(X86_64Register::Rdx)
+        @code.divide_by_register(X86_64Register::Rcx, false)
+        @code.move_register(X86_64Register::Rax, X86_64Register::Rdx) if division.remainder?
+      end
+
+      @code.move_rbp_from_register(@frame.invoke_normal_result_offset, X86_64Register::Rax)
+      restore_call_spills(spills)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_normal_result_offset)
+      location(division.result_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.jump_to(division.normal_successor_label)
+
+      @code.mark_label(zero_divisor_label)
+      call_runtime(X86_64RuntimeSymbols::DIVISION_BY_ZERO)
+      @code.move_rbp_from_register(@frame.invoke_exception_offset, X86_64Register::Rax)
+      restore_call_spills(spills)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_exception_offset)
+      location(division.exception_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.jump_to(division.exception_successor_label)
+    end
+
+    def emit_exception_dispatch(dispatch : MachineExceptionDispatch) : Nil
+      location(dispatch.exception_id).load_to(@code, X86_64Register::Rax, @frame)
+      @code.move_register_from_memory(X86_64Register::Rcx, X86_64Register::Rax, 0)
+      dispatch.cases.each do |kind, target_label|
+        unless kind
+          @code.jump_to(target_label)
+          return
+        end
+        @code.compare_register_immediate(X86_64Register::Rcx, exception_kind_tag(kind))
+        @code.jump_if_equal_to(target_label)
+      end
+      target_label = dispatch.default_label
+      raise X86_64BackendFailure.new("exception dispatch has no fallback successor") unless target_label
+      @code.jump_to(target_label)
+    end
+
+    def emit_suppress_exception(suppress : MachineSuppressException) : Nil
+      spills = @allocation.call_spills_at(suppress.position)
+      save_call_spills(spills)
+      location(suppress.new_exception_id).load_to(@code, X86_64Register::Rax, @frame)
+      location(suppress.old_exception_id).load_to(@code, X86_64Register::Rcx, @frame)
+      find_tail = @code.new_label
+      append_suppressed = @code.new_label
+      @code.move_register(X86_64Register::R10, X86_64Register::Rax)
+      @code.mark_label(find_tail)
+      @code.move_register_from_memory(X86_64Register::R11, X86_64Register::R10, 8)
+      @code.test_register(X86_64Register::R11)
+      @code.jump_if_zero_to(append_suppressed)
+      @code.move_register(X86_64Register::R10, X86_64Register::R11)
+      @code.jump_to(find_tail)
+      @code.mark_label(append_suppressed)
+      @code.move_memory_from_register(X86_64Register::R10, 8, X86_64Register::Rcx)
+      @code.move_rbp_from_register(@frame.invoke_normal_result_offset, X86_64Register::Rax)
+      restore_call_spills(spills)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_normal_result_offset)
+      location(suppress.result_id).store_from(@code, X86_64Register::Rax, @frame)
+    end
+
+    def emit_exception_release(release : MachineExceptionRelease) : Nil
+      spills = @allocation.call_spills_at(release.position)
+      save_call_spills(spills)
+      location(release.exception_id).load_to(@code, X86_64Register::Rdi, @frame)
+      call_runtime(X86_64RuntimeSymbols::EXCEPTION_RELEASE)
+      restore_call_spills(spills)
+    end
+
+    private def emit_signed_division(division : MachineIntegerDivision, zero_divisor_label : Int32) : Nil
+      overflow_done_label = @code.new_label
+      divide_label = @code.new_label
+      @code.move_immediate(X86_64Register::R10, 0x8000_0000_0000_0000_u64)
+      @code.compare_registers(X86_64Register::Rax, X86_64Register::R10)
+      @code.jump_if_not_equal_to(divide_label)
+      @code.move_immediate(X86_64Register::R10, UInt64::MAX)
+      @code.compare_registers(X86_64Register::Rcx, X86_64Register::R10)
+      @code.jump_if_not_equal_to(divide_label)
+      @code.xor_register(X86_64Register::Rax) if division.remainder?
+      @code.jump_to(overflow_done_label)
+      @code.mark_label(divide_label)
+      @code.sign_extend_rax_to_rdx
+      @code.divide_by_register(X86_64Register::Rcx, true)
+      @code.move_register(X86_64Register::Rax, X86_64Register::Rdx) if division.remainder?
+      @code.mark_label(overflow_done_label)
+    end
+
+    private def save_call_spills(spills : Array(CallSpill)) : Nil
+      spills.each do |spill|
+        @code.move_rbp_from_register(@frame.spill_offset(spill.slot), spill.register)
+      end
+    end
+
+    private def restore_call_spills(spills : Array(CallSpill)) : Nil
+      spills.each do |spill|
+        @code.move_register_from_rbp(spill.register, @frame.spill_offset(spill.slot))
+      end
+    end
+
+    private def call_runtime(function_id : FunctionId) : Nil
+      relocation_offset = @code.emit_call
+      @relocations << X86_64Relocation.new(relocation_offset, function_id)
+    end
+
+    private def exception_kind_tag(kind : IrExceptionKind) : Int32
+      case kind
+      when IrExceptionKind::DivisionByZero
+        1
+      else
+        raise X86_64BackendFailure.new("unsupported exception kind #{kind}")
+      end
+    end
+
+    private def set_function_name(name : String) : Nil
+      label = intern_literal(name)
+      @code.lea_rip_relative(X86_64Register::Rax, label)
+      @code.move_rbp_from_register(@frame.function_name_offset, X86_64Register::Rax)
+      @code.move_immediate_to_memory(X86_64Register::Rbp, @frame.function_name_length_offset, name.bytesize.to_u32)
+    end
+
+    private def intern_literal(value : String) : Int32
+      if label = @literal_labels[value]?
+        return label
+      end
+      label = @code.new_label
+      @literal_labels[value] = label
+      @literal_order << {value, label}
+      label
     end
   end
 
@@ -1124,11 +1706,310 @@ module Smalang
       code = X86_64CodeBuffer.new
       code.emit_prologue(frame.frame_size)
       context = X86_64EmissionContext.new(code, frame, allocation)
+      context.initialize_frame(function)
       context.initialize_parameters(function)
       instructions.each(&.emit(context))
+      context.append_string_literals
       code.resolve_labels
 
       EmittedFunction.new(function, code.bytes.dup, context.relocations.dup, code.cfi_events)
+    end
+  end
+
+  class X86_64EntryEmitter
+    EXIT_SYSCALL      = 60_u64
+    ENTRY_FUNCTION_ID = X86_64RuntimeSymbols::ENTRY
+
+    def emit(user_main_id : FunctionId, expected_result : UInt64? = nil) : EmittedFunction
+      code = X86_64CodeBuffer.new
+      code.xor_register(X86_64Register::R15)
+      call_offset = code.emit_call
+      code.test_register(X86_64Register::Rdx)
+      exception_label = code.new_label
+      code.jump_if_not_zero_to(exception_label)
+      relocations = [X86_64Relocation.new(call_offset, user_main_id)] of X86_64Relocation
+
+      if expected = expected_result
+        mismatch_label = code.new_label
+        code.move_immediate(X86_64Register::R10, expected)
+        code.compare_registers(X86_64Register::Rax, X86_64Register::R10)
+        code.jump_if_not_equal_to(mismatch_label)
+        emit_exit(code, 0_u64)
+        code.mark_label(mismatch_label)
+        emit_exit(code, 1_u64)
+        code.mark_label(exception_label)
+        emit_exit(code, 2_u64)
+      else
+        code.move_register(X86_64Register::Rdi, X86_64Register::Rax)
+        code.move_immediate(X86_64Register::Rax, EXIT_SYSCALL)
+        code.emit_syscall
+        code.mark_label(exception_label)
+        code.move_register(X86_64Register::Rdi, X86_64Register::Rdx)
+        report_offset = code.emit_call
+        relocations << X86_64Relocation.new(report_offset, X86_64RuntimeSymbols::REPORT_UNCAUGHT)
+        emit_exit(code, 1_u64)
+      end
+      code.resolve_labels
+
+      function = IrFunction.new(ENTRY_FUNCTION_ID, "_start", Array(IrType).new, IrType::Isize)
+      EmittedFunction.new(function, code.bytes.dup, relocations, Array(X86_64CfiEvent).new)
+    end
+
+    private def emit_exit(code : X86_64CodeBuffer, status : UInt64) : Nil
+      code.move_immediate(X86_64Register::Rdi, status)
+      code.move_immediate(X86_64Register::Rax, EXIT_SYSCALL)
+      code.emit_syscall
+    end
+  end
+
+  class X86_64RuntimeEmitter
+    MAP_SYSCALL                         =    9_u64
+    UNMAP_SYSCALL                       =   11_u64
+    WRITE_SYSCALL                       =    1_u64
+    EXIT_SYSCALL                        =   60_u64
+    PAGE_SIZE                           = 4096_u64
+    EXCEPTION_KIND_DIVISION_BY_ZERO     =        1
+    EXCEPTION_RECORD_KIND_OFFSET        =        0
+    EXCEPTION_RECORD_SUPPRESSED_OFFSET  =        8
+    EXCEPTION_RECORD_FRAME_COUNT_OFFSET =       16
+    EXCEPTION_RECORD_FRAMES_OFFSET      =       24
+    EXCEPTION_FRAME_SIZE                =       48
+    MAX_EXCEPTION_FRAMES                =       64
+
+    def emit : Array(EmittedFunction)
+      [emit_division_by_zero, emit_release, emit_report_uncaught]
+    end
+
+    private def emit_division_by_zero : EmittedFunction
+      code = X86_64CodeBuffer.new
+      capture_loop = code.new_label
+      capture_done = code.new_label
+      allocation_failed = code.new_label
+      emit_exception_allocation(code, allocation_failed)
+      emit_frame_capture_loop(code, capture_loop, capture_done)
+      emit_exception_capture_return(code, capture_done)
+
+      code.mark_label(allocation_failed)
+      emit_exit(code, 127_u64)
+      code.resolve_labels
+      emit_helper(X86_64RuntimeSymbols::DIVISION_BY_ZERO, "__smalang_new_division_by_zero", code)
+    end
+
+    private def emit_exception_allocation(code : X86_64CodeBuffer, allocation_failed : Int32) : Nil
+      code.move_immediate(X86_64Register::Rax, MAP_SYSCALL)
+      code.xor_register(X86_64Register::Rdi)
+      code.move_immediate(X86_64Register::Rsi, PAGE_SIZE)
+      code.move_immediate(X86_64Register::Rdx, 3_u64)
+      code.move_immediate(X86_64Register::R10, 0x22_u64)
+      code.move_immediate(X86_64Register::R8, UInt64::MAX)
+      code.xor_register(X86_64Register::R9)
+      code.emit_syscall
+      code.test_register(X86_64Register::Rax)
+      code.jump_if_sign_to(allocation_failed)
+      code.move_register(X86_64Register::Rdi, X86_64Register::Rax)
+      code.move_immediate(X86_64Register::Rcx, EXCEPTION_KIND_DIVISION_BY_ZERO.to_u64)
+      code.move_memory_from_register(X86_64Register::Rdi, EXCEPTION_RECORD_KIND_OFFSET, X86_64Register::Rcx)
+    end
+
+    private def emit_frame_capture_loop(code : X86_64CodeBuffer, capture_loop : Int32, capture_done : Int32) : Nil
+      code.move_register(X86_64Register::Rsi, X86_64Register::R15)
+      code.xor_register(X86_64Register::Rcx)
+      code.mark_label(capture_loop)
+      code.test_register(X86_64Register::Rsi)
+      code.jump_if_zero_to(capture_done)
+      code.compare_register_immediate(X86_64Register::Rcx, MAX_EXCEPTION_FRAMES)
+      code.jump_if_greater_equal_to(capture_done)
+      emit_frame_record_copy(code)
+      code.move_register_from_memory(X86_64Register::Rsi, X86_64Register::Rsi, -8)
+      code.add_immediate_register(X86_64Register::Rcx, 1)
+      code.jump_to(capture_loop)
+    end
+
+    private def emit_frame_record_copy(code : X86_64CodeBuffer) : Nil
+      code.move_register(X86_64Register::R10, X86_64Register::Rcx)
+      code.shift_left_register(X86_64Register::R10, 4_u8)
+      code.move_register(X86_64Register::R11, X86_64Register::Rcx)
+      code.shift_left_register(X86_64Register::R11, 5_u8)
+      code.add_register(X86_64Register::R10, X86_64Register::R11)
+      code.move_register(X86_64Register::R11, X86_64Register::Rdi)
+      code.add_immediate_register(X86_64Register::R11, EXCEPTION_RECORD_FRAMES_OFFSET)
+      code.add_register(X86_64Register::R11, X86_64Register::R10)
+      copy_frame_field(code, -16, 0)
+      copy_frame_field(code, -24, 8)
+      copy_frame_field(code, -32, 16)
+      copy_frame_field(code, -40, 24)
+      copy_frame_field(code, -48, 32)
+      copy_frame_field(code, -56, 40)
+    end
+
+    private def copy_frame_field(code : X86_64CodeBuffer, frame_offset : Int32, record_offset : Int32) : Nil
+      code.move_register_from_memory(X86_64Register::Rax, X86_64Register::Rsi, frame_offset)
+      code.move_memory_from_register(X86_64Register::R11, record_offset, X86_64Register::Rax)
+    end
+
+    private def emit_exception_capture_return(code : X86_64CodeBuffer, capture_done : Int32) : Nil
+      code.mark_label(capture_done)
+      code.move_memory_from_register(X86_64Register::Rdi, EXCEPTION_RECORD_FRAME_COUNT_OFFSET, X86_64Register::Rcx)
+      code.move_register(X86_64Register::Rax, X86_64Register::Rdi)
+      code.xor_register(X86_64Register::Rdx)
+      code.emit_return_instruction
+    end
+
+    private def emit_release : EmittedFunction
+      code = X86_64CodeBuffer.new
+      loop_label = code.new_label
+      done_label = code.new_label
+      code.mark_label(loop_label)
+      code.test_register(X86_64Register::Rdi)
+      code.jump_if_zero_to(done_label)
+      code.move_register(X86_64Register::R8, X86_64Register::Rdi)
+      code.move_register_from_memory(X86_64Register::R9, X86_64Register::R8, EXCEPTION_RECORD_SUPPRESSED_OFFSET)
+      code.move_immediate(X86_64Register::Rax, UNMAP_SYSCALL)
+      code.move_immediate(X86_64Register::Rsi, PAGE_SIZE)
+      code.emit_syscall
+      code.move_register(X86_64Register::Rdi, X86_64Register::R9)
+      code.jump_to(loop_label)
+      code.mark_label(done_label)
+      code.xor_register(X86_64Register::Rax)
+      code.xor_register(X86_64Register::Rdx)
+      code.emit_return_instruction
+      code.resolve_labels
+      emit_helper(X86_64RuntimeSymbols::EXCEPTION_RELEASE, "__smalang_exception_release", code)
+    end
+
+    private def emit_report_uncaught : EmittedFunction
+      code = X86_64CodeBuffer.new
+      strings = X86_64RuntimeStringPool.new(code)
+      exceptions = code.new_label
+      frames = code.new_label
+      no_frames = code.new_label
+      code.move_register(X86_64Register::R12, X86_64Register::Rdi)
+      code.xor_register(X86_64Register::R15)
+      code.mark_label(exceptions)
+      emit_exception_prefix(code, strings)
+      emit_exception_kind(code, strings)
+      emit_exception_frames(code, strings, frames, no_frames)
+      code.mark_label(no_frames)
+      code.move_register_from_memory(X86_64Register::R12, X86_64Register::R12, EXCEPTION_RECORD_SUPPRESSED_OFFSET)
+      code.add_immediate_register(X86_64Register::R15, 1)
+      code.test_register(X86_64Register::R12)
+      code.jump_if_not_zero_to(exceptions)
+      code.emit_return_instruction
+
+      strings.append
+      code.resolve_labels
+      emit_helper(X86_64RuntimeSymbols::REPORT_UNCAUGHT, "__smalang_report_uncaught", code)
+    end
+
+    private def emit_exception_prefix(code : X86_64CodeBuffer, strings : X86_64RuntimeStringPool) : Nil
+      suppressed_prefix = code.new_label
+      after_prefix = code.new_label
+      code.test_register(X86_64Register::R15)
+      code.jump_if_not_zero_to(suppressed_prefix)
+      strings.write("Uncaught exception: ")
+      code.jump_to(after_prefix)
+      code.mark_label(suppressed_prefix)
+      strings.write("Suppressed exception: ")
+      code.mark_label(after_prefix)
+    end
+
+    private def emit_exception_kind(code : X86_64CodeBuffer, strings : X86_64RuntimeStringPool) : Nil
+      unknown_kind = code.new_label
+      done = code.new_label
+      code.move_register_from_memory(X86_64Register::Rcx, X86_64Register::R12, EXCEPTION_RECORD_KIND_OFFSET)
+      code.compare_register_immediate(X86_64Register::Rcx, EXCEPTION_KIND_DIVISION_BY_ZERO)
+      code.jump_if_not_equal_to(unknown_kind)
+      strings.write("DivisionByZero\n")
+      code.jump_to(done)
+      code.mark_label(unknown_kind)
+      strings.write("Unknown\n")
+      code.mark_label(done)
+    end
+
+    private def emit_exception_frames(
+      code : X86_64CodeBuffer,
+      strings : X86_64RuntimeStringPool,
+      loop_label : Int32,
+      done_label : Int32,
+    ) : Nil
+      code.move_register_from_memory(X86_64Register::R13, X86_64Register::R12, EXCEPTION_RECORD_FRAME_COUNT_OFFSET)
+      code.move_register(X86_64Register::R14, X86_64Register::R12)
+      code.add_immediate_register(X86_64Register::R14, EXCEPTION_RECORD_FRAMES_OFFSET)
+      code.mark_label(loop_label)
+      code.test_register(X86_64Register::R13)
+      code.jump_if_zero_to(done_label)
+      strings.write("  at ")
+      emit_exception_frame(code, strings)
+      code.add_immediate_register(X86_64Register::R14, EXCEPTION_FRAME_SIZE)
+      code.add_immediate_register(X86_64Register::R13, -1)
+      code.jump_to(loop_label)
+    end
+
+    private def emit_exception_frame(code : X86_64CodeBuffer, strings : X86_64RuntimeStringPool) : Nil
+      code.move_register_from_memory(X86_64Register::R10, X86_64Register::R14, 0)
+      code.move_register_from_memory(X86_64Register::R9, X86_64Register::R14, 8)
+      strings.write_registers(X86_64Register::R10, X86_64Register::R9)
+      strings.write(" (")
+      code.move_register_from_memory(X86_64Register::R10, X86_64Register::R14, 16)
+      code.move_register_from_memory(X86_64Register::R9, X86_64Register::R14, 24)
+      strings.write_registers(X86_64Register::R10, X86_64Register::R9)
+      strings.write(":")
+      code.move_register_from_memory(X86_64Register::R10, X86_64Register::R14, 32)
+      code.move_register_from_memory(X86_64Register::R9, X86_64Register::R14, 40)
+      strings.write_registers(X86_64Register::R10, X86_64Register::R9)
+      strings.write(")\n")
+    end
+
+    private def emit_exit(code : X86_64CodeBuffer, status : UInt64) : Nil
+      code.move_immediate(X86_64Register::Rdi, status)
+      code.move_immediate(X86_64Register::Rax, EXIT_SYSCALL)
+      code.emit_syscall
+    end
+
+    private def emit_helper(id : FunctionId, name : String, code : X86_64CodeBuffer) : EmittedFunction
+      function = IrFunction.new(id, name, Array(IrType).new, IrType::Isize)
+      EmittedFunction.new(function, code.bytes.dup, Array(X86_64Relocation).new, Array(X86_64CfiEvent).new)
+    end
+  end
+
+  class X86_64RuntimeStringPool
+    def initialize(@code : X86_64CodeBuffer)
+      @labels = {} of String => Int32
+      @entries = [] of Tuple(String, Int32)
+    end
+
+    def write(value : String) : Nil
+      label = intern(value)
+      @code.lea_rip_relative(X86_64Register::Rsi, label)
+      @code.move_immediate(X86_64Register::Rdx, value.bytesize.to_u64)
+      @code.move_immediate(X86_64Register::Rdi, 2_u64)
+      @code.move_immediate(X86_64Register::Rax, X86_64RuntimeEmitter::WRITE_SYSCALL)
+      @code.emit_syscall
+    end
+
+    def write_registers(pointer : X86_64Register, length : X86_64Register) : Nil
+      @code.move_register(X86_64Register::Rsi, pointer)
+      @code.move_register(X86_64Register::Rdx, length)
+      @code.move_immediate(X86_64Register::Rdi, 2_u64)
+      @code.move_immediate(X86_64Register::Rax, X86_64RuntimeEmitter::WRITE_SYSCALL)
+      @code.emit_syscall
+    end
+
+    def append : Nil
+      @entries.each do |value, label|
+        @code.mark_label(label)
+        @code.write_bytes(value.to_slice.to_a)
+      end
+    end
+
+    private def intern(value : String) : Int32
+      if label = @labels[value]?
+        return label
+      end
+      label = @code.new_label
+      @labels[value] = label
+      @entries << {value, label}
+      label
     end
   end
 
@@ -1141,11 +2022,14 @@ module Smalang
     end
 
     def global? : Bool
-      @function.name == "main"
+      @function.id == X86_64RuntimeSymbols::ENTRY || @function.name == "main"
     end
 
     def elf_name : String
-      global? ? "main" : ".Lsmalang_fn_#{@function.id}"
+      return "_start" if @function.id == X86_64RuntimeSymbols::ENTRY
+      return "__smalang_user_main" if @function.name == "main"
+      return @function.name if @function.id < 0
+      ".Lsmalang_fn_#{@function.id}"
     end
   end
 
@@ -1360,7 +2244,7 @@ module Smalang
     end
 
     private def ensure_unique_main(functions : Array(ElfFunctionSymbol)) : Nil
-      main_count = functions.count(&.global?)
+      main_count = functions.count { |function| function.function.name == "main" }
       raise X86_64BackendFailure.new("module contains more than one main function") if main_count > 1
     end
 
@@ -1533,6 +2417,14 @@ module Smalang
 
   class X86_64Backend
     def emit(ir_module : IrModule) : Array(UInt8)
+      emit_object(ir_module, nil)
+    end
+
+    def emit_with_main_result_assertion(ir_module : IrModule, expected_result : UInt64) : Array(UInt8)
+      emit_object(ir_module, expected_result)
+    end
+
+    private def emit_object(ir_module : IrModule, expected_result : UInt64?) : Array(UInt8)
       diagnostics = ir_module.verify
       unless diagnostics.empty?
         raise X86_64BackendFailure.new("cannot emit invalid IR:\n#{diagnostics.join("\n")}")
@@ -1553,6 +2445,35 @@ module Smalang
           relocations << X86_64Relocation.new(text_offset + relocation.offset, relocation.function_id)
         end
       end
+
+      main_function = nil.as(IrFunction?)
+      ir_module.each_function do |function|
+        main_function = function if function.name == "main"
+      end
+      unless main_function
+        raise X86_64BackendFailure.new("executable module must define main")
+      end
+
+      X86_64RuntimeEmitter.new.emit.each do |runtime_function|
+        text.align(16)
+        runtime_offset = text.size
+        text.write_bytes(runtime_function.bytes)
+        function_symbols << ElfFunctionSymbol.new(runtime_function.function, runtime_offset, runtime_function.bytes.size)
+        cfi_events_by_function[runtime_function.function.id] = runtime_function.cfi_events
+        runtime_function.relocations.each do |relocation|
+          relocations << X86_64Relocation.new(runtime_offset + relocation.offset, relocation.function_id)
+        end
+      end
+
+      text.align(16)
+      entry_offset = text.size
+      entry = X86_64EntryEmitter.new.emit(main_function.not_nil!.id, expected_result)
+      text.write_bytes(entry.bytes)
+      function_symbols << ElfFunctionSymbol.new(entry.function, entry_offset, entry.bytes.size)
+      entry.relocations.each do |relocation|
+        relocations << X86_64Relocation.new(entry_offset + relocation.offset, relocation.function_id)
+      end
+      cfi_events_by_function[entry.function.id] = entry.cfi_events
 
       eh_frame = X86_64EhFrameWriter.new.write(function_symbols, cfi_events_by_function)
       X86_64ElfObjectWriter.new.write(text.bytes, function_symbols, relocations, eh_frame.bytes, eh_frame.relocations)

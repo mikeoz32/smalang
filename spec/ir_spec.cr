@@ -126,6 +126,23 @@ describe Smalang::IrModule do
     ir.verify.should be_empty
   end
 
+  it "dumps invoke source locations in S-expression form" do
+    ir = Smalang::IrModule.new
+    callee = ir.add_function("callee", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    zero = callee.emit_constant(callee.entry_block_id, Smalang::IrType::Isize, 0)
+    callee.emit_return(callee.entry_block_id, zero)
+    caller = ir.add_function("caller", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    normal = caller.add_block("normal")
+    unwind = caller.add_block("unwind")
+    target = ir.internal_call_target(callee.id).not_nil!
+    location = Smalang::IrSourceLocation.new("source.py", 17)
+    result = caller.emit_invoke_call(caller.entry_block_id, target, Array(Smalang::ValueId).new, normal, unwind, location)
+    caller.emit_return(normal, result.value_id)
+    caller.emit_resume_exception(unwind, result.exception_id)
+
+    Smalang::IrSExpressionDumper.new.dump(ir).should contain("(at \"source.py\" 17)")
+  end
+
   it "merges values from predecessor blocks with explicit phi inputs" do
     ir = Smalang::IrModule.new
     function = ir.add_function("choose", [Smalang::IrType::Isize], Smalang::IrType::Isize)
@@ -179,6 +196,7 @@ describe Smalang::IrModule do
     function.emit_exception_dispatch(dispatch, result.exception_id, [
       Smalang::IrExceptionCase.new(Smalang::IrExceptionKind::DivisionByZero, caught),
     ], resume)
+    function.emit_exception_release(caught, result.exception_id)
     fallback = function.emit_constant(caught, Smalang::IrType::Isize, 0)
     function.emit_return(caught, fallback)
     function.emit_resume_exception(resume, result.exception_id)
@@ -187,5 +205,110 @@ describe Smalang::IrModule do
     dump.should contain("(invoke (div %v0 %v1) (normal @normal %v2) (exception @dispatch %v3))")
     dump.should contain("(exception-switch %v3 (kind DivisionByZero @caught) (default @resume))")
     ir.verify.should be_empty
+  end
+
+  it "releases caught exceptions and verifies exception ownership transfers" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("divide", [Smalang::IrType::Isize, Smalang::IrType::Isize], Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    normal = function.add_block("normal")
+    dispatch = function.add_block("dispatch")
+    caught = function.add_block("caught")
+    resume = function.add_block("resume")
+
+    result = function.emit_invoke_divide(
+      entry,
+      Smalang::IrType::Isize,
+      function.parameters[0].value_id,
+      function.parameters[1].value_id,
+      normal,
+      dispatch
+    )
+    function.emit_return(normal, result.value_id)
+    function.emit_exception_dispatch(dispatch, result.exception_id, [
+      Smalang::IrExceptionCase.new(Smalang::IrExceptionKind::DivisionByZero, caught),
+    ], resume)
+    function.emit_exception_release(caught, result.exception_id)
+    fallback = function.emit_constant(caught, Smalang::IrType::Isize, 0)
+    function.emit_return(caught, fallback)
+    function.emit_resume_exception(resume, result.exception_id)
+
+    dump = Smalang::IrSExpressionDumper.new.dump(ir)
+    dump.should contain("(exception.release %v3)")
+    ir.verify.should be_empty
+  end
+
+  it "transfers exception ownership through an exceptional phi edge" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("merge_exceptions", [Smalang::IrType::Isize], Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    left = function.add_block("left")
+    left_normal = function.add_block("left_normal")
+    left_failed = function.add_block("left_failed")
+    right = function.add_block("right")
+    right_normal = function.add_block("right_normal")
+    right_failed = function.add_block("right_failed")
+    merge = function.add_block("merge")
+    caught = function.add_block("caught")
+    function.emit_branch(entry, function.parameters.first.value_id, left, right)
+
+    left_value = function.emit_constant(left, Smalang::IrType::Isize, 10)
+    left_zero = function.emit_constant(left, Smalang::IrType::Isize, 0)
+    left_division = function.emit_invoke_divide(left, Smalang::IrType::Isize, left_value, left_zero, left_normal, left_failed)
+    function.emit_return(left_normal, left_division.value_id)
+    function.emit_jump(left_failed, merge)
+
+    right_value = function.emit_constant(right, Smalang::IrType::Isize, 20)
+    right_zero = function.emit_constant(right, Smalang::IrType::Isize, 0)
+    right_division = function.emit_invoke_divide(right, Smalang::IrType::Isize, right_value, right_zero, right_normal, right_failed)
+    function.emit_return(right_normal, right_division.value_id)
+    function.emit_jump(right_failed, merge)
+
+    merged_exception = function.emit_phi(merge, Smalang::IrType::Exception, [
+      Smalang::IrPhiIncoming.new(left_failed, left_division.exception_id),
+      Smalang::IrPhiIncoming.new(right_failed, right_division.exception_id),
+    ])
+    function.emit_exception_dispatch(merge, merged_exception, [
+      Smalang::IrExceptionCase.new(nil, caught),
+    ])
+    function.emit_exception_release(caught, merged_exception)
+    recovered = function.emit_constant(caught, Smalang::IrType::Isize, 0)
+    function.emit_return(caught, recovered)
+
+    ir.verify.should be_empty
+  end
+
+  it "rejects use of an exception after release" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("invalid_release", [Smalang::IrType::Isize, Smalang::IrType::Isize], Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    normal = function.add_block("normal")
+    caught = function.add_block("caught")
+
+    result = function.emit_invoke_divide(
+      entry,
+      Smalang::IrType::Isize,
+      function.parameters[0].value_id,
+      function.parameters[1].value_id,
+      normal,
+      caught
+    )
+    function.emit_return(normal, result.value_id)
+    function.emit_exception_release(caught, result.exception_id)
+    function.emit_resume_exception(caught, result.exception_id)
+
+    ir.verify.join("\n").should contain("exception %v3 is not owned")
+  end
+
+  it "rejects an invoke that recreates an exception while its previous value remains owned" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("loop_exception", [Smalang::IrType::Isize], Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    normal = function.add_block("normal")
+    value = function.parameters.first.value_id
+    result = function.emit_invoke_divide(entry, Smalang::IrType::Isize, value, value, normal, entry)
+    function.emit_return(normal, result.value_id)
+
+    ir.verify.join("\n").should contain("exception %v2 is already owned in block entry")
   end
 end
