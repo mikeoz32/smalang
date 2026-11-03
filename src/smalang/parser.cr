@@ -88,7 +88,15 @@ module Smalang
     end
   end
 
-  alias AstNode = ModuleNode | FunctionNode | ParameterNode | ReturnNode | BinaryExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr
+  struct ErrorNode
+    getter span : SourceSpan
+    getter recovered_node : NodeId?
+
+    def initialize(@span : SourceSpan, @recovered_node : NodeId? = nil)
+    end
+  end
+
+  alias AstNode = ModuleNode | FunctionNode | ParameterNode | ReturnNode | BinaryExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | ErrorNode
 
   abstract class AstVisitor
     abstract def visit(node : ModuleNode) : Nil
@@ -99,6 +107,7 @@ module Smalang
     abstract def visit(node : CallExpr) : Nil
     abstract def visit(node : IdentifierExpr) : Nil
     abstract def visit(node : IntegerLiteralExpr) : Nil
+    abstract def visit(node : ErrorNode) : Nil
   end
 
   struct ModuleNode
@@ -149,6 +158,12 @@ module Smalang
     end
   end
 
+  struct ErrorNode
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
   class AstArena
     def initialize(source_size : Int32)
       node_capacity = source_size // 4
@@ -192,14 +207,37 @@ module Smalang
     end
   end
 
-  class ParseError < Exception
+  class ParseDiagnostic
     getter source_file : SourceFile
-    getter token : Token
+    getter span : SourceSpan
     getter description : String
 
-    def initialize(@source_file : SourceFile, @token : Token, @description : String)
-      position = source_file.position_at(token.span.start)
-      super("#{source_file.name}:#{position.line}:#{position.column}: #{description}")
+    def initialize(@source_file : SourceFile, @span : SourceSpan, @description : String)
+    end
+
+    def message : String
+      position = @source_file.position_at(@span.start)
+      "#{@source_file.name}:#{position.line}:#{position.column}: #{@description}"
+    end
+  end
+
+  class ParseFailure < Exception
+    getter diagnostic : ParseDiagnostic
+
+    def initialize(@diagnostic : ParseDiagnostic)
+      super(diagnostic.message)
+    end
+  end
+
+  class ParseResult
+    getter parsed_module : ParsedModule
+    getter diagnostics : Array(ParseDiagnostic)
+
+    def initialize(@parsed_module : ParsedModule, @diagnostics : Array(ParseDiagnostic))
+    end
+
+    def success? : Bool
+      @diagnostics.empty?
     end
   end
 
@@ -208,20 +246,37 @@ module Smalang
 
     def initialize(@tokens : TokenStream)
       @cursor = 0
+      @diagnostics = Array(ParseDiagnostic).new
     end
 
-    def parse : ParsedModule
+    def parse : ParseResult
+      @cursor = 0
+      @diagnostics.clear
       arena = AstArena.new(@tokens.source_file.source.bytesize)
       function_ids = Array(NodeId).new
 
       until current_token.kind == TokenKind::Eof
-        function_ids << parse_function(arena)
+        start = current_token.span.start
+        if top_level_function_start?
+          begin
+            function_ids << parse_function(arena)
+          rescue failure : ParseFailure
+            @diagnostics << failure.diagnostic
+            finish = synchronize_top_level(start)
+            function_ids << arena.add(ErrorNode.new(span_between(start, finish)))
+          end
+        else
+          report("expected a function definition, found #{current_token.kind}")
+          finish = synchronize_top_level(start)
+          function_ids << arena.add(ErrorNode.new(span_between(start, finish)))
+        end
       end
 
       function_range = arena.append_children(function_ids)
       module_span = SourceSpan.new(0, @tokens.source_file.source.bytesize)
       root_id = arena.add(ModuleNode.new(module_span, function_range))
-      ParsedModule.new(@tokens.source_file, arena, root_id)
+      parsed_module = ParsedModule.new(@tokens.source_file, arena, root_id)
+      ParseResult.new(parsed_module, @diagnostics)
     end
 
     private def parse_function(arena : AstArena) : NodeId
@@ -236,28 +291,73 @@ module Smalang
       expect(TokenKind::Newline, "expected a newline after the function signature")
       expect(TokenKind::Indent, "expected an indented function body")
 
-      body = parse_return(arena)
-      dedent = expect(TokenKind::Dedent, "expected the end of the function body")
-      function_span = SourceSpan.new(start, dedent.span.start - start)
+      body = parse_function_body(arena)
+      function_end = current_token.span.start
+      if current_token.kind == TokenKind::Dedent
+        function_end = advance.span.start
+      end
+      function_span = span_between(start, function_end)
       arena.add(FunctionNode.new(function_span, name, return_type, parameters, body))
     end
 
     private def parse_parameters(arena : AstArena) : NodeRange
-      parameter_ids = Array(NodeId).new
-      return arena.append_children(parameter_ids) if current_token.kind == TokenKind::RightParen
+      parse_delimited_list(arena, "parameter") { parse_parameter(arena) }
+    end
+
+    private def parse_parameter(arena : AstArena) : NodeId
+      name = expect(TokenKind::Identifier, "expected a parameter name").span
+      expect(TokenKind::Colon, "expected ':' after the parameter name")
+      type = parse_type
+      span = SourceSpan.new(name.start, previous_token.span.end_offset - name.start)
+      arena.add(ParameterNode.new(span, name, type))
+    end
+
+    private def parse_delimited_list(arena : AstArena, item_name : String, &parse_item : -> NodeId) : NodeRange
+      item_ids = Array(NodeId).new
+      return arena.append_children(item_ids) if current_token.kind == TokenKind::RightParen
 
       loop do
-        name = expect(TokenKind::Identifier, "expected a parameter name").span
-        expect(TokenKind::Colon, "expected ':' after the parameter name")
-        type = parse_type
-        span = SourceSpan.new(name.start, previous_token.span.end_offset - name.start)
-        parameter_ids << arena.add(ParameterNode.new(span, name, type))
+        break if list_terminator?
 
-        break unless current_token.kind == TokenKind::Comma
-        advance
+        cursor_before = @cursor
+        begin
+          item_ids << yield
+        rescue failure : ParseFailure
+          @diagnostics << failure.diagnostic
+          item_ids << arena.add(ErrorNode.new(failure.diagnostic.span))
+          synchronize_list
+        end
+
+        if current_token.kind == TokenKind::Comma
+          comma = advance
+          if current_token.kind == TokenKind::RightParen
+            diagnostic = report("trailing commas are not supported", comma)
+            item_ids << arena.add(ErrorNode.new(diagnostic.span))
+            break
+          end
+          next
+        end
+
+        break if current_token.kind == TokenKind::RightParen || list_terminator?
+
+        diagnostic = report("expected ',' or ')' after a #{item_name}")
+        item_ids << arena.add(ErrorNode.new(diagnostic.span))
+        synchronize_list
+        if current_token.kind == TokenKind::Comma
+          comma = advance
+          if current_token.kind == TokenKind::RightParen
+            diagnostic = report("trailing commas are not supported", comma)
+            item_ids << arena.add(ErrorNode.new(diagnostic.span))
+            break
+          end
+        else
+          break
+        end
+
+        advance if @cursor == cursor_before
       end
 
-      arena.append_children(parameter_ids)
+      arena.append_children(item_ids)
     end
 
     private def parse_type : AstType
@@ -276,13 +376,49 @@ module Smalang
     private def parse_return(arena : AstArena) : NodeId
       start = expect(TokenKind::Return, "expected 'return'").span.start
       value = parse_expression(arena)
-      newline = expect(TokenKind::Newline, "expected a newline after the return statement")
-      span = SourceSpan.new(start, newline.span.start - start)
+      if current_token.kind != TokenKind::Newline && current_token.kind != TokenKind::Dedent && current_token.kind != TokenKind::Eof
+        diagnostic = report("expected a newline after the return statement")
+        expression_span = arena.node(value).span
+        synchronize_statement
+        end_offset = previous_token.span.end_offset
+        end_offset = diagnostic.span.end_offset if end_offset < diagnostic.span.end_offset
+        value = arena.add(ErrorNode.new(span_between(expression_span.start, end_offset), value))
+      end
+
+      end_offset = current_token.span.start
+      end_offset = advance.span.start if current_token.kind == TokenKind::Newline
+      end_offset = previous_token.span.end_offset if end_offset < start
+      span = span_between(start, end_offset)
       arena.add(ReturnNode.new(span, value))
     end
 
+    private def parse_function_body(arena : AstArena) : NodeId
+      body = begin
+        parse_return(arena)
+      rescue failure : ParseFailure
+        @diagnostics << failure.diagnostic
+        finish = synchronize_function_end
+        finish = failure.diagnostic.span.end_offset if finish < failure.diagnostic.span.end_offset
+        error_span = span_between(failure.diagnostic.span.start, finish)
+        return arena.add(ErrorNode.new(error_span))
+      end
+
+      return body if current_token.kind == TokenKind::Dedent || current_token.kind == TokenKind::Eof || top_level_function_start?
+
+      diagnostic = report("expected the end of the function body")
+      finish = synchronize_function_end
+      error_span = span_between(diagnostic.span.start, finish)
+      arena.add(ErrorNode.new(error_span, body))
+    end
+
     private def parse_expression(arena : AstArena, minimum_precedence : Int32 = PRECEDENCE) : NodeId
-      left = parse_primary(arena)
+      left = begin
+        parse_primary(arena)
+      rescue failure : ParseFailure
+        @diagnostics << failure.diagnostic
+        synchronize_expression
+        arena.add(ErrorNode.new(failure.diagnostic.span))
+      end
 
       while operator = current_binary_operator
         break if PRECEDENCE < minimum_precedence
@@ -311,10 +447,23 @@ module Smalang
           arena.add(IdentifierExpr.new(name))
         end
       when TokenKind::LeftParen
-        advance
+        open_paren = advance
         expression = parse_expression(arena)
-        expect(TokenKind::RightParen, "expected ')' after the expression")
-        expression
+        if current_token.kind == TokenKind::RightParen
+          advance
+          expression
+        else
+          report_missing("expected ')' after the expression, found #{current_token.kind}")
+          synchronize_parenthesized
+          finish = if current_token.kind == TokenKind::RightParen
+                     advance.span.end_offset
+                   else
+                     previous_token.span.end_offset
+                   end
+          finish = arena.node(expression).span.end_offset if finish < open_paren.span.end_offset
+          error = ErrorNode.new(span_between(open_paren.span.start, finish), expression)
+          arena.add(error)
+        end
       else
         fail("expected an expression")
       end
@@ -322,20 +471,115 @@ module Smalang
 
     private def parse_call(arena : AstArena, callee : SourceSpan) : NodeId
       expect(TokenKind::LeftParen, "expected '(' after the function name")
-      argument_ids = Array(NodeId).new
+      arguments = parse_delimited_list(arena, "argument") { parse_expression(arena) }
+      close_paren = if current_token.kind == TokenKind::RightParen
+                      advance
+                    else
+                      report_missing("expected ')' after the argument list, found #{current_token.kind}")
+                      synchronize_parenthesized
+                      advance if current_token.kind == TokenKind::RightParen
+                    end
 
-      unless current_token.kind == TokenKind::RightParen
-        loop do
-          argument_ids << parse_expression(arena)
-          break unless current_token.kind == TokenKind::Comma
-          advance
-        end
+      finish = close_paren.try(&.span.end_offset) || previous_token.span.end_offset
+      finish = callee.end_offset if finish < callee.end_offset
+      call_span = span_between(callee.start, finish)
+      call_id = arena.add(CallExpr.new(call_span, callee, arguments))
+      if close_paren
+        call_id
+      else
+        arena.add(ErrorNode.new(call_span, call_id))
+      end
+    end
+
+    private def synchronize_expression : Nil
+      until expression_terminator?
+        advance
+      end
+    end
+
+    private def synchronize_list : Nil
+      until list_terminator? || current_token.kind == TokenKind::Comma || current_token.kind == TokenKind::RightParen
+        advance
+      end
+    end
+
+    private def synchronize_parenthesized : Nil
+      until current_token.kind == TokenKind::RightParen || statement_terminator? || current_token.kind == TokenKind::Comma
+        advance
+      end
+    end
+
+    private def synchronize_statement : Nil
+      until statement_terminator?
+        advance
+      end
+    end
+
+    private def synchronize_function_end : Int32
+      start = current_token.span.start
+      cursor_before = @cursor
+      until current_token.kind == TokenKind::Dedent || current_token.kind == TokenKind::Eof || top_level_function_start?
+        advance
       end
 
-      arguments = arena.append_children(argument_ids)
-      close_paren = expect(TokenKind::RightParen, "expected ')' after the argument list")
-      span = SourceSpan.new(callee.start, close_paren.span.end_offset - callee.start)
-      arena.add(CallExpr.new(span, callee, arguments))
+      @cursor == cursor_before ? start : previous_token.span.end_offset
+    end
+
+    private def synchronize_top_level(start : Int32) : Int32
+      until current_token.kind == TokenKind::Eof
+        if top_level_function_start? && current_token.span.start > start
+          return current_token.span.start
+        end
+        advance
+      end
+
+      current_token.span.start
+    end
+
+    private def expression_terminator? : Bool
+      case current_token.kind
+      when TokenKind::Plus, TokenKind::Minus, TokenKind::Comma, TokenKind::RightParen,
+           TokenKind::Newline, TokenKind::Dedent, TokenKind::Eof
+        true
+      else
+        top_level_function_start?
+      end
+    end
+
+    private def list_terminator? : Bool
+      case current_token.kind
+      when TokenKind::Newline, TokenKind::Indent, TokenKind::Dedent, TokenKind::Eof
+        true
+      else
+        top_level_function_start?
+      end
+    end
+
+    private def statement_terminator? : Bool
+      current_token.kind == TokenKind::Newline || current_token.kind == TokenKind::Dedent || current_token.kind == TokenKind::Eof || top_level_function_start?
+    end
+
+    private def top_level_function_start? : Bool
+      current_token.kind == TokenKind::Def && @tokens.source_file.position_at(current_token.span.start).column == 1
+    end
+
+    private def report(description : String, token : Token = current_token) : ParseDiagnostic
+      report(description, token.span)
+    end
+
+    private def report_missing(description : String) : ParseDiagnostic
+      span = SourceSpan.new(current_token.span.start, 0)
+      report(description, span)
+    end
+
+    private def report(description : String, span : SourceSpan) : ParseDiagnostic
+      diagnostic = ParseDiagnostic.new(@tokens.source_file, span, description)
+      @diagnostics << diagnostic
+      diagnostic
+    end
+
+    private def span_between(start : Int32, finish : Int32) : SourceSpan
+      SourceSpan.new(start, {finish - start, 0}.max)
     end
 
     private def current_binary_operator : BinaryOperator?
@@ -365,11 +609,27 @@ module Smalang
 
     private def expect(kind : TokenKind, description : String) : Token
       return advance if current_token.kind == kind
-      fail("#{description}, found #{current_token.kind}")
+      fail(description)
     end
 
     private def fail(description : String) : NoReturn
-      raise ParseError.new(@tokens.source_file, current_token, description)
+      token = current_token
+      span = if missing_token_boundary?(token.kind)
+               SourceSpan.new(token.span.start, 0)
+             else
+               token.span
+             end
+      raise ParseFailure.new(ParseDiagnostic.new(@tokens.source_file, span, "#{description}, found #{token.kind}"))
+    end
+
+    private def missing_token_boundary?(kind : TokenKind) : Bool
+      case kind
+      when TokenKind::Comma, TokenKind::RightParen, TokenKind::Newline,
+           TokenKind::Indent, TokenKind::Dedent, TokenKind::Eof
+        true
+      else
+        false
+      end
     end
   end
 end

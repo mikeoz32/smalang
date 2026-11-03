@@ -36,6 +36,6 @@ Read [README.md](README.md) for project goals and design.
 
 - Before implementing a feature, use `$feature-interview`; save the plan in `plans/` and wait for explicit approval before coding.
 - Use `main` as the trunk. Do not create `dev` or `stage` branches.
-- Create short-lived `feature/*` and `fix/*` branches from up-to-date `main`; merge them back promptly and delete them after merging.
+- Create each short-lived `feature/*` or `fix/*` branch from up-to-date `main` in a dedicated Git worktree at `.worktrees/<branch-name>`; do not switch the primary working tree to feature branches. Reuse that worktree while continuing the branch. Merge branches back promptly and delete them after merging.
 - Tag verified commits on `main` as `vMAJOR.MINOR.PATCH`.
 - Before every commit, reread this file, review the full diff against its rules, and run the documented checks. Fix violations and exclude unrelated changes.
