@@ -183,6 +183,10 @@ module Smalang
       @nodes[id]
     end
 
+    def size : Int32
+      @nodes.size
+    end
+
     def append_children(ids : Array(NodeId)) : NodeRange
       start = @children.size
       @children.concat(ids)
