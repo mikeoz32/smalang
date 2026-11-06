@@ -5,36 +5,61 @@ module Smalang
   alias SymbolId = Int32
   alias TypeId = Int32
 
-  enum SemanticType : UInt8
-    Int
-    UInt
+  struct IntegerTypeInfo
+    getter name : String
+    getter bit_width : Int32
+    getter signed : Bool
+
+    def initialize(@name : String, @bit_width : Int32, @signed : Bool)
+    end
+
+    def fits_nonnegative_literal?(value : UInt128) : Bool
+      value_bits = @bit_width - (@signed ? 1 : 0)
+      value <= (1_u128 << value_bits) - 1
+    end
   end
 
   class SemanticTypeTable
+    POINTER_WIDTH = 64
+
     getter int_type_id : TypeId
     getter uint_type_id : TypeId
 
-    @types : Array(SemanticType)
+    @types : Array(IntegerTypeInfo)
+    @type_ids_by_ast_type : Hash(AstType, TypeId)
 
     def initialize
-      @types = [SemanticType::Int, SemanticType::UInt]
-      @int_type_id = 0
-      @uint_type_id = 1
+      @types = [] of IntegerTypeInfo
+      @type_ids_by_ast_type = {} of AstType => TypeId
+      register_type(AstType::Int, IntegerTypeInfo.new("int", POINTER_WIDTH, true))
+      register_type(AstType::UInt, IntegerTypeInfo.new("uint", POINTER_WIDTH, false))
+      register_type(AstType::Int8, IntegerTypeInfo.new("int8", 8, true))
+      register_type(AstType::UInt8, IntegerTypeInfo.new("uint8", 8, false))
+      register_type(AstType::Int16, IntegerTypeInfo.new("int16", 16, true))
+      register_type(AstType::UInt16, IntegerTypeInfo.new("uint16", 16, false))
+      register_type(AstType::Int32, IntegerTypeInfo.new("int32", 32, true))
+      register_type(AstType::UInt32, IntegerTypeInfo.new("uint32", 32, false))
+      register_type(AstType::Int64, IntegerTypeInfo.new("int64", 64, true))
+      register_type(AstType::UInt64, IntegerTypeInfo.new("uint64", 64, false))
+      @int_type_id = @type_ids_by_ast_type[AstType::Int]
+      @uint_type_id = @type_ids_by_ast_type[AstType::UInt]
     end
 
     def id_for(source_type : AstType) : TypeId
-      case source_type
-      when AstType::Int
-        @int_type_id
-      when AstType::UInt
-        @uint_type_id
-      else
-        raise ArgumentError.new("unsupported AST type #{source_type}")
-      end
+      @type_ids_by_ast_type[source_type]
     end
 
     def label(type_id : TypeId) : String
-      @types[type_id].to_s.downcase
+      @types[type_id].name
+    end
+
+    def fits_nonnegative_literal?(type_id : TypeId, value : UInt128) : Bool
+      @types[type_id].fits_nonnegative_literal?(value)
+    end
+
+    private def register_type(ast_type : AstType, type_info : IntegerTypeInfo) : Nil
+      @type_ids_by_ast_type[ast_type] = @types.size
+      @types << type_info
     end
   end
 
@@ -328,11 +353,13 @@ module Smalang
   class FunctionBodyChecker < SemanticAstVisitor
     @current_function : SemanticFunctionSymbol?
     @current_parameter_scope : FunctionParameterScope?
+    @expected_type_id : TypeId?
 
     def initialize(context : SemanticContext)
       super(context)
       @current_function = nil
       @current_parameter_scope = nil
+      @expected_type_id = nil
     end
 
     def check : Nil
@@ -376,10 +403,14 @@ module Smalang
     end
 
     def visit(node : ReturnNode) : Nil
-      value_type = analyze_expression(node.value)
-      return if @context.diagnostic || value_type.nil?
-
       function = @current_function.not_nil!
+      value_type = analyze_expression(node.value, function.result_type_id)
+      return if @context.diagnostic
+      unless value_type
+        @context.report(@context.arena.node(node.value).span, "integer literal requires an expected integer type")
+        return
+      end
+
       if value_type != function.result_type_id
         value_span = @context.arena.node(node.value).span
         @context.report(value_span, "return has type #{type_label(value_type)}, expected #{type_label(function.result_type_id)}")
@@ -388,9 +419,23 @@ module Smalang
 
     def visit(node : BinaryExpr) : Nil
       left_type = analyze_expression(node.left)
-      return if @context.diagnostic || left_type.nil?
+      return if @context.diagnostic
       right_type = analyze_expression(node.right)
-      return if @context.diagnostic || right_type.nil?
+      return if @context.diagnostic
+
+      expected_type_id = @expected_type_id
+      if left_type.nil? && right_type.nil?
+        return unless expected_type_id
+        left_type = analyze_expression(node.left, expected_type_id)
+        return if @context.diagnostic
+        right_type = analyze_expression(node.right, expected_type_id)
+      elsif left_type.nil? && right_type
+        left_type = analyze_expression(node.left, right_type)
+      elsif right_type.nil? && left_type
+        right_type = analyze_expression(node.right, left_type)
+      end
+
+      return if @context.diagnostic || left_type.nil? || right_type.nil?
 
       if left_type != right_type
         operator = node.operator == BinaryOperator::Add ? "+" : "-"
@@ -416,10 +461,14 @@ module Smalang
 
       node.arguments.count.times do |index|
         argument_id = @context.arena.child(node.arguments, index)
-        argument_type = analyze_expression(argument_id)
-        return if @context.diagnostic || argument_type.nil?
-
         expected_type = function.parameter_type(index).not_nil!
+        argument_type = analyze_expression(argument_id, expected_type)
+        return if @context.diagnostic
+        unless argument_type
+          @context.report(@context.arena.node(argument_id).span, "integer literal requires an expected integer type")
+          return
+        end
+
         if argument_type != expected_type
           @context.report(
             @context.arena.node(argument_id).span,
@@ -446,12 +495,25 @@ module Smalang
     end
 
     def visit(node : IntegerLiteralExpr) : Nil
-      @context.set_type(current_node_id, @context.type_table.int_type_id)
+      expected_type_id = @expected_type_id
+      return unless expected_type_id
+
+      literal_text = @context.parsed_module.source_file.slice(node.span)
+      literal_value = literal_text.to_u128?
+      unless literal_value && @context.type_table.fits_nonnegative_literal?(expected_type_id, literal_value)
+        @context.report(node.span, "literal #{literal_text} does not fit type #{type_label(expected_type_id)}")
+        return
+      end
+
+      @context.set_type(current_node_id, expected_type_id)
     end
 
-    private def analyze_expression(node_id : NodeId) : TypeId?
+    private def analyze_expression(node_id : NodeId, expected_type_id : TypeId? = nil) : TypeId?
       return nil if @context.diagnostic
+      previous_expected_type_id = @expected_type_id
+      @expected_type_id = expected_type_id
       visit_node(node_id)
+      @expected_type_id = previous_expected_type_id
       @context.type_of(node_id)
     end
 

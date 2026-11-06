@@ -118,6 +118,25 @@ describe Smalang::Lexer do
     ])
   end
 
+  it "recognizes fixed-width integer type names as whole keywords" do
+    stream = Smalang::Lexer.new.tokenize(
+      "def values(a: int8, b: uint8, c: int16, d: uint16, e: int32, f: uint32, g: int64, h: uint64, int80: int8) -> int64:\n    return a\n"
+    )
+
+    kinds = stream.tokens.map(&.kind)
+    kinds.should contain(Smalang::TokenKind::Int8Type)
+    kinds.should contain(Smalang::TokenKind::UInt8Type)
+    kinds.should contain(Smalang::TokenKind::Int16Type)
+    kinds.should contain(Smalang::TokenKind::UInt16Type)
+    kinds.should contain(Smalang::TokenKind::Int32Type)
+    kinds.should contain(Smalang::TokenKind::UInt32Type)
+    kinds.should contain(Smalang::TokenKind::Int64Type)
+    kinds.should contain(Smalang::TokenKind::UInt64Type)
+
+    identifiers = stream.tokens.select { |token| token.kind == Smalang::TokenKind::Identifier }
+    identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("int80")
+  end
+
   it "ignores blank lines, accepts CRLF, and inserts the final newline" do
     stream = Smalang::Lexer.new.tokenize(
       "\r\n    \r\ndef main() -> int:\r\n    return 1"

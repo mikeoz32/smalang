@@ -68,6 +68,98 @@ describe Smalang::SemanticAnalyzer do
     semantic.type_of(expression.left).should eq(semantic.type_table.uint_type_id)
   end
 
+  it "accepts fixed-width integer signatures and contextual in-range literals" do
+    source = String.build do |program|
+      program << "def signed8() -> int8:\n    return 127\n\n"
+      program << "def unsigned8() -> uint8:\n    return 255\n\n"
+      program << "def signed16() -> int16:\n    return 32767\n\n"
+      program << "def unsigned16() -> uint16:\n    return 65535\n\n"
+      program << "def signed32() -> int32:\n    return 2147483647\n\n"
+      program << "def unsigned32() -> uint32:\n    return 4294967295\n\n"
+      program << "def signed64() -> int64:\n    return 9223372036854775807\n\n"
+      program << "def unsigned64() -> uint64:\n    return 18446744073709551615\n\n"
+      program << "def signed_pointer() -> int:\n    return 9223372036854775807\n\n"
+      program << "def unsigned_pointer() -> uint:\n    return 18446744073709551615\n\n"
+      program << "def main() -> int:\n    return 0\n"
+    end
+
+    result = SemanticSpecHelpers.analyze(source)
+
+    result.success?.should eq(true)
+  end
+
+  it "uses typed operands and enclosing signatures to type integer literals" do
+    result = SemanticSpecHelpers.analyze(
+      "def add(value: int8) -> int8:\n    return value + 1\n\ndef calculate() -> int16:\n    return 1 + 2\n\ndef identity(value: uint8) -> uint8:\n    return value\n\ndef call() -> uint8:\n    return identity(255)\n\ndef main() -> int:\n    return 0\n"
+    )
+
+    result.success?.should eq(true)
+  end
+
+  it "rejects integer literals that exceed the contextual type range" do
+    invalid_literals = [
+      {"int8", "128"},
+      {"uint8", "256"},
+      {"int16", "32768"},
+      {"uint16", "65536"},
+      {"int32", "2147483648"},
+      {"uint32", "4294967296"},
+      {"int64", "9223372036854775808"},
+      {"uint64", "18446744073709551616"},
+      {"int", "9223372036854775808"},
+      {"uint", "18446744073709551616"},
+    ]
+
+    invalid_literals.each do |type, value|
+      result = SemanticSpecHelpers.analyze(
+        "def invalid() -> #{type}:\n    return #{value}\n\ndef main() -> int:\n    return 0\n"
+      )
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.message.should contain("literal #{value} does not fit type #{type}")
+    end
+  end
+
+  it "checks literal ranges when the context comes from calls and arithmetic operands" do
+    invalid_sources = [
+      "def take(value: uint8) -> int:\n    return 0\n\ndef main() -> int:\n    return take(256)\n",
+      "def add(value: int8) -> int8:\n    return value + 128\n\ndef main() -> int:\n    return 0\n",
+    ]
+
+    invalid_sources.each do |source|
+      result = SemanticSpecHelpers.analyze(source)
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.message.should contain("does not fit type")
+    end
+  end
+
+  it "rejects implicit conversions between differently typed integer values" do
+    result = SemanticSpecHelpers.analyze(
+      "def add(left: int8, right: int16) -> int16:\n    return left + right\n\ndef main() -> int:\n    return 0\n"
+    )
+
+    result.success?.should eq(false)
+    result.diagnostic.not_nil!.message.should contain("operator '+' operands must have matching types")
+  end
+
+  it "rejects implicit integer conversions in calls and returns" do
+    invalid_sources = [
+      {"def take(value: int16) -> int16:\n    return value\n\ndef caller(value: int8) -> int16:\n    return take(value)\n\ndef main() -> int:\n    return 0\n", "argument 0 has type int8, expected int16"},
+      {"def widen(value: int8) -> int16:\n    return value\n\ndef main() -> int:\n    return 0\n", "return has type int8, expected int16"},
+      {"def widen(value: int) -> int64:\n    return value\n\ndef main() -> int:\n    return 0\n", "return has type int, expected int64"},
+      {"def widen(value: uint) -> uint64:\n    return value\n\ndef main() -> int:\n    return 0\n", "return has type uint, expected uint64"},
+      {"def add(left: int8, right: uint8) -> int8:\n    return left + right\n\ndef main() -> int:\n    return 0\n", "operator '+' operands must have matching types"},
+    ]
+
+    invalid_sources.each do |source, expected_diagnostic|
+      result = SemanticSpecHelpers.analyze(source)
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.message.should contain(expected_diagnostic)
+    end
+  end
+
   it "resolves forward and mutually recursive function calls" do
     source = "def is_even(value: int) -> int:\n    return is_odd(value)\n\ndef is_odd(value: int) -> int:\n    return is_even(value)\n\ndef main() -> int:\n    return is_even(0)\n"
     tokens = Smalang::Lexer.new.tokenize(source)

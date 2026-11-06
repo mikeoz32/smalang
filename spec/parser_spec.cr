@@ -121,6 +121,29 @@ describe Smalang::Parser do
     right.type.should eq(Smalang::AstType::Int)
   end
 
+  it "parses each fixed-width integer type in parameter and result annotations" do
+    types = [
+      {"int8", Smalang::AstType::Int8},
+      {"uint8", Smalang::AstType::UInt8},
+      {"int16", Smalang::AstType::Int16},
+      {"uint16", Smalang::AstType::UInt16},
+      {"int32", Smalang::AstType::Int32},
+      {"uint32", Smalang::AstType::UInt32},
+      {"int64", Smalang::AstType::Int64},
+      {"uint64", Smalang::AstType::UInt64},
+    ]
+
+    types.each do |name, ast_type|
+      result = ParserSpecHelpers.parse("def identity(value: #{name}) -> #{name}:\n    return value\n")
+      result.diagnostics.should be_empty
+
+      function = ParserSpecHelpers.function_at(result.parsed_module, 0)
+      function.return_type.should eq(ast_type)
+      parameter = result.parsed_module.arena.node(result.parsed_module.arena.child(function.parameters, 0)).as(Smalang::ParameterNode)
+      parameter.type.should eq(ast_type)
+    end
+  end
+
   it "builds nested calls and left-associative arithmetic expressions" do
     result = ParserSpecHelpers.parse("def main() -> int:\n    return outer(inner(1), 2 - 3 + 4)\n")
     result.diagnostics.should be_empty
