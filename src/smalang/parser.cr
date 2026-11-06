@@ -5,6 +5,14 @@ module Smalang
     Int
     UInt
     Bool
+    Int8
+    UInt8
+    Int16
+    UInt16
+    Int32
+    UInt32
+    Int64
+    UInt64
   end
 
   enum BinaryOperator : UInt8
@@ -391,8 +399,32 @@ module Smalang
       when TokenKind::BoolType
         advance
         AstType::Bool
+      when TokenKind::Int8Type
+        advance
+        AstType::Int8
+      when TokenKind::UInt8Type
+        advance
+        AstType::UInt8
+      when TokenKind::Int16Type
+        advance
+        AstType::Int16
+      when TokenKind::UInt16Type
+        advance
+        AstType::UInt16
+      when TokenKind::Int32Type
+        advance
+        AstType::Int32
+      when TokenKind::UInt32Type
+        advance
+        AstType::UInt32
+      when TokenKind::Int64Type
+        advance
+        AstType::Int64
+      when TokenKind::UInt64Type
+        advance
+        AstType::UInt64
       else
-        fail("expected 'int', 'uint', or 'bool' as a type")
+        fail("expected a type")
       end
     end
 

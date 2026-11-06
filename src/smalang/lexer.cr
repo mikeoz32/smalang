@@ -5,6 +5,14 @@ module Smalang
     IntType
     UIntType
     BoolType
+    Int8Type
+    UInt8Type
+    Int16Type
+    UInt16Type
+    Int32Type
+    UInt32Type
+    Int64Type
+    UInt64Type
     Identifier
     IntegerLiteral
     TrueLiteral
@@ -270,10 +278,18 @@ module Smalang
         return TokenKind::UIntType if matches_keyword?(start, "uint")
         return TokenKind::BoolType if matches_keyword?(start, "bool")
         return TokenKind::TrueLiteral if matches_keyword?(start, "true")
+        return TokenKind::Int8Type if matches_keyword?(start, "int8")
       when 5
         return TokenKind::FalseLiteral if matches_keyword?(start, "false")
+        return TokenKind::UInt8Type if matches_keyword?(start, "uint8")
+        return TokenKind::Int16Type if matches_keyword?(start, "int16")
+        return TokenKind::Int32Type if matches_keyword?(start, "int32")
+        return TokenKind::Int64Type if matches_keyword?(start, "int64")
       when 6
         return TokenKind::Return if matches_keyword?(start, "return")
+        return TokenKind::UInt16Type if matches_keyword?(start, "uint16")
+        return TokenKind::UInt32Type if matches_keyword?(start, "uint32")
+        return TokenKind::UInt64Type if matches_keyword?(start, "uint64")
       end
 
       TokenKind::Identifier

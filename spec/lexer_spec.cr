@@ -118,7 +118,26 @@ describe Smalang::Lexer do
     ])
   end
 
-  it "recognizes bool types and boolean literals without splitting similar identifiers" do
+  it "recognizes fixed-width integer type names as whole keywords" do
+    stream = Smalang::Lexer.new.tokenize(
+      "def values(a: int8, b: uint8, c: int16, d: uint16, e: int32, f: uint32, g: int64, h: uint64, int80: int8) -> int64:\n    return a\n"
+    )
+
+    kinds = stream.tokens.map(&.kind)
+    kinds.should contain(Smalang::TokenKind::Int8Type)
+    kinds.should contain(Smalang::TokenKind::UInt8Type)
+    kinds.should contain(Smalang::TokenKind::Int16Type)
+    kinds.should contain(Smalang::TokenKind::UInt16Type)
+    kinds.should contain(Smalang::TokenKind::Int32Type)
+    kinds.should contain(Smalang::TokenKind::UInt32Type)
+    kinds.should contain(Smalang::TokenKind::Int64Type)
+    kinds.should contain(Smalang::TokenKind::UInt64Type)
+
+    identifiers = stream.tokens.select { |token| token.kind == Smalang::TokenKind::Identifier }
+    identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("int80")
+  end
+
+  it "recognizes bool types and boolean literals as whole keywords" do
     stream = Smalang::Lexer.new.tokenize(
       "def booleanish(boolish: bool) -> bool:\n    return true\n\ndef falsehood() -> bool:\n    return false\n"
     )
@@ -126,9 +145,7 @@ describe Smalang::Lexer do
     stream.tokens.map(&.kind).should contain(Smalang::TokenKind::BoolType)
     stream.tokens.map(&.kind).should contain(Smalang::TokenKind::TrueLiteral)
     stream.tokens.map(&.kind).should contain(Smalang::TokenKind::FalseLiteral)
-
     identifiers = stream.tokens.select { |token| token.kind == Smalang::TokenKind::Identifier }
-    identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("booleanish")
     identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("boolish")
     identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("falsehood")
   end

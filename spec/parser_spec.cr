@@ -125,6 +125,29 @@ describe Smalang::Parser do
     right.type.should eq(Smalang::AstType::Int)
   end
 
+  it "parses each fixed-width integer type in parameter and result annotations" do
+    types = [
+      {"int8", Smalang::AstType::Int8},
+      {"uint8", Smalang::AstType::UInt8},
+      {"int16", Smalang::AstType::Int16},
+      {"uint16", Smalang::AstType::UInt16},
+      {"int32", Smalang::AstType::Int32},
+      {"uint32", Smalang::AstType::UInt32},
+      {"int64", Smalang::AstType::Int64},
+      {"uint64", Smalang::AstType::UInt64},
+    ]
+
+    types.each do |name, ast_type|
+      result = ParserSpecHelpers.parse("def identity(value: #{name}) -> #{name}:\n    return value\n")
+      result.diagnostics.should be_empty
+
+      function = ParserSpecHelpers.function_at(result.parsed_module, 0)
+      function.return_type.should eq(ast_type)
+      parameter = result.parsed_module.arena.node(result.parsed_module.arena.child(function.parameters, 0)).as(Smalang::ParameterNode)
+      parameter.type.should eq(ast_type)
+    end
+  end
+
   it "parses bool annotations and boolean literals into the AST" do
     result = ParserSpecHelpers.parse(
       "def identity(value: bool) -> bool:\n    return value\n\ndef truth() -> bool:\n    return true\n\ndef main() -> int:\n    return 0\n"
@@ -136,10 +159,8 @@ describe Smalang::Parser do
     identity.return_type.should eq(Smalang::AstType::Bool)
     parameter = parsed.arena.node(parsed.arena.child(identity.parameters, 0)).as(Smalang::ParameterNode)
     parameter.type.should eq(Smalang::AstType::Bool)
-
     truth = ParserSpecHelpers.function_at(parsed, 1)
-    returned = parsed.arena.node(truth.body).as(Smalang::ReturnNode)
-    literal = parsed.arena.node(returned.value).as(Smalang::BooleanLiteralExpr)
+    literal = parsed.arena.node(parsed.arena.node(truth.body).as(Smalang::ReturnNode).value).as(Smalang::BooleanLiteralExpr)
     parsed.source_file.slice(literal.span).should eq("true")
   end
 
