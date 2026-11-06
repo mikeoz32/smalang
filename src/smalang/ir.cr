@@ -7,6 +7,7 @@ module Smalang
   enum IrType : UInt8
     Isize
     Usize
+    Bool
     Exception
 
     def label : String
@@ -250,6 +251,10 @@ module Smalang
       type = @result_type
       return [] of String unless type
       return [] of String if type == IrType::Isize || type == IrType::Usize
+      if type == IrType::Bool
+        return [] of String if @value == 0 || @value == 1
+        return [context.error("bool constant must be 0 or 1, got #{@value}")]
+      end
       [context.error("const result must have an integer type, got #{type.label}")]
     end
 
@@ -609,8 +614,8 @@ module Smalang
     def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
       type = operand_types.first?
       return [] of String unless type
-      return [] of String if type == IrType::Isize || type == IrType::Usize
-      [context.error("branch condition must be an integer, got #{type.label}")]
+      return [] of String if type == IrType::Isize || type == IrType::Usize || type == IrType::Bool
+      [context.error("branch condition must be an integer or bool, got #{type.label}")]
     end
 
     def expression : String

@@ -1442,8 +1442,13 @@ module Smalang
           raise X86_64BackendFailure.new("constant #{value} does not fit usize on x86_64")
         end
         value.to_u64
+      when IrType::Bool
+        unless value == 0 || value == 1
+          raise X86_64BackendFailure.new("bool constant must be 0 or 1, got #{value}")
+        end
+        value.to_u64
       else
-        raise X86_64BackendFailure.new("unsupported integer type #{type}")
+        raise X86_64BackendFailure.new("unsupported constant type #{type}")
       end
     end
 

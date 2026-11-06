@@ -37,6 +37,68 @@ describe Smalang::IrModule do
     ir.verify.should be_empty
   end
 
+  it "represents boolean constants, signatures, and returns as typed SSA" do
+    ir = Smalang::IrModule.new
+    identity = ir.add_function("identity", [Smalang::IrType::Bool], Smalang::IrType::Bool)
+    identity.emit_return(identity.entry_block_id, identity.parameters.first.value_id)
+
+    literal = ir.add_function("literal", Array(Smalang::IrType).new, Smalang::IrType::Bool)
+    truth = literal.emit_constant(literal.entry_block_id, Smalang::IrType::Bool, 1)
+    literal.emit_return(literal.entry_block_id, truth)
+
+    caller = ir.add_function("caller", Array(Smalang::IrType).new, Smalang::IrType::Bool)
+    argument = caller.emit_constant(caller.entry_block_id, Smalang::IrType::Bool, 0)
+    normal = caller.add_block("normal")
+    unwind = caller.add_block("unwind")
+    target = ir.internal_call_target(identity.id).not_nil!
+    result = caller.emit_invoke_call(caller.entry_block_id, target, [argument], normal, unwind)
+    caller.emit_return(normal, result.value_id)
+    caller.emit_resume_exception(unwind, result.exception_id)
+
+    dump = Smalang::IrSExpressionDumper.new.dump(ir)
+    dump.should contain("(func @identity (param %v0 bool) (result bool)")
+    dump.should contain("(%v0 bool (const 1))")
+    dump.should contain("(invoke (call @identity %v0) (normal @normal %v1) (exception @unwind %v2))")
+    ir.verify.should be_empty
+  end
+
+  it "accepts boolean branch conditions and merges bool values through phi" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("choose", [Smalang::IrType::Bool], Smalang::IrType::Bool)
+    entry = function.entry_block_id
+    truth = function.add_block("truth")
+    falsity = function.add_block("falsity")
+    join = function.add_block("join")
+    function.emit_branch(entry, function.parameters.first.value_id, truth, falsity)
+    true_value = function.emit_constant(truth, Smalang::IrType::Bool, 1)
+    function.emit_jump(truth, join)
+    false_value = function.emit_constant(falsity, Smalang::IrType::Bool, 0)
+    function.emit_jump(falsity, join)
+    result = function.emit_phi(join, Smalang::IrType::Bool, [
+      Smalang::IrPhiIncoming.new(truth, true_value),
+      Smalang::IrPhiIncoming.new(falsity, false_value),
+    ])
+    function.emit_return(join, result)
+
+    dump = Smalang::IrSExpressionDumper.new.dump(ir)
+    dump.should contain("(branch %v0 @truth @falsity)")
+    dump.should contain("(%v3 bool (phi [@truth %v1] [@falsity %v2]))")
+    ir.verify.should be_empty
+  end
+
+  it "rejects noncanonical boolean constants and boolean arithmetic" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("broken", Array(Smalang::IrType).new, Smalang::IrType::Bool)
+    entry = function.entry_block_id
+    invalid = function.emit_constant(entry, Smalang::IrType::Bool, 2)
+    function.emit_add(entry, Smalang::IrType::Bool, invalid, invalid)
+    function.emit_return(entry, invalid)
+
+    diagnostics = ir.verify.join("\n")
+    diagnostics.should contain("bool constant must be 0 or 1")
+    diagnostics.should contain("add requires integer operands and result, got bool")
+  end
+
   it "represents multiplication as a typed SSA operation" do
     ir = Smalang::IrModule.new
     function = ir.add_function("multiply", [Smalang::IrType::Isize, Smalang::IrType::Isize], Smalang::IrType::Isize)

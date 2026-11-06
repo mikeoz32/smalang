@@ -30,6 +30,52 @@ describe Smalang::X86_64Backend do
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
 
+  it "passes bool values through calls, phi nodes, and true and false branches" do
+    [0_i128, 1_i128].each do |input|
+      ir = Smalang::IrModule.new
+      parameter_types = Array.new(6, Smalang::IrType::Isize)
+      parameter_types << Smalang::IrType::Bool
+      identity = ir.add_function("identity", parameter_types, Smalang::IrType::Bool)
+      identity.emit_return(identity.entry_block_id, identity.parameters.last.value_id)
+
+      main = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+      entry = main.entry_block_id
+      arguments = Array(Smalang::ValueId).new
+      6.times do
+        arguments << main.emit_constant(entry, Smalang::IrType::Isize, 0)
+      end
+      flag = main.emit_constant(entry, Smalang::IrType::Bool, input)
+      arguments << flag
+      normal = main.add_block("normal")
+      unwind = main.add_block("unwind")
+      truth = main.add_block("truth")
+      falsity = main.add_block("falsity")
+      join = main.add_block("join")
+      success = main.add_block("success")
+      failure = main.add_block("failure")
+      target = ir.internal_call_target(identity.id).not_nil!
+      result = main.emit_invoke_call(entry, target, arguments, normal, unwind)
+      main.emit_branch(normal, result.value_id, truth, falsity)
+      true_value = main.emit_constant(truth, Smalang::IrType::Bool, 1)
+      main.emit_jump(truth, join)
+      false_value = main.emit_constant(falsity, Smalang::IrType::Bool, 0)
+      main.emit_jump(falsity, join)
+      merged = main.emit_phi(join, Smalang::IrType::Bool, [
+        Smalang::IrPhiIncoming.new(truth, true_value),
+        Smalang::IrPhiIncoming.new(falsity, false_value),
+      ])
+      main.emit_branch(join, merged, success, failure)
+      success_value = main.emit_constant(success, Smalang::IrType::Isize, 42)
+      main.emit_return(success, success_value)
+      failure_value = main.emit_constant(failure, Smalang::IrType::Isize, 1)
+      main.emit_return(failure, failure_value)
+      main.emit_resume_exception(unwind, result.exception_id)
+
+      expected = input == 1 ? 42 : 1
+      BackendSpecHelpers.link_and_run(ir).should eq(expected)
+    end
+  end
+
   it "emits 64-bit subtraction" do
     ir = Smalang::IrModule.new
     function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)

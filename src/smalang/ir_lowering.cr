@@ -65,6 +65,7 @@ module Smalang
       type_table = @semantic_module.type_table
       return IrType::Isize if type_id == type_table.int_type_id
       return IrType::Usize if type_id == type_table.uint_type_id
+      return IrType::Bool if type_id == type_table.bool_type_id
 
       report(span, "unsupported semantic type id #{type_id}")
       nil
@@ -392,6 +393,22 @@ module Smalang
         return
       end
 
+      @expression_value_id = function.emit_constant(current_block_id, type, value)
+    end
+
+    def visit(node : BooleanLiteralExpr) : Nil
+      type_id = @context.type_of(current_node_id)
+      return unless type_id
+      type = @context.ir_type_for(type_id, node.span)
+      return unless type
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "boolean literal is not inside a function")
+        return
+      end
+
+      value = node.value ? 1_i128 : 0_i128
       @expression_value_id = function.emit_constant(current_block_id, type, value)
     end
 

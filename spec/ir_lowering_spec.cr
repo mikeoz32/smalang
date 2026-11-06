@@ -45,6 +45,30 @@ describe Smalang::IrLowerer do
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
 
+  it "lowers bool literals, signatures, parameters, and nested calls" do
+    source = "def identity(value: bool) -> bool:\n    return value\n\ndef true_value() -> bool:\n    return true\n\ndef false_value() -> bool:\n    return false\n\ndef forward() -> bool:\n    return identity(true_value())\n\ndef accept(value: bool) -> int:\n    return 42\n\ndef main() -> int:\n    return accept(forward())\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    identity = ir.function(0).not_nil!
+    true_value = ir.function(1).not_nil!
+    false_value = ir.function(2).not_nil!
+    forward = ir.function(3).not_nil!
+    identity.signature.parameter_types.should eq([Smalang::IrType::Bool])
+    identity.signature.result_type.should eq(Smalang::IrType::Bool)
+    true_value.signature.result_type.should eq(Smalang::IrType::Bool)
+    literal = IrLoweringSpecHelpers.instructions(true_value).find! { |instruction| instruction.is_a?(Smalang::IrConstantInstruction) }
+    literal.as(Smalang::IrConstantInstruction).value.should eq(1)
+    false_literal = IrLoweringSpecHelpers.instructions(false_value).find! { |instruction| instruction.is_a?(Smalang::IrConstantInstruction) }
+    false_literal.as(Smalang::IrConstantInstruction).value.should eq(0)
+    forward.signature.result_type.should eq(Smalang::IrType::Bool)
+    forward_calls = IrLoweringSpecHelpers.instructions(forward).select { |instruction| instruction.is_a?(Smalang::IrInvokeInstruction) }
+    forward_calls.size.should eq(2)
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
   it "preserves unsigned parameter and expression types" do
     source = "def add(left: uint, right: uint) -> uint:\n    return left + right\n\ndef main() -> int:\n    return 0\n"
     result = IrLoweringSpecHelpers.lower(source)
