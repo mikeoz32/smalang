@@ -9,9 +9,63 @@ module Smalang
     Usize
     Bool
     Exception
+    Int8
+    UInt8
+    Int16
+    UInt16
+    Int32
+    UInt32
+    Int64
+    UInt64
 
     def label : String
       to_s.downcase
+    end
+
+    def integer? : ::Bool
+      case self
+      when Isize, Usize, Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64
+        true
+      else
+        false
+      end
+    end
+
+    def signed? : ::Bool
+      case self
+      when Isize, Int8, Int16, Int32, Int64
+        true
+      else
+        false
+      end
+    end
+
+    def fixed_bit_width : ::Int32?
+      case self
+      when Int8, UInt8
+        8
+      when Int16, UInt16
+        16
+      when Int32, UInt32
+        32
+      when Int64, UInt64
+        64
+      else
+        nil
+      end
+    end
+
+    def fixed_width_constant_fits?(value : Int128) : ::Bool
+      width = fixed_bit_width
+      return false unless width
+
+      if signed?
+        minimum = -(1_i128 << (width - 1))
+        maximum = (1_i128 << (width - 1)) - 1
+        value >= minimum && value <= maximum
+      else
+        value >= 0 && value <= (1_i128 << width) - 1
+      end
     end
   end
 
@@ -250,12 +304,15 @@ module Smalang
     def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
       type = @result_type
       return [] of String unless type
-      return [] of String if type == IrType::Isize || type == IrType::Usize
       if type == IrType::Bool
         return [] of String if @value == 0 || @value == 1
         return [context.error("bool constant must be 0 or 1, got #{@value}")]
       end
-      [context.error("const result must have an integer type, got #{type.label}")]
+      return [context.error("const result must have an integer type, got #{type.label}")] unless type.integer?
+      return [] of String unless type.fixed_bit_width
+      return [] of String if type.fixed_width_constant_fits?(@value)
+
+      [context.error("constant does not fit #{type.label}")]
     end
 
     def accept(visitor : IrInstructionVisitor) : Nil
@@ -291,7 +348,7 @@ module Smalang
 
       [left_type, right_type, result_type].each do |type|
         next unless type
-        unless type == IrType::Isize || type == IrType::Usize
+        unless type.integer?
           errors << context.error("#{operator_name} requires integer operands and result, got #{type.label}")
           break
         end
@@ -457,7 +514,7 @@ module Smalang
 
     def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
       errors = [] of String
-      unless @type == IrType::Isize || @type == IrType::Usize
+      unless @type.integer?
         errors << context.error("#{operator_name} result must have an integer type, got #{@type.label}")
       end
       left_type = operand_types[0]?
@@ -614,7 +671,7 @@ module Smalang
     def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
       type = operand_types.first?
       return [] of String unless type
-      return [] of String if type == IrType::Isize || type == IrType::Usize || type == IrType::Bool
+      return [] of String if type.integer? || type == IrType::Bool
       [context.error("branch condition must be an integer or bool, got #{type.label}")]
     end
 

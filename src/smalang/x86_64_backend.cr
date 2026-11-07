@@ -236,8 +236,16 @@ module Smalang
     getter result_id : ValueId
     getter left_id : ValueId
     getter right_id : ValueId
+    getter type : IrType
 
-    def initialize(position : Int32, @result_id : ValueId, @left_id : ValueId, @right_id : ValueId, @operation : MachineBinaryOperation)
+    def initialize(
+      position : Int32,
+      @result_id : ValueId,
+      @left_id : ValueId,
+      @right_id : ValueId,
+      @type : IrType,
+      @operation : MachineBinaryOperation,
+    )
       super(position)
     end
 
@@ -263,6 +271,7 @@ module Smalang
         raise X86_64BackendFailure.new("unsupported operand location")
       end
 
+      context.normalize_integer_register(X86_64Register::Rax, @type)
       result.store_from(context.code, X86_64Register::Rax, context.frame)
     end
   end
@@ -767,8 +776,16 @@ module Smalang
 
     private def append_binary(instruction : IrBinaryInstruction, operation : MachineBinaryOperation) : Nil
       result_id = instruction.result_id
-      raise X86_64BackendFailure.new("binary operation is missing its result") unless result_id
-      @instructions << MachineBinary.new(@instructions.size, result_id, instruction.left, instruction.right, operation)
+      result_type = instruction.result_type
+      raise X86_64BackendFailure.new("binary operation is missing its result") unless result_id && result_type
+      @instructions << MachineBinary.new(
+        @instructions.size,
+        result_id,
+        instruction.left,
+        instruction.right,
+        result_type,
+        operation
+      )
     end
 
     private def append_integer_division(
@@ -1178,6 +1195,20 @@ module Smalang
       @buffer.write_u8(amount)
     end
 
+    def shift_right_logical_register(register : X86_64Register, amount : UInt8) : Nil
+      write_rex(true, X86_64Register::Rax, register)
+      @buffer.write_u8(0xc1_u8)
+      @buffer.write_u8(0xe8_u8 | register.code)
+      @buffer.write_u8(amount)
+    end
+
+    def shift_right_arithmetic_register(register : X86_64Register, amount : UInt8) : Nil
+      write_rex(true, X86_64Register::Rax, register)
+      @buffer.write_u8(0xc1_u8)
+      @buffer.write_u8(0xf8_u8 | register.code)
+      @buffer.write_u8(amount)
+    end
+
     def sign_extend_rax_to_rdx : Nil
       @buffer.write_bytes([0x48_u8, 0x99_u8])
     end
@@ -1431,25 +1462,58 @@ module Smalang
     end
 
     def constant_bits(type : IrType, value : Int128) : UInt64
-      case type
-      when IrType::Isize
-        if value < Int64::MIN.to_i128 || value > Int64::MAX.to_i128
-          raise X86_64BackendFailure.new("constant #{value} does not fit isize on x86_64")
-        end
-        (value.to_i128 & 0xffff_ffff_ffff_ffff_i128).to_u64
-      when IrType::Usize
-        if value < 0 || value > UInt64::MAX.to_i128
-          raise X86_64BackendFailure.new("constant #{value} does not fit usize on x86_64")
-        end
-        value.to_u64
-      when IrType::Bool
+      if type == IrType::Bool
         unless value == 0 || value == 1
           raise X86_64BackendFailure.new("bool constant must be 0 or 1, got #{value}")
         end
-        value.to_u64
-      else
+        return value.to_u64
+      end
+      unless type.integer?
         raise X86_64BackendFailure.new("unsupported constant type #{type}")
       end
+
+      width = integer_bit_width(type)
+      if type.signed?
+        minimum = -(1_i128 << (width - 1))
+        maximum = (1_i128 << (width - 1)) - 1
+        unless value >= minimum && value <= maximum
+          raise X86_64BackendFailure.new("constant #{value} does not fit #{type.label} on x86_64")
+        end
+      else
+        maximum = (1_i128 << width) - 1
+        unless value >= 0 && value <= maximum
+          raise X86_64BackendFailure.new("constant #{value} does not fit #{type.label} on x86_64")
+        end
+      end
+
+      bits = (value & ((1_i128 << width) - 1)).to_u64
+      if type.signed? && width < 64 && (bits & (1_u64 << (width - 1))) != 0
+        bits |= UInt64::MAX << width
+      end
+      bits
+    end
+
+    def normalize_integer_register(register : X86_64Register, type : IrType) : Nil
+      return unless type.integer?
+      width = integer_bit_width(type)
+      return if width == 64
+
+      shift = (64 - width).to_u8
+      @code.shift_left_register(register, shift)
+      if type.signed?
+        @code.shift_right_arithmetic_register(register, shift)
+      else
+        @code.shift_right_logical_register(register, shift)
+      end
+    end
+
+    private def integer_bit_width(type : IrType) : Int32
+      if width = type.fixed_bit_width
+        return width
+      end
+      return 64 if type == IrType::Isize || type == IrType::Usize
+
+      raise X86_64BackendFailure.new("unsupported integer type #{type}")
     end
 
     def initialize_parameters(function : IrFunction) : Nil
@@ -1467,6 +1531,7 @@ module Smalang
           stack_offset = 16 + (index - ARGUMENT_REGISTERS.size) * 8
           @code.move_register_from_rbp(X86_64Register::Rax, stack_offset)
         end
+        normalize_integer_register(X86_64Register::Rax, parameter.type)
         location(parameter.value_id).store_from(@code, X86_64Register::Rax, @frame)
       end
     end
@@ -1550,13 +1615,14 @@ module Smalang
 
       location(division.left_id).load_to(@code, X86_64Register::Rax, @frame)
       normal_divisor.load_to(@code, X86_64Register::Rcx, @frame)
-      if division.type == IrType::Isize
+      if division.type.signed?
         emit_signed_division(division, zero_divisor_label)
       else
         @code.xor_register(X86_64Register::Rdx)
         @code.divide_by_register(X86_64Register::Rcx, false)
         @code.move_register(X86_64Register::Rax, X86_64Register::Rdx) if division.remainder?
       end
+      normalize_integer_register(X86_64Register::Rax, division.type)
 
       @code.move_rbp_from_register(@frame.invoke_normal_result_offset, X86_64Register::Rax)
       restore_call_spills(spills)
@@ -1622,7 +1688,10 @@ module Smalang
     private def emit_signed_division(division : MachineIntegerDivision, zero_divisor_label : Int32) : Nil
       overflow_done_label = @code.new_label
       divide_label = @code.new_label
-      @code.move_immediate(X86_64Register::R10, 0x8000_0000_0000_0000_u64)
+      width = integer_bit_width(division.type)
+      minimum = -(1_i128 << (width - 1))
+      minimum_bits = (minimum & ((1_i128 << width) - 1)).to_u64
+      @code.move_immediate(X86_64Register::R10, minimum_bits)
       @code.compare_registers(X86_64Register::Rax, X86_64Register::R10)
       @code.jump_if_not_equal_to(divide_label)
       @code.move_immediate(X86_64Register::R10, UInt64::MAX)

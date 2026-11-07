@@ -100,6 +100,206 @@ describe Smalang::X86_64Backend do
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
 
+  it "wraps fixed-width addition at the declared width" do
+    cases = [
+      {Smalang::IrType::Int8, 127_i128, 1_i128, 0xffff_ffff_ffff_ff80_u64},
+      {Smalang::IrType::UInt8, 255_i128, 1_i128, 0_u64},
+      {Smalang::IrType::Int16, 32_767_i128, 1_i128, 0xffff_ffff_ffff_8000_u64},
+      {Smalang::IrType::UInt16, 65_535_i128, 1_i128, 0_u64},
+      {Smalang::IrType::Int32, 2_147_483_647_i128, 1_i128, 0xffff_ffff_8000_0000_u64},
+      {Smalang::IrType::UInt32, 4_294_967_295_i128, 1_i128, 0_u64},
+      {Smalang::IrType::Int64, Int64::MAX.to_i128, 1_i128, 0x8000_0000_0000_0000_u64},
+      {Smalang::IrType::UInt64, UInt64::MAX.to_i128, 1_i128, 0_u64},
+    ]
+
+    cases.each do |type, left_value, right_value, expected|
+      BackendSpecHelpers.link_binary_and_compare_full_width_result(type, left_value, right_value, expected) do |function, entry, left, right|
+        function.emit_add(entry, type, left, right)
+      end.should eq(0)
+    end
+  end
+
+  it "wraps fixed-width subtraction at the declared width" do
+    cases = [
+      {Smalang::IrType::Int8, -128_i128, 1_i128, 127_u64},
+      {Smalang::IrType::UInt8, 0_i128, 1_i128, 255_u64},
+      {Smalang::IrType::Int16, -32_768_i128, 1_i128, 32_767_u64},
+      {Smalang::IrType::UInt16, 0_i128, 1_i128, 65_535_u64},
+      {Smalang::IrType::Int32, -2_147_483_648_i128, 1_i128, 2_147_483_647_u64},
+      {Smalang::IrType::UInt32, 0_i128, 1_i128, 4_294_967_295_u64},
+      {Smalang::IrType::Int64, Int64::MIN.to_i128, 1_i128, Int64::MAX.to_u64},
+      {Smalang::IrType::UInt64, 0_i128, 1_i128, UInt64::MAX},
+    ]
+
+    cases.each do |type, left_value, right_value, expected|
+      BackendSpecHelpers.link_binary_and_compare_full_width_result(type, left_value, right_value, expected) do |function, entry, left, right|
+        function.emit_subtract(entry, type, left, right)
+      end.should eq(0)
+    end
+  end
+
+  it "wraps fixed-width multiplication at the declared width" do
+    cases = [
+      {Smalang::IrType::Int8, 64_i128, 2_i128, 0xffff_ffff_ffff_ff80_u64},
+      {Smalang::IrType::UInt8, 128_i128, 2_i128, 0_u64},
+      {Smalang::IrType::Int16, 16_384_i128, 2_i128, 0xffff_ffff_ffff_8000_u64},
+      {Smalang::IrType::UInt16, 32_768_i128, 2_i128, 0_u64},
+      {Smalang::IrType::Int32, 1_073_741_824_i128, 2_i128, 0xffff_ffff_8000_0000_u64},
+      {Smalang::IrType::UInt32, 2_147_483_648_i128, 2_i128, 0_u64},
+      {Smalang::IrType::Int64, 4_611_686_018_427_387_904_i128, 2_i128, 0x8000_0000_0000_0000_u64},
+      {Smalang::IrType::UInt64, 9_223_372_036_854_775_808_i128, 2_i128, 0_u64},
+    ]
+
+    cases.each do |type, left_value, right_value, expected|
+      BackendSpecHelpers.link_binary_and_compare_full_width_result(type, left_value, right_value, expected) do |function, entry, left, right|
+        function.emit_multiply(entry, type, left, right)
+      end.should eq(0)
+    end
+  end
+
+  it "passes canonical fixed-width values through stack arguments, calls, and returns" do
+    cases = [
+      {Smalang::IrType::Int8, -1_i128, UInt64::MAX},
+      {Smalang::IrType::UInt8, 255_i128, 255_u64},
+      {Smalang::IrType::Int16, -1_i128, UInt64::MAX},
+      {Smalang::IrType::UInt16, 65_535_i128, 65_535_u64},
+      {Smalang::IrType::Int32, -1_i128, UInt64::MAX},
+      {Smalang::IrType::UInt32, 4_294_967_295_i128, 4_294_967_295_u64},
+      {Smalang::IrType::Int64, -1_i128, UInt64::MAX},
+      {Smalang::IrType::UInt64, UInt64::MAX.to_i128, UInt64::MAX},
+    ]
+
+    cases.each do |type, value, expected|
+      parameter_types = Array.new(6, Smalang::IrType::Isize)
+      parameter_types << type
+      ir = Smalang::IrModule.new
+      callee = ir.add_function("identity", parameter_types, type)
+      callee.emit_return(callee.entry_block_id, callee.parameters.last.value_id)
+
+      main = ir.add_function("main", Array(Smalang::IrType).new, type)
+      entry = main.entry_block_id
+      arguments = Array(Smalang::ValueId).new
+      6.times { arguments << main.emit_constant(entry, Smalang::IrType::Isize, 0) }
+      arguments << main.emit_constant(entry, type, value)
+      normal = main.add_block("normal")
+      unwind = main.add_block("unwind")
+      target = ir.internal_call_target(callee.id).not_nil!
+      result = main.emit_invoke_call(entry, target, arguments, normal, unwind)
+      main.emit_return(normal, result.value_id)
+      main.emit_resume_exception(unwind, result.exception_id)
+
+      BackendSpecHelpers.link_and_compare_full_width_result(ir, expected).should eq(0)
+    end
+  end
+
+  it "emits fixed-width signed and unsigned division" do
+    cases = [
+      {Smalang::IrType::Int8, -23_i128, 5_i128, 0xffff_ffff_ffff_fffc_u64},
+      {Smalang::IrType::Int8, -128_i128, -1_i128, 0xffff_ffff_ffff_ff80_u64},
+      {Smalang::IrType::UInt8, 255_i128, 2_i128, 127_u64},
+      {Smalang::IrType::Int16, -32_768_i128, -1_i128, 0xffff_ffff_ffff_8000_u64},
+      {Smalang::IrType::UInt16, 65_535_i128, 2_i128, 32_767_u64},
+      {Smalang::IrType::Int32, -2_147_483_648_i128, -1_i128, 0xffff_ffff_8000_0000_u64},
+      {Smalang::IrType::UInt32, 4_294_967_295_i128, 2_i128, 2_147_483_647_u64},
+      {Smalang::IrType::Int64, Int64::MIN.to_i128, -1_i128, 0x8000_0000_0000_0000_u64},
+      {Smalang::IrType::UInt64, UInt64::MAX.to_i128, 2_i128, 9_223_372_036_854_775_807_u64},
+    ]
+
+    cases.each do |type, left, right, expected|
+      BackendSpecHelpers.link_invoke_binary_and_compare_full_width_result(type, left, right, expected) do |function, entry, dividend, divisor, normal, unwind|
+        function.emit_invoke_divide(entry, type, dividend, divisor, normal, unwind)
+      end.should eq(0)
+    end
+  end
+
+  it "emits fixed-width signed and unsigned remainder" do
+    cases = [
+      {Smalang::IrType::Int8, -23_i128, 5_i128, 0xffff_ffff_ffff_fffd_u64},
+      {Smalang::IrType::Int8, -128_i128, -1_i128, 0_u64},
+      {Smalang::IrType::UInt8, 255_i128, 2_i128, 1_u64},
+      {Smalang::IrType::Int16, -32_768_i128, -1_i128, 0_u64},
+      {Smalang::IrType::UInt16, 65_535_i128, 2_i128, 1_u64},
+      {Smalang::IrType::Int32, -2_147_483_648_i128, -1_i128, 0_u64},
+      {Smalang::IrType::UInt32, 4_294_967_295_i128, 2_i128, 1_u64},
+      {Smalang::IrType::Int64, Int64::MIN.to_i128, -1_i128, 0_u64},
+      {Smalang::IrType::UInt64, UInt64::MAX.to_i128, 2_i128, 1_u64},
+    ]
+
+    cases.each do |type, dividend, divisor, expected|
+      BackendSpecHelpers.link_invoke_binary_and_compare_full_width_result(type, dividend, divisor, expected) do |function, entry, dividend, divisor, normal, unwind|
+        function.emit_invoke_remainder(entry, type, dividend, divisor, normal, unwind)
+      end.should eq(0)
+    end
+  end
+
+  it "branches on fixed-width zero and nonzero values" do
+    [
+      {Smalang::IrType::Int8, 0_i128, 1},
+      {Smalang::IrType::UInt32, 1_i128, 42},
+    ].each do |type, condition_value, expected|
+      ir = Smalang::IrModule.new
+      function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+      entry = function.entry_block_id
+      truth = function.add_block("truth")
+      falsity = function.add_block("falsity")
+      condition = function.emit_constant(entry, type, condition_value)
+      function.emit_branch(entry, condition, truth, falsity)
+      true_value = function.emit_constant(truth, Smalang::IrType::Isize, 42)
+      function.emit_return(truth, true_value)
+      false_value = function.emit_constant(falsity, Smalang::IrType::Isize, 1)
+      function.emit_return(falsity, false_value)
+
+      BackendSpecHelpers.link_and_run(ir).should eq(expected)
+    end
+  end
+
+  it "preserves an int8 phi value from the taken branch" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Int8)
+    entry = function.entry_block_id
+    negative = function.add_block("negative")
+    positive = function.add_block("positive")
+    join = function.add_block("join")
+    condition = function.emit_constant(entry, Smalang::IrType::Int8, 1)
+    function.emit_branch(entry, condition, negative, positive)
+    negative_value = function.emit_constant(negative, Smalang::IrType::Int8, -1)
+    function.emit_jump(negative, join)
+    positive_value = function.emit_constant(positive, Smalang::IrType::Int8, 1)
+    function.emit_jump(positive, join)
+    merged = function.emit_phi(join, Smalang::IrType::Int8, [
+      Smalang::IrPhiIncoming.new(negative, negative_value),
+      Smalang::IrPhiIncoming.new(positive, positive_value),
+    ])
+    function.emit_return(join, merged)
+
+    BackendSpecHelpers.link_and_compare_full_width_result(ir, UInt64::MAX).should eq(0)
+  end
+
+  it "raises and catches division by zero for fixed-width integer types" do
+    [Smalang::IrType::Int8, Smalang::IrType::UInt64].each do |type|
+      ir = Smalang::IrModule.new
+      function = ir.add_function("main", Array(Smalang::IrType).new, type)
+      entry = function.entry_block_id
+      normal = function.add_block("normal")
+      dispatch = function.add_block("dispatch")
+      caught = function.add_block("caught")
+      resume = function.add_block("resume")
+      value = function.emit_constant(entry, type, 10)
+      zero = function.emit_constant(entry, type, 0)
+      result = function.emit_invoke_divide(entry, type, value, zero, normal, dispatch)
+      function.emit_return(normal, result.value_id)
+      function.emit_exception_dispatch(dispatch, result.exception_id, [
+        Smalang::IrExceptionCase.new(Smalang::IrExceptionKind::DivisionByZero, caught),
+      ], resume)
+      function.emit_exception_release(caught, result.exception_id)
+      recovered = function.emit_constant(caught, type, 42)
+      function.emit_return(caught, recovered)
+      function.emit_resume_exception(resume, result.exception_id)
+
+      BackendSpecHelpers.link_and_compare_full_width_result(ir, 42_u64).should eq(0)
+    end
+  end
+
   it "emits conditional control flow and merges values through phi" do
     ir = Smalang::IrModule.new
     function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
@@ -166,7 +366,7 @@ describe Smalang::X86_64Backend do
     BackendSpecHelpers.link_and_compare_full_width_result(ir, 8_589_934_593_u64).should eq(0)
   end
 
-  it "wraps signed runtime addition, subtraction, and multiplication at 64 bits" do
+  it "wraps signed runtime addition at 64 bits" do
     BackendSpecHelpers.link_binary_and_compare_full_width_result(
       Smalang::IrType::Isize,
       Int64::MAX,
@@ -175,7 +375,9 @@ describe Smalang::X86_64Backend do
     ) do |function, entry, left, right|
       function.emit_add(entry, Smalang::IrType::Isize, left, right)
     end.should eq(0)
+  end
 
+  it "wraps signed runtime subtraction at 64 bits" do
     BackendSpecHelpers.link_binary_and_compare_full_width_result(
       Smalang::IrType::Isize,
       Int64::MIN,
@@ -184,7 +386,9 @@ describe Smalang::X86_64Backend do
     ) do |function, entry, left, right|
       function.emit_subtract(entry, Smalang::IrType::Isize, left, right)
     end.should eq(0)
+  end
 
+  it "wraps signed runtime multiplication at 64 bits" do
     BackendSpecHelpers.link_binary_and_compare_full_width_result(
       Smalang::IrType::Isize,
       Int64::MAX,
@@ -195,17 +399,18 @@ describe Smalang::X86_64Backend do
     end.should eq(0)
   end
 
-  it "wraps unsigned runtime addition, subtraction, and multiplication at 64 bits" do
-    addition_ir = Smalang::IrModule.new
-    addition = addition_ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Usize)
-    entry = addition.entry_block_id
-    half = addition.emit_constant(entry, Smalang::IrType::Usize, 4_611_686_018_427_387_904_i64)
-    two = addition.emit_constant(entry, Smalang::IrType::Usize, 2)
-    two_to_63 = addition.emit_multiply(entry, Smalang::IrType::Usize, half, two)
-    wrapped_sum = addition.emit_add(entry, Smalang::IrType::Usize, two_to_63, two_to_63)
-    addition.emit_return(entry, wrapped_sum)
-    BackendSpecHelpers.link_and_compare_full_width_result(addition_ir, 0_u64).should eq(0)
+  it "wraps unsigned runtime addition at 64 bits" do
+    BackendSpecHelpers.link_binary_and_compare_full_width_result(
+      Smalang::IrType::Usize,
+      UInt64::MAX.to_i128,
+      1_i128,
+      0_u64
+    ) do |function, entry, left, right|
+      function.emit_add(entry, Smalang::IrType::Usize, left, right)
+    end.should eq(0)
+  end
 
+  it "wraps unsigned runtime subtraction at 64 bits" do
     BackendSpecHelpers.link_binary_and_compare_full_width_result(
       Smalang::IrType::Usize,
       0_i64,
@@ -214,12 +419,14 @@ describe Smalang::X86_64Backend do
     ) do |function, entry, left, right|
       function.emit_subtract(entry, Smalang::IrType::Usize, left, right)
     end.should eq(0)
+  end
 
+  it "wraps unsigned runtime multiplication at 64 bits" do
     BackendSpecHelpers.link_binary_and_compare_full_width_result(
       Smalang::IrType::Usize,
-      Int64::MAX,
-      3_i64,
-      0x7fff_ffff_ffff_fffd_u64
+      9_223_372_036_854_775_808_i128,
+      2_i128,
+      0_u64
     ) do |function, entry, left, right|
       function.emit_multiply(entry, Smalang::IrType::Usize, left, right)
     end.should eq(0)

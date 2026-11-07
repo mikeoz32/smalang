@@ -66,6 +66,14 @@ module Smalang
       return IrType::Isize if type_id == type_table.int_type_id
       return IrType::Usize if type_id == type_table.uint_type_id
       return IrType::Bool if type_id == type_table.bool_type_id
+      return IrType::Int8 if type_id == type_table.id_for(AstType::Int8)
+      return IrType::UInt8 if type_id == type_table.id_for(AstType::UInt8)
+      return IrType::Int16 if type_id == type_table.id_for(AstType::Int16)
+      return IrType::UInt16 if type_id == type_table.id_for(AstType::UInt16)
+      return IrType::Int32 if type_id == type_table.id_for(AstType::Int32)
+      return IrType::UInt32 if type_id == type_table.id_for(AstType::UInt32)
+      return IrType::Int64 if type_id == type_table.id_for(AstType::Int64)
+      return IrType::UInt64 if type_id == type_table.id_for(AstType::UInt64)
 
       report(span, "unsupported semantic type id #{type_id}")
       nil

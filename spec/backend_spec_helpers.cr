@@ -68,8 +68,8 @@ module BackendSpecHelpers
 
   def self.link_binary_and_compare_full_width_result(
     type : Smalang::IrType,
-    left_value : Int64,
-    right_value : Int64,
+    left_value : Int128,
+    right_value : Int128,
     expected_result : UInt64,
     &operation : Smalang::IrFunction, Smalang::BlockId, Smalang::ValueId, Smalang::ValueId -> Smalang::ValueId
   ) : Int32
@@ -80,6 +80,27 @@ module BackendSpecHelpers
     right = function.emit_constant(entry, type, right_value)
     result = operation.call(function, entry, left, right)
     function.emit_return(entry, result)
+
+    link_and_compare_full_width_result(ir, expected_result)
+  end
+
+  def self.link_invoke_binary_and_compare_full_width_result(
+    type : Smalang::IrType,
+    left_value : Int128,
+    right_value : Int128,
+    expected_result : UInt64,
+    &operation : Smalang::IrFunction, Smalang::BlockId, Smalang::ValueId, Smalang::ValueId, Smalang::BlockId, Smalang::BlockId -> Smalang::IrInvokeResults
+  ) : Int32
+    ir = Smalang::IrModule.new
+    function = ir.add_function("main", Array(Smalang::IrType).new, type)
+    entry = function.entry_block_id
+    left = function.emit_constant(entry, type, left_value)
+    right = function.emit_constant(entry, type, right_value)
+    normal = function.add_block("normal")
+    unwind = function.add_block("unwind")
+    result = operation.call(function, entry, left, right, normal, unwind)
+    function.emit_return(normal, result.value_id)
+    function.emit_resume_exception(unwind, result.exception_id)
 
     link_and_compare_full_width_result(ir, expected_result)
   end

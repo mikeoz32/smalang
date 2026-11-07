@@ -85,6 +85,37 @@ describe Smalang::IrLowerer do
     add.as(Smalang::IrAddInstruction).right.should eq(parameters[1].value_id)
   end
 
+  it "lowers fixed-width integer result types into distinct IR types" do
+    integer_types = ["int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"]
+    source = String.build do |program|
+      integer_types.each do |type|
+        program << "def value_#{type}() -> #{type}:\n    return 0\n\n"
+      end
+      program << "def main() -> int:\n    return 0\n"
+    end
+
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    integer_types.each_with_index do |type, index|
+      function = ir.function(index).not_nil!
+      function.signature.result_type.label.should eq(type)
+    end
+    ir.verify.should be_empty
+  end
+
+  it "compiles and runs nested calls that pass an int8 result" do
+    source = "def increment(value: int8) -> int8:\n    return value + 1\n\ndef consume(value: int8) -> int:\n    return 42\n\ndef main() -> int:\n    return consume(increment(127))\n"
+
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
   it "lowers forward and mutually recursive calls to their module function IDs" do
     source = "def is_even(value: int) -> int:\n    return is_odd(value)\n\ndef is_odd(value: int) -> int:\n    return is_even(value)\n\ndef main() -> int:\n    return is_even(0)\n"
     result = IrLoweringSpecHelpers.lower(source)

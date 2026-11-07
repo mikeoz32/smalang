@@ -1,6 +1,17 @@
 require "spec"
 require "../src/smalang/ir"
 
+FIXED_WIDTH_IR_TYPES = [
+  Smalang::IrType::Int8,
+  Smalang::IrType::UInt8,
+  Smalang::IrType::Int16,
+  Smalang::IrType::UInt16,
+  Smalang::IrType::Int32,
+  Smalang::IrType::UInt32,
+  Smalang::IrType::Int64,
+  Smalang::IrType::UInt64,
+]
+
 describe Smalang::IrModule do
   it "represents and dumps the first-slice program as typed SSA" do
     ir = Smalang::IrModule.new
@@ -35,6 +46,201 @@ describe Smalang::IrModule do
     dump.should contain("(invoke (call @increment %v1) (normal @normal %v2) (exception @unwind %v3))")
     dump.should contain("(return %v2)")
     ir.verify.should be_empty
+  end
+
+  it "defines distinct typed IR values for every fixed-width integer" do
+    fixed_widths = [
+      {Smalang::IrType::Int8, 8, true},
+      {Smalang::IrType::UInt8, 8, false},
+      {Smalang::IrType::Int16, 16, true},
+      {Smalang::IrType::UInt16, 16, false},
+      {Smalang::IrType::Int32, 32, true},
+      {Smalang::IrType::UInt32, 32, false},
+      {Smalang::IrType::Int64, 64, true},
+      {Smalang::IrType::UInt64, 64, false},
+    ]
+    labels = Smalang::IrType.values.map(&.label)
+
+    fixed_widths.each do |type, width, signed|
+      label = type.label
+      labels.should contain(label)
+      type.fixed_bit_width.should eq(width)
+      type.signed?.should eq(signed)
+      type.integer?.should be_true
+    end
+    Smalang::IrType::Isize.fixed_bit_width.should be_nil
+    Smalang::IrType::Isize.signed?.should be_true
+    Smalang::IrType::Usize.fixed_bit_width.should be_nil
+    Smalang::IrType::Usize.signed?.should be_false
+  end
+
+  it "accepts in-range constants for every fixed-width integer type" do
+    cases = [
+      {Smalang::IrType::Int8, -128_i128, 127_i128},
+      {Smalang::IrType::UInt8, 0_i128, 255_i128},
+      {Smalang::IrType::Int16, -32_768_i128, 32_767_i128},
+      {Smalang::IrType::UInt16, 0_i128, 65_535_i128},
+      {Smalang::IrType::Int32, -2_147_483_648_i128, 2_147_483_647_i128},
+      {Smalang::IrType::UInt32, 0_i128, 4_294_967_295_i128},
+      {Smalang::IrType::Int64, Int64::MIN.to_i128, Int64::MAX.to_i128},
+      {Smalang::IrType::UInt64, 0_i128, UInt64::MAX.to_i128},
+    ]
+    ir = Smalang::IrModule.new
+
+    cases.each do |type, minimum, maximum|
+      function = ir.add_function("constants_#{type.label}", Array(Smalang::IrType).new, type)
+      entry = function.entry_block_id
+      function.emit_constant(entry, type, minimum)
+      maximum_value = function.emit_constant(entry, type, maximum)
+      function.emit_return(entry, maximum_value)
+    end
+
+    ir.verify.should be_empty
+  end
+
+  it "accepts addition for every fixed-width type" do
+    ir = Smalang::IrModule.new
+
+    FIXED_WIDTH_IR_TYPES.each do |type|
+      function = ir.add_function("add_#{type.label}", [type, type], type)
+      entry = function.entry_block_id
+      left = function.parameters[0].value_id
+      right = function.parameters[1].value_id
+      sum = function.emit_add(entry, type, left, right)
+      function.emit_return(entry, sum)
+    end
+
+    ir.verify.should be_empty
+  end
+
+  it "accepts subtraction for every fixed-width type" do
+    ir = Smalang::IrModule.new
+
+    FIXED_WIDTH_IR_TYPES.each do |type|
+      function = ir.add_function("sub_#{type.label}", [type, type], type)
+      entry = function.entry_block_id
+      left = function.parameters[0].value_id
+      right = function.parameters[1].value_id
+      difference = function.emit_subtract(entry, type, left, right)
+      function.emit_return(entry, difference)
+    end
+
+    ir.verify.should be_empty
+  end
+
+  it "accepts multiplication for every fixed-width type" do
+    ir = Smalang::IrModule.new
+
+    FIXED_WIDTH_IR_TYPES.each do |type|
+      function = ir.add_function("mul_#{type.label}", [type, type], type)
+      entry = function.entry_block_id
+      left = function.parameters[0].value_id
+      right = function.parameters[1].value_id
+      product = function.emit_multiply(entry, type, left, right)
+      function.emit_return(entry, product)
+    end
+
+    ir.verify.should be_empty
+  end
+
+  it "accepts division for every fixed-width type" do
+    ir = Smalang::IrModule.new
+
+    FIXED_WIDTH_IR_TYPES.each do |type|
+      function = ir.add_function("div_#{type.label}", [type, type], type)
+      entry = function.entry_block_id
+      normal = function.add_block("normal")
+      unwind = function.add_block("unwind")
+      left = function.parameters[0].value_id
+      right = function.parameters[1].value_id
+      division = function.emit_invoke_divide(entry, type, left, right, normal, unwind)
+      function.emit_return(normal, division.value_id)
+      function.emit_resume_exception(unwind, division.exception_id)
+    end
+
+    ir.verify.should be_empty
+  end
+
+  it "accepts remainder for every fixed-width type" do
+    ir = Smalang::IrModule.new
+
+    FIXED_WIDTH_IR_TYPES.each do |type|
+      function = ir.add_function("rem_#{type.label}", [type, type], type)
+      entry = function.entry_block_id
+      normal = function.add_block("normal")
+      unwind = function.add_block("unwind")
+      left = function.parameters[0].value_id
+      right = function.parameters[1].value_id
+      remainder = function.emit_invoke_remainder(entry, type, left, right, normal, unwind)
+      function.emit_return(normal, remainder.value_id)
+      function.emit_resume_exception(unwind, remainder.exception_id)
+    end
+
+    ir.verify.should be_empty
+  end
+
+  it "prints fixed-width integer names in S-expression dumps" do
+    ir = Smalang::IrModule.new
+    FIXED_WIDTH_IR_TYPES.each do |type|
+      function = ir.add_function("value_#{type.label}", Array(Smalang::IrType).new, type)
+      value = function.emit_constant(function.entry_block_id, type, 0)
+      function.emit_return(function.entry_block_id, value)
+    end
+
+    dump = Smalang::IrSExpressionDumper.new.dump(ir)
+    FIXED_WIDTH_IR_TYPES.each { |type| dump.should contain("#{type.label}") }
+  end
+
+  it "rejects constants outside fixed-width integer ranges" do
+    invalid_values = [
+      {Smalang::IrType::Int8, -129_i128},
+      {Smalang::IrType::UInt8, 256_i128},
+      {Smalang::IrType::Int16, -32_769_i128},
+      {Smalang::IrType::UInt16, 65_536_i128},
+      {Smalang::IrType::Int32, -2_147_483_649_i128},
+      {Smalang::IrType::UInt32, 4_294_967_296_i128},
+      {Smalang::IrType::Int64, Int64::MIN.to_i128 - 1},
+      {Smalang::IrType::UInt64, UInt64::MAX.to_i128 + 1},
+    ]
+    ir = Smalang::IrModule.new
+
+    invalid_values.each_with_index do |(type, value), index|
+      function = ir.add_function("invalid_#{index}", Array(Smalang::IrType).new, type)
+      constant = function.emit_constant(function.entry_block_id, type, value)
+      function.emit_return(function.entry_block_id, constant)
+    end
+
+    diagnostics = ir.verify.join("\n")
+    ["int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"].each do |label|
+      diagnostics.should contain("constant does not fit #{label}")
+    end
+  end
+
+  it "rejects mixed fixed-width operands in addition" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("mixed", [Smalang::IrType::Int8, Smalang::IrType::UInt8], Smalang::IrType::Int8)
+    entry = function.entry_block_id
+    left = function.parameters[0].value_id
+    right = function.parameters[1].value_id
+    sum = function.emit_add(entry, Smalang::IrType::Int8, left, right)
+    function.emit_return(entry, sum)
+
+    ir.verify.join("\n").should contain("add operands must have matching types")
+  end
+
+  it "rejects mixed fixed-width operands in division" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("mixed", [Smalang::IrType::Int8, Smalang::IrType::UInt8], Smalang::IrType::Int8)
+    entry = function.entry_block_id
+    normal = function.add_block("normal")
+    unwind = function.add_block("unwind")
+    left = function.parameters[0].value_id
+    right = function.parameters[1].value_id
+    division = function.emit_invoke_divide(entry, Smalang::IrType::Int8, left, right, normal, unwind)
+    function.emit_return(normal, division.value_id)
+    function.emit_resume_exception(unwind, division.exception_id)
+
+    ir.verify.join("\n").should contain("div right operand has type uint8, expected int8")
   end
 
   it "represents boolean constants, signatures, and returns as typed SSA" do
