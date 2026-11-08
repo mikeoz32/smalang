@@ -150,6 +150,12 @@ IR і backend працюють із перевіреним IR. Відоме пі
 
 Backend генерує власні runtime-функції та ланцюг кадрів. Під час створення винятку runtime копіює до 64 кадрів із назвами функцій і source locations. Непійманий виняток друкується через Linux `write`; пам'ять exception records виділяється та звільняється через `mmap`/`munmap`. `_start` викликає `__smalang_user_main` і завершує процес через syscall `exit`. Згенерований об'єкт не потребує C runtime, libc, `libgcc_s` чи LLVM `libunwind`; `.eh_frame` і DWARF залишаються для звичайних налагоджувачів. Виняткова модель, IR і backend не додають синтаксис `try/catch` чи `finally` до мови.
 
+## Архітектурні рішення
+
+- [ADR 0001: Володіння пам'яттю, move та clone](adr/0001-memory-ownership.md).
+- [ADR 0002: Desugaring у межах одного AST](adr/0002-ast-desugaring.md).
+- [ADR 0003: Unsafe-операції з пам'яттю](adr/0003-unsafe-memory-operations.md).
+
 ## Поки не визначено
 
 - Повний обсяг Python-подібного синтаксису поза початковою граматикою вище.
