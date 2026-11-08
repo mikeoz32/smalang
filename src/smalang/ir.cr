@@ -17,6 +17,7 @@ module Smalang
     UInt32
     Int64
     UInt64
+    Unit
 
     def label : String
       to_s.downcase
@@ -29,6 +30,10 @@ module Smalang
       else
         false
       end
+    end
+
+    def zero_sized? : ::Bool
+      self == Unit
     end
 
     def signed? : ::Bool
@@ -241,6 +246,7 @@ module Smalang
 
   abstract class IrInstructionVisitor < IrInvokeOperationVisitor
     abstract def visit(instruction : IrConstantInstruction) : Nil
+    abstract def visit(instruction : IrUnitConstantInstruction) : Nil
     abstract def visit(instruction : IrAddInstruction) : Nil
     abstract def visit(instruction : IrSubtractInstruction) : Nil
     abstract def visit(instruction : IrMultiplyInstruction) : Nil
@@ -321,6 +327,32 @@ module Smalang
 
     def expression : String
       "(%v#{@result_id.not_nil!} #{@result_type.not_nil!.label} (const #{@value}))"
+    end
+  end
+
+  class IrUnitConstantInstruction < IrInstruction
+    def initialize(id : InstructionId, block_id : BlockId, result_id : ValueId)
+      super(id, block_id, result_id, IrType::Unit)
+    end
+
+    def used_values : Array(ValueId)
+      [] of ValueId
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      [] of String
+    end
+
+    def expression : String
+      "(%v#{@result_id.not_nil!} unit (unit))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
     end
   end
 
@@ -1025,6 +1057,12 @@ module Smalang
     def emit_constant(block_id : BlockId, type : IrType, value : Int128) : ValueId
       append_result(block_id, type) do |instruction_id, result_id|
         IrConstantInstruction.new(instruction_id, block_id, result_id, type, value)
+      end
+    end
+
+    def emit_unit_constant(block_id : BlockId) : ValueId
+      append_result(block_id, IrType::Unit) do |instruction_id, result_id|
+        IrUnitConstantInstruction.new(instruction_id, block_id, result_id)
       end
     end
 
