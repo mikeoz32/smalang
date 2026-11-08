@@ -90,7 +90,7 @@ describe Smalang::SemanticAnalyzer do
 
   it "checks bool parameters, results, literals, and calls" do
     result = SemanticSpecHelpers.analyze(
-      "def identity(value: bool) -> bool:\n    return value\n\ndef truth() -> bool:\n    return identity(true)\n\ndef falsehood() -> bool:\n    return identity(false)\n\ndef main() -> int:\n    return 0\n"
+      "def identity(value: bool) -> bool:\n    return value\n\ndef truth() -> bool:\n    return identity(True)\n\ndef falsehood() -> bool:\n    return identity(False)\n\ndef main() -> int:\n    return 0\n"
     )
 
     result.success?.should eq(true)
@@ -120,6 +120,14 @@ describe Smalang::SemanticAnalyzer do
     semantic.type_of(false_literal_id).should eq(semantic.type_table.bool_type_id)
   end
 
+  it "treats lowercase true and false as ordinary function names" do
+    result = SemanticSpecHelpers.analyze(
+      "def true() -> bool:\n    return True\n\ndef false() -> bool:\n    return False\n\ndef main() -> int:\n    return 0\n"
+    )
+
+    result.success?.should eq(true)
+  end
+
   it "rejects implicit conversions between bool and integer types" do
     result = SemanticSpecHelpers.analyze(
       "def identity(value: bool) -> bool:\n    return value\n\ndef main() -> int:\n    return identity(1)\n"
@@ -130,7 +138,7 @@ describe Smalang::SemanticAnalyzer do
 
   it "rejects a bool return from an int function" do
     result = SemanticSpecHelpers.analyze(
-      "def wrong() -> int:\n    return true\n\ndef main() -> int:\n    return 0\n"
+      "def wrong() -> int:\n    return True\n\ndef main() -> int:\n    return 0\n"
     )
     result.success?.should eq(false)
     result.diagnostic.not_nil!.message.should contain("return has type bool, expected int")

@@ -644,10 +644,10 @@ module Smalang
                     advance
                     arena.add(WildcardMatchPatternNode.new(pattern_token.span))
                   else
-                    fail("expected 'true', 'false', or '_' as a case pattern")
+                    fail("expected 'True', 'False', or '_' as a case pattern")
                   end
                 else
-                  fail("expected 'true', 'false', or '_' as a case pattern")
+                  fail("expected 'True', 'False', or '_' as a case pattern")
                 end
 
       expect(TokenKind::Colon, "expected ':' after the case pattern")

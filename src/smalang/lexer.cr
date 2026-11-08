@@ -280,11 +280,11 @@ module Smalang
         return TokenKind::Case if matches_keyword?(start, "case")
         return TokenKind::UIntType if matches_keyword?(start, "uint")
         return TokenKind::BoolType if matches_keyword?(start, "bool")
-        return TokenKind::TrueLiteral if matches_keyword?(start, "true")
+        return TokenKind::TrueLiteral if matches_keyword?(start, "True")
         return TokenKind::Int8Type if matches_keyword?(start, "int8")
       when 5
         return TokenKind::Match if matches_keyword?(start, "match")
-        return TokenKind::FalseLiteral if matches_keyword?(start, "false")
+        return TokenKind::FalseLiteral if matches_keyword?(start, "False")
         return TokenKind::UInt8Type if matches_keyword?(start, "uint8")
         return TokenKind::Int16Type if matches_keyword?(start, "int16")
         return TokenKind::Int32Type if matches_keyword?(start, "int32")

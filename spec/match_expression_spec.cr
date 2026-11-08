@@ -36,7 +36,7 @@ module MatchExpressionSpecHelpers
 end
 
 describe "boolean match expression compilation" do
-  it "compiles and runs the explicit true/false example" do
+  it "compiles and runs the explicit True/False example" do
     MatchExpressionSpecHelpers.run_example("bool_match_explicit.py").should eq(46)
   end
 
@@ -45,19 +45,19 @@ describe "boolean match expression compilation" do
   end
 
   it "compiles nested matches, call arguments, and call results" do
-    source = "def choose(value: bool) -> int:\n    return match value:\n        case true: match false:\n            case true: 1\n            case false: 2\n        case false: identity(match true:\n            case true: identity(40)\n            case false: 41\n        )\n\ndef identity(value: int) -> int:\n    return value\n\ndef main() -> int:\n    return choose(false)\n"
+    source = "def choose(value: bool) -> int:\n    return match value:\n        case True: match False:\n            case True: 1\n            case False: 2\n        case False: identity(match True:\n            case True: identity(40)\n            case False: 41\n        )\n\ndef identity(value: int) -> int:\n    return value\n\ndef main() -> int:\n    return choose(False)\n"
 
     MatchExpressionSpecHelpers.run(source).should eq(40)
   end
 
   it "passes boolean match results to a later match" do
-    source = "def invert(value: bool) -> bool:\n    return match value:\n        case true: false\n        case false: true\n\ndef condition() -> bool:\n    return invert(true)\n\ndef main() -> int:\n    return match condition():\n        case true: 17\n        case false: 29\n"
+    source = "def invert(value: bool) -> bool:\n    return match value:\n        case True: False\n        case False: True\n\ndef condition() -> bool:\n    return invert(True)\n\ndef main() -> int:\n    return match condition():\n        case True: 17\n        case False: 29\n"
 
     MatchExpressionSpecHelpers.run(source).should eq(29)
   end
 
   it "rejects non-boolean scrutinees during semantic analysis" do
-    source = "def main() -> int:\n    return match 1:\n        case true: 1\n        case false: 0\n"
+    source = "def main() -> int:\n    return match 1:\n        case True: 1\n        case False: 0\n"
 
     diagnostic = MatchExpressionSpecHelpers.semantic_diagnostic(source)
     diagnostic.should contain("match value has type int, expected bool")
@@ -66,24 +66,24 @@ describe "boolean match expression compilation" do
 
   it "rejects non-exhaustive, wildcard-only, and duplicate patterns" do
     cases = [
-      {"case true: 1\n", "bool match must have exactly two cases"},
+      {"case True: 1\n", "bool match must have exactly two cases"},
       {"case _: 1\n", "bool match must have exactly two cases"},
-      {"case true: 1\n        case true: 2\n", "duplicate bool pattern true"},
-      {"case false: 1\n        case false: 2\n", "duplicate bool pattern false"},
+      {"case True: 1\n        case True: 2\n", "duplicate bool pattern True"},
+      {"case False: 1\n        case False: 2\n", "duplicate bool pattern False"},
     ]
 
     cases.each do |case_source, expected_message|
-      source = "def main() -> int:\n    return match true:\n        #{case_source}"
+      source = "def main() -> int:\n    return match True:\n        #{case_source}"
       MatchExpressionSpecHelpers.semantic_diagnostic(source).should contain(expected_message)
     end
   end
 
   it "rejects cases after a wildcard and mismatched result types" do
-    after_wildcard = "def main() -> int:\n    return match true:\n        case _: 1\n        case true: 2\n"
+    after_wildcard = "def main() -> int:\n    return match True:\n        case _: 1\n        case True: 2\n"
     MatchExpressionSpecHelpers.semantic_diagnostic(after_wildcard)
       .should contain("wildcard pattern must be the final case")
 
-    mismatched_results = "def main() -> int:\n    return match true:\n        case true: 1\n        case false: true\n"
+    mismatched_results = "def main() -> int:\n    return match True:\n        case True: 1\n        case False: True\n"
     MatchExpressionSpecHelpers.semantic_diagnostic(mismatched_results)
       .should contain("match case has type bool, expected int")
   end

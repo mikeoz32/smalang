@@ -46,7 +46,7 @@ describe Smalang::IrLowerer do
   end
 
   it "lowers bool literals, signatures, parameters, and nested calls" do
-    source = "def identity(value: bool) -> bool:\n    return value\n\ndef true_value() -> bool:\n    return true\n\ndef false_value() -> bool:\n    return false\n\ndef forward() -> bool:\n    return identity(true_value())\n\ndef accept(value: bool) -> int:\n    return 42\n\ndef main() -> int:\n    return accept(forward())\n"
+    source = "def identity(value: bool) -> bool:\n    return value\n\ndef true_value() -> bool:\n    return True\n\ndef false_value() -> bool:\n    return False\n\ndef forward() -> bool:\n    return identity(true_value())\n\ndef accept(value: bool) -> int:\n    return 42\n\ndef main() -> int:\n    return accept(forward())\n"
     result = IrLoweringSpecHelpers.lower(source)
 
     result.success?.should eq(true)

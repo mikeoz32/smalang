@@ -324,7 +324,7 @@ module Smalang
       elsif @has_wildcard && (@has_true != @has_false)
         return
       else
-        fail_at(span, "bool match must cover true and false, or use one final wildcard case")
+        fail_at(span, "bool match must cover True and False, or use one final wildcard case")
       end
     end
 
@@ -333,12 +333,12 @@ module Smalang
         fail_at(pattern.span, "case is unreachable after wildcard pattern")
       elsif pattern.value
         if @has_true
-          fail_at(pattern.span, "duplicate bool pattern true")
+          fail_at(pattern.span, "duplicate bool pattern True")
         else
           @has_true = true
         end
       elsif @has_false
-        fail_at(pattern.span, "duplicate bool pattern false")
+        fail_at(pattern.span, "duplicate bool pattern False")
       else
         @has_false = true
       end

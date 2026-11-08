@@ -166,7 +166,7 @@ describe Smalang::Parser do
 
   it "parses bool annotations and boolean literals into the AST" do
     result = ParserSpecHelpers.parse(
-      "def identity(value: bool) -> bool:\n    return value\n\ndef truth() -> bool:\n    return true\n\ndef main() -> int:\n    return 0\n"
+      "def identity(value: bool) -> bool:\n    return value\n\ndef truth() -> bool:\n    return True\n\ndef main() -> int:\n    return 0\n"
     )
     result.diagnostics.should be_empty
 
@@ -177,12 +177,12 @@ describe Smalang::Parser do
     parameter.type.should eq(Smalang::AstType::Bool)
     truth = ParserSpecHelpers.function_at(parsed, 1)
     literal = parsed.arena.node(parsed.arena.node(truth.body).as(Smalang::ReturnNode).value).as(Smalang::BooleanLiteralExpr)
-    parsed.source_file.slice(literal.span).should eq("true")
+    parsed.source_file.slice(literal.span).should eq("True")
   end
 
   it "parses a boolean match expression with inline case results" do
     result = ParserSpecHelpers.parse(
-      "def choose(value: bool) -> int:\n    return match value:\n        case true: 1\n        case false: 2\n"
+      "def choose(value: bool) -> int:\n    return match value:\n        case True: 1\n        case False: 2\n"
     )
 
     result.diagnostics.should be_empty
@@ -208,7 +208,7 @@ describe Smalang::Parser do
 
   it "parses a wildcard default and full expressions as case results" do
     result = ParserSpecHelpers.parse(
-      "def choose(value: bool) -> int:\n    return match value:\n        case true: calculate(1 + 2)\n        case _: 0\n"
+      "def choose(value: bool) -> int:\n    return match value:\n        case True: calculate(1 + 2)\n        case _: 0\n"
     )
     result.diagnostics.should be_empty
 
@@ -226,7 +226,7 @@ describe Smalang::Parser do
 
   it "parses a match expression nested as a case result" do
     result = ParserSpecHelpers.parse(
-      "def choose(first: bool, second: bool) -> int:\n    return match first:\n        case true: match second:\n            case true: 1\n            case false: 2\n        case false: 0\n"
+      "def choose(first: bool, second: bool) -> int:\n    return match first:\n        case True: match second:\n            case True: 1\n            case False: 2\n        case False: 0\n"
     )
     result.diagnostics.should be_empty
 
@@ -242,7 +242,7 @@ describe Smalang::Parser do
 
   it "parses a match expression as a function-call argument" do
     result = ParserSpecHelpers.parse(
-      "def choose(value: bool) -> int:\n    return wrap(match value:\n        case true: 1\n        case false: 0\n    )\n"
+      "def choose(value: bool) -> int:\n    return wrap(match value:\n        case True: 1\n        case False: 0\n    )\n"
     )
     result.diagnostics.should be_empty
 
@@ -264,7 +264,7 @@ describe Smalang::Parser do
     result.success?.should eq(false)
     result.diagnostics.size.should eq(1)
     result.diagnostics.first.message.should contain("match_recovery.py:3:14:")
-    result.diagnostics.first.message.should contain("expected 'true', 'false', or '_' as a case pattern")
+    result.diagnostics.first.message.should contain("expected 'True', 'False', or '_' as a case pattern")
     module_node.functions.count.should eq(2)
     broken_function = parsed.arena.node(parsed.arena.child(module_node.functions, 0)).as(Smalang::FunctionNode)
     parsed.arena.node(broken_function.body).should be_a(Smalang::ErrorNode)
@@ -273,7 +273,7 @@ describe Smalang::Parser do
 
   it "reports a missing case result and keeps the following function" do
     result = ParserSpecHelpers.parse(
-      "def broken(value: bool) -> int:\n    return match value:\n        case true:\n\ndef later() -> int:\n    return 7\n",
+      "def broken(value: bool) -> int:\n    return match value:\n        case True:\n\ndef later() -> int:\n    return 7\n",
       "missing_case_result.py"
     )
     parsed = result.parsed_module

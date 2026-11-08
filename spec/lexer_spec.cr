@@ -137,17 +137,18 @@ describe Smalang::Lexer do
     identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("int80")
   end
 
-  it "recognizes bool types and boolean literals as whole keywords" do
+  it "recognizes capitalized bool literals and keeps lowercase spellings as identifiers" do
     stream = Smalang::Lexer.new.tokenize(
-      "def booleanish(boolish: bool) -> bool:\n    return true\n\ndef falsehood() -> bool:\n    return false\n"
+      "True False true false\n"
     )
 
-    stream.tokens.map(&.kind).should contain(Smalang::TokenKind::BoolType)
-    stream.tokens.map(&.kind).should contain(Smalang::TokenKind::TrueLiteral)
-    stream.tokens.map(&.kind).should contain(Smalang::TokenKind::FalseLiteral)
-    identifiers = stream.tokens.select { |token| token.kind == Smalang::TokenKind::Identifier }
-    identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("boolish")
-    identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("falsehood")
+    stream.tokens.map(&.kind).first(4).should eq([
+      Smalang::TokenKind::TrueLiteral,
+      Smalang::TokenKind::FalseLiteral,
+      Smalang::TokenKind::Identifier,
+      Smalang::TokenKind::Identifier,
+    ])
+    stream.tokens[2..3].map { |token| stream.source_file.slice(token.span) }.should eq(["true", "false"])
   end
 
   it "recognizes match and case as whole keywords" do
