@@ -149,6 +149,22 @@ module Smalang
     end
   end
 
+  class UnitValueLocation < ValueLocation
+    def load_to(code : X86_64CodeBuffer, destination : X86_64Register, frame : X86_64FrameLayout) : Nil
+    end
+
+    def store_from(code : X86_64CodeBuffer, source : X86_64Register, frame : X86_64FrameLayout) : Nil
+    end
+
+    def assigned_register : X86_64Register?
+      nil
+    end
+
+    def spill_slot : Int32?
+      nil
+    end
+  end
+
   abstract class MachineInstruction
     getter position : Int32
 
@@ -194,6 +210,25 @@ module Smalang
       immediate = context.constant_bits(@type, @value)
       context.code.move_immediate(X86_64Register::Rax, immediate)
       context.location(@result_id).store_from(context.code, X86_64Register::Rax, context.frame)
+    end
+  end
+
+  class MachineUnitConstant < MachineInstruction
+    getter result_id : ValueId
+
+    def initialize(position : Int32, @result_id : ValueId)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [] of ValueId
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
     end
   end
 
@@ -281,20 +316,30 @@ module Smalang
     getter exception_id : ValueId
     getter function_id : FunctionId
     getter arguments : Array(ValueId)
+    getter result_type : IrType
     getter normal_successor_label : Int32
     getter exception_successor_label : Int32
+
+    @argument_types : Array(IrType)
 
     def initialize(
       position : Int32,
       @result_id : ValueId,
       @exception_id : ValueId,
       @function_id : FunctionId,
+      @result_type : IrType,
       arguments : Array(ValueId),
+      argument_types : Array(IrType),
       @normal_successor_label : Int32,
       @exception_successor_label : Int32,
     )
       super(position)
       @arguments = arguments.dup
+      @argument_types = argument_types.dup
+    end
+
+    def argument_types : Array(IrType)
+      @argument_types.dup
     end
 
     def used_values : Array(ValueId)
@@ -314,7 +359,7 @@ module Smalang
     end
 
     def outgoing_argument_count : Int32
-      @arguments.size
+      @argument_types.count { |type| !type.zero_sized? }
     end
 
     def emit(context : X86_64EmissionContext) : Nil
@@ -690,6 +735,12 @@ module Smalang
       @instructions << MachineConstant.new(@instructions.size, result_id, result_type, instruction.value)
     end
 
+    def visit(instruction : IrUnitConstantInstruction) : Nil
+      result_id = instruction.result_id
+      raise X86_64BackendFailure.new("unit constant is missing its result") unless result_id
+      @instructions << MachineUnitConstant.new(@instructions.size, result_id)
+    end
+
     def visit(instruction : IrAddInstruction) : Nil
       append_binary(instruction, MachineAddOperation.new)
     end
@@ -738,7 +789,9 @@ module Smalang
         instruction.normal_result_id,
         instruction.exception_result_id,
         function_id,
+        operation.result_type,
         operation.arguments,
+        operation.target.signature.parameter_types,
         normal_label,
         exception_label
       )
@@ -896,7 +949,14 @@ module Smalang
       active = [] of ActiveInterval
       spill_slot_count = 0
 
+      function.value_count.times do |value_id|
+        type = function.value_type(value_id)
+        locations[value_id] = UnitValueLocation.new if type && type.zero_sized?
+      end
+
       intervals.sort_by(&.start_position).each do |interval|
+        next if function.value_type(interval.value_id).try(&.zero_sized?)
+
         active = active.select { |entry| entry.interval.last_use_position >= interval.start_position }
         used_registers = active.map(&.register)
         available_register = ALLOCATABLE_REGISTERS.find { |register| !used_registers.includes?(register) }
@@ -931,10 +991,17 @@ module Smalang
 
     private def allocate_stack_only(function : IrFunction) : RegisterAllocation
       locations = {} of ValueId => ValueLocation
+      spill_slot_count = 0
       function.value_count.times do |value_id|
-        locations[value_id] = SpillValueLocation.new(value_id)
+        type = function.value_type(value_id)
+        if type && type.zero_sized?
+          locations[value_id] = UnitValueLocation.new
+        else
+          locations[value_id] = SpillValueLocation.new(spill_slot_count)
+          spill_slot_count += 1
+        end
       end
-      RegisterAllocation.new(locations, {} of Int32 => Array(CallSpill), function.value_count)
+      RegisterAllocation.new(locations, {} of Int32 => Array(CallSpill), spill_slot_count)
     end
 
     private def build_intervals(function : IrFunction, instructions : Array(MachineInstruction)) : Array(LiveInterval)
@@ -1517,7 +1584,7 @@ module Smalang
     end
 
     def initialize_parameters(function : IrFunction) : Nil
-      parameters = function.parameters
+      parameters = function.parameters.reject { |parameter| parameter.type.zero_sized? }
       staged_count = {parameters.size, ARGUMENT_REGISTERS.size}.min
 
       staged_count.times do |index|
@@ -1566,25 +1633,30 @@ module Smalang
         @code.move_rbp_from_register(@frame.spill_offset(spill.slot), spill.register)
       end
 
-      call.arguments.each_with_index do |value_id, index|
+      argument_index = 0
+      call.arguments.each_with_index do |value_id, parameter_index|
+        next if call.argument_types[parameter_index].zero_sized?
+
         location(value_id).load_to(@code, X86_64Register::Rax, @frame)
-        if index < ARGUMENT_REGISTERS.size
-          @code.move_rbp_from_register(@frame.argument_stage_offset(index), X86_64Register::Rax)
+        if argument_index < ARGUMENT_REGISTERS.size
+          @code.move_rbp_from_register(@frame.argument_stage_offset(argument_index), X86_64Register::Rax)
         else
-          stack_index = index - ARGUMENT_REGISTERS.size
+          stack_index = argument_index - ARGUMENT_REGISTERS.size
           @code.move_rsp_from_register(@frame.outgoing_stack_argument_offset(stack_index), X86_64Register::Rax)
         end
+        argument_index += 1
       end
 
-      call.arguments.each_with_index do |_, index|
-        break if index >= ARGUMENT_REGISTERS.size
+      {argument_index, ARGUMENT_REGISTERS.size}.min.times do |index|
         @code.move_register_from_rbp(ARGUMENT_REGISTERS[index], @frame.argument_stage_offset(index))
       end
 
       relocation_offset = @code.emit_call
       @relocations << X86_64Relocation.new(relocation_offset, call.function_id)
 
-      @code.move_rbp_from_register(@frame.invoke_normal_result_offset, X86_64Register::Rax)
+      unless call.result_type.zero_sized?
+        @code.move_rbp_from_register(@frame.invoke_normal_result_offset, X86_64Register::Rax)
+      end
       @code.move_rbp_from_register(@frame.invoke_exception_offset, X86_64Register::Rdx)
 
       @allocation.call_spills_at(call.position).each do |spill|
@@ -1595,8 +1667,10 @@ module Smalang
       @code.test_register(X86_64Register::Rax)
       exception_result_label = @code.new_label
       @code.jump_if_not_zero_to(exception_result_label)
-      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_normal_result_offset)
-      location(call.result_id).store_from(@code, X86_64Register::Rax, @frame)
+      unless call.result_type.zero_sized?
+        @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_normal_result_offset)
+        location(call.result_id).store_from(@code, X86_64Register::Rax, @frame)
+      end
       @code.jump_to(call.normal_successor_label)
       @code.mark_label(exception_result_label)
       @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_exception_offset)
@@ -1772,7 +1846,8 @@ module Smalang
       allocation = LinearScanRegisterAllocator.new.allocate(function, instructions)
       max_outgoing_arguments = instructions.map(&.outgoing_argument_count).max? || 0
       argument_register_count = X86_64EmissionContext::ARGUMENT_REGISTERS.size
-      parameter_stage_count = {function.parameters.size, argument_register_count}.min
+      machine_parameter_count = function.parameters.count { |parameter| !parameter.type.zero_sized? }
+      parameter_stage_count = {machine_parameter_count, argument_register_count}.min
       call_stage_count = {max_outgoing_arguments, argument_register_count}.min
       staged_argument_count = parameter_stage_count > call_stage_count ? parameter_stage_count : call_stage_count
       outgoing_stack_argument_count = max_outgoing_arguments > argument_register_count ? max_outgoing_arguments - argument_register_count : 0
@@ -2527,6 +2602,10 @@ module Smalang
       unless main_function
         raise X86_64BackendFailure.new("executable module must define main")
       end
+      main = main_function.not_nil!
+      if main.signature.result_type.zero_sized?
+        raise X86_64BackendFailure.new("main cannot return unit because the entrypoint requires an exit status")
+      end
 
       X86_64RuntimeEmitter.new.emit.each do |runtime_function|
         text.align(16)
@@ -2541,7 +2620,7 @@ module Smalang
 
       text.align(16)
       entry_offset = text.size
-      entry = X86_64EntryEmitter.new.emit(main_function.not_nil!.id, expected_result)
+      entry = X86_64EntryEmitter.new.emit(main.id, expected_result)
       text.write_bytes(entry.bytes)
       function_symbols << ElfFunctionSymbol.new(entry.function, entry_offset, entry.bytes.size)
       entry.relocations.each do |relocation|
