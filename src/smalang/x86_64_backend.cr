@@ -1,9 +1,10 @@
 module Smalang
   module X86_64RuntimeSymbols
-    ENTRY             = -1
-    DIVISION_BY_ZERO  = -2
-    EXCEPTION_RELEASE = -3
-    REPORT_UNCAUGHT   = -4
+    ENTRY               = -1
+    DIVISION_BY_ZERO    = -2
+    EXCEPTION_RELEASE   = -3
+    REPORT_UNCAUGHT     = -4
+    INDEX_OUT_OF_BOUNDS = -5
   end
 
   class X86_64BackendFailure < Exception
@@ -149,6 +150,29 @@ module Smalang
     end
   end
 
+  class ArrayValueLocation < ValueLocation
+    getter value_id : ValueId
+
+    def initialize(@value_id : ValueId)
+    end
+
+    def load_to(code : X86_64CodeBuffer, destination : X86_64Register, frame : X86_64FrameLayout) : Nil
+      code.lea_rbp_relative(destination, frame.array_offset(@value_id))
+    end
+
+    def store_from(code : X86_64CodeBuffer, source : X86_64Register, frame : X86_64FrameLayout) : Nil
+      frame.copy_address_to_array(code, source, @value_id)
+    end
+
+    def assigned_register : X86_64Register?
+      nil
+    end
+
+    def spill_slot : Int32?
+      nil
+    end
+  end
+
   class UnitValueLocation < ValueLocation
     def load_to(code : X86_64CodeBuffer, destination : X86_64Register, frame : X86_64FrameLayout) : Nil
     end
@@ -229,6 +253,29 @@ module Smalang
     end
 
     def emit(context : X86_64EmissionContext) : Nil
+    end
+  end
+
+  class MachineArrayLiteral < MachineInstruction
+    getter result_id : ValueId
+    getter array_type : IrArrayType
+    getter elements : Array(ValueId)
+
+    def initialize(position : Int32, @result_id : ValueId, @array_type : IrArrayType, elements : Array(ValueId))
+      super(position)
+      @elements = elements.dup
+    end
+
+    def used_values : Array(ValueId)
+      @elements.dup
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_array_literal(self)
     end
   end
 
@@ -359,11 +406,80 @@ module Smalang
     end
 
     def outgoing_argument_count : Int32
-      @argument_types.count { |type| !type.zero_sized? }
+      @argument_types.count { |type| !type.zero_sized? } + (@result_type.is_a?(IrArrayType) && !@result_type.zero_sized? ? 1 : 0)
     end
 
     def emit(context : X86_64EmissionContext) : Nil
       context.emit_invoke(self)
+    end
+  end
+
+  class MachineArrayAccess < MachineInstruction
+    getter result_id : ValueId
+    getter exception_id : ValueId
+    getter array_id : ValueId
+    getter index_id : ValueId
+    getter array_type : IrArrayType
+    getter normal_successor_label : Int32
+    getter exception_successor_label : Int32
+
+    def initialize(
+      position : Int32,
+      @result_id : ValueId,
+      @exception_id : ValueId,
+      @array_id : ValueId,
+      @index_id : ValueId,
+      @array_type : IrArrayType,
+      @normal_successor_label : Int32,
+      @exception_successor_label : Int32,
+    )
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@array_id, @index_id]
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def defined_value_ids : Array(ValueId)
+      [@result_id, @exception_id]
+    end
+
+    def call_boundary? : Bool
+      true
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_array_get(self)
+    end
+  end
+
+  class MachineArrayUpdate < MachineArrayAccess
+    getter value_id : ValueId
+
+    def initialize(
+      position : Int32,
+      result_id : ValueId,
+      exception_id : ValueId,
+      array_id : ValueId,
+      index_id : ValueId,
+      @value_id : ValueId,
+      array_type : IrArrayType,
+      normal_successor_label : Int32,
+      exception_successor_label : Int32,
+    )
+      super(position, result_id, exception_id, array_id, index_id, array_type, normal_successor_label, exception_successor_label)
+    end
+
+    def used_values : Array(ValueId)
+      super + [@value_id]
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_array_set(self)
     end
   end
 
@@ -647,8 +763,9 @@ module Smalang
 
   class MachineReturn < MachineInstruction
     getter value_id : ValueId
+    getter result_type : IrType
 
-    def initialize(position : Int32, @value_id : ValueId)
+    def initialize(position : Int32, @value_id : ValueId, @result_type : IrType)
       super(position)
     end
 
@@ -661,9 +778,7 @@ module Smalang
     end
 
     def emit(context : X86_64EmissionContext) : Nil
-      context.location(@value_id).load_to(context.code, X86_64Register::Rax, context.frame)
-      context.code.xor_register(X86_64Register::Rdx)
-      context.code.emit_epilogue
+      context.emit_return(@value_id, @result_type)
     end
   end
 
@@ -693,12 +808,14 @@ module Smalang
     @block_labels : Hash(BlockId, Int32)
     @phi_edges : Hash(Tuple(BlockId, BlockId), MachinePhiEdge)
     @phi_edge_order : Array(MachinePhiEdge)
+    @current_result_type : IrType?
 
     def initialize
       @instructions = [] of MachineInstruction
       @block_labels = {} of BlockId => Int32
       @phi_edges = {} of Tuple(BlockId, BlockId) => MachinePhiEdge
       @phi_edge_order = [] of MachinePhiEdge
+      @current_result_type = nil
     end
 
     def lower(function : IrFunction) : Array(MachineInstruction)
@@ -706,6 +823,7 @@ module Smalang
       @block_labels.clear
       @phi_edges.clear
       @phi_edge_order.clear
+      @current_result_type = function.signature.result_type
       function.each_block { |block| @block_labels[block.id] = block.id }
       prepare_phi_edges(function)
 
@@ -741,6 +859,13 @@ module Smalang
       @instructions << MachineUnitConstant.new(@instructions.size, result_id)
     end
 
+    def visit(instruction : IrArrayLiteralInstruction) : Nil
+      result_id = instruction.result_id
+      array_type = instruction.result_type.as?(IrArrayType)
+      raise X86_64BackendFailure.new("array literal is missing its result type") unless result_id && array_type
+      @instructions << MachineArrayLiteral.new(@instructions.size, result_id, array_type, instruction.elements)
+    end
+
     def visit(instruction : IrAddInstruction) : Nil
       append_binary(instruction, MachineAddOperation.new)
     end
@@ -754,7 +879,9 @@ module Smalang
     end
 
     def visit(instruction : IrReturnInstruction) : Nil
-      @instructions << MachineReturn.new(@instructions.size, instruction.value_id)
+      result_type = @current_result_type
+      raise X86_64BackendFailure.new("return is missing the function result type") unless result_type
+      @instructions << MachineReturn.new(@instructions.size, instruction.value_id, result_type)
     end
 
     def visit(instruction : IrPhiInstruction) : Nil
@@ -803,6 +930,24 @@ module Smalang
 
     def visit(operation : IrRemainderOperation, instruction : IrInvokeInstruction) : Nil
       append_integer_division(instruction, operation, true)
+    end
+
+    def visit(operation : IrArrayGetOperation, instruction : IrInvokeInstruction) : Nil
+      append_array_access(instruction, operation.array_id, operation.index_id, operation.array_type)
+    end
+
+    def visit(operation : IrArraySetOperation, instruction : IrInvokeInstruction) : Nil
+      @instructions << MachineArrayUpdate.new(
+        @instructions.size,
+        instruction.normal_result_id,
+        instruction.exception_result_id,
+        operation.array_id,
+        operation.index_id,
+        operation.value_id,
+        operation.array_type,
+        target_label(instruction.block_id, instruction.normal_successor),
+        target_label(instruction.block_id, instruction.exception_successor)
+      )
     end
 
     def visit(instruction : IrResumeExceptionInstruction) : Nil
@@ -854,6 +999,24 @@ module Smalang
         operation.right,
         operation.type,
         remainder,
+        target_label(instruction.block_id, instruction.normal_successor),
+        target_label(instruction.block_id, instruction.exception_successor)
+      )
+    end
+
+    private def append_array_access(
+      instruction : IrInvokeInstruction,
+      array_id : ValueId,
+      index_id : ValueId,
+      array_type : IrArrayType,
+    ) : Nil
+      @instructions << MachineArrayAccess.new(
+        @instructions.size,
+        instruction.normal_result_id,
+        instruction.exception_result_id,
+        array_id,
+        index_id,
+        array_type,
         target_label(instruction.block_id, instruction.normal_successor),
         target_label(instruction.block_id, instruction.exception_successor)
       )
@@ -937,8 +1100,6 @@ module Smalang
       X86_64Register::Rdi,
       X86_64Register::R8,
       X86_64Register::R9,
-      X86_64Register::R10,
-      X86_64Register::R11,
     ]
 
     def allocate(function : IrFunction, instructions : Array(MachineInstruction)) : RegisterAllocation
@@ -951,11 +1112,15 @@ module Smalang
 
       function.value_count.times do |value_id|
         type = function.value_type(value_id)
-        locations[value_id] = UnitValueLocation.new if type && type.zero_sized?
+        if type.is_a?(IrArrayType)
+          locations[value_id] = ArrayValueLocation.new(value_id)
+        elsif type && type.zero_sized?
+          locations[value_id] = UnitValueLocation.new
+        end
       end
 
       intervals.sort_by(&.start_position).each do |interval|
-        next if function.value_type(interval.value_id).try(&.zero_sized?)
+        next if function.value_type(interval.value_id).try { |type| type.zero_sized? || type.is_a?(IrArrayType) }
 
         active = active.select { |entry| entry.interval.last_use_position >= interval.start_position }
         used_registers = active.map(&.register)
@@ -994,7 +1159,9 @@ module Smalang
       spill_slot_count = 0
       function.value_count.times do |value_id|
         type = function.value_type(value_id)
-        if type && type.zero_sized?
+        if type.is_a?(IrArrayType)
+          locations[value_id] = ArrayValueLocation.new(value_id)
+        elsif type && type.zero_sized?
           locations[value_id] = UnitValueLocation.new
         else
           locations[value_id] = SpillValueLocation.new(spill_slot_count)
@@ -1072,9 +1239,11 @@ module Smalang
 
     @spill_offsets : Array(Int32)
     @argument_stage_offsets : Array(Int32)
+    @array_offsets : Hash(ValueId, Int32)
+    @array_sizes : Hash(ValueId, Int32)
     @outgoing_stack_argument_count : Int32
 
-    def initialize(spill_slot_count : Int32, argument_stage_count : Int32, @outgoing_stack_argument_count : Int32)
+    def initialize(function : IrFunction, spill_slot_count : Int32, argument_stage_count : Int32, @outgoing_stack_argument_count : Int32)
       @spill_offsets = [] of Int32
       spill_slot_count.times do |slot|
         @spill_offsets << -(FIXED_FRAME_BYTES + (slot + 1) * 8)
@@ -1085,8 +1254,29 @@ module Smalang
         @argument_stage_offsets << -(FIXED_FRAME_BYTES + (spill_slot_count + index + 1) * 8)
       end
 
-      local_bytes = FIXED_FRAME_BYTES + (spill_slot_count + argument_stage_count + @outgoing_stack_argument_count) * 8
-      @frame_size = align_to(local_bytes, 16)
+      @array_offsets = {} of ValueId => Int32
+      @array_sizes = {} of ValueId => Int32
+      cursor = FIXED_FRAME_BYTES + (spill_slot_count + argument_stage_count + @outgoing_stack_argument_count) * 8
+      function.value_count.times do |value_id|
+        array_type = function.value_type(value_id).as?(IrArrayType)
+        next unless array_type
+        size = array_type.storage_size || raise X86_64BackendFailure.new("array %v#{value_id} has an unrepresentable storage size")
+        raise X86_64BackendFailure.new("array %v#{value_id} is too large for a stack frame") if size > Int32::MAX
+        allocated_size = {size.to_i32, 1}.max
+        alignment = array_type.alignment.to_i32
+        end_offset_64 = cursor.to_i64 + allocated_size.to_i64
+        end_offset_64 = ((end_offset_64 + alignment - 1) // alignment) * alignment
+        if end_offset_64 > Int32::MAX
+          raise X86_64BackendFailure.new("array stack frame exceeds x86_64 frame limits")
+        end
+        end_offset = end_offset_64.to_i32
+        @array_offsets[value_id] = -end_offset
+        @array_sizes[value_id] = size.to_i32
+        cursor = end_offset
+      end
+      frame_size_64 = ((cursor.to_i64 + 15) // 16) * 16
+      raise X86_64BackendFailure.new("array stack frame exceeds x86_64 frame limits") if frame_size_64 > Int32::MAX
+      @frame_size = frame_size_64.to_i32
     end
 
     def frame_link_offset : Int32
@@ -1131,6 +1321,37 @@ module Smalang
 
     def argument_stage_offset(index : Int32) : Int32
       @argument_stage_offsets[index]? || raise X86_64BackendFailure.new("invalid staged argument #{index}")
+    end
+
+    def array_offset(value_id : ValueId) : Int32
+      @array_offsets[value_id]? || raise X86_64BackendFailure.new("missing stack storage for array %v#{value_id}")
+    end
+
+    def array_size(value_id : ValueId) : Int32
+      @array_sizes[value_id]? || raise X86_64BackendFailure.new("missing stack size for array %v#{value_id}")
+    end
+
+    def hidden_return_pointer_offset : Int32
+      -80
+    end
+
+    def copy_address_to_array(code : X86_64CodeBuffer, source : X86_64Register, value_id : ValueId) : Nil
+      size = array_size(value_id)
+      copy_address_to_memory(code, source, X86_64Register::Rbp, array_offset(value_id), size)
+    end
+
+    def copy_address_to_memory(
+      code : X86_64CodeBuffer,
+      source : X86_64Register,
+      destination : X86_64Register,
+      destination_offset : Int32,
+      size : Int32,
+    ) : Nil
+      temporary = source == X86_64Register::R10 ? X86_64Register::R11 : X86_64Register::R10
+      size.times do |index|
+        code.move_register_from_memory_sized(temporary, source, index, 8, false)
+        code.move_memory_from_register_sized(destination, destination_offset + index, temporary, 8)
+      end
     end
 
     def outgoing_stack_argument_offset(index : Int32) : Int32
@@ -1197,8 +1418,16 @@ module Smalang
       write_memory_move(destination, X86_64Register::Rbp, offset)
     end
 
+    def move_register_from_rbp_sized(destination : X86_64Register, offset : Int32, width : Int32, signed : Bool) : Nil
+      move_register_from_memory_sized(destination, X86_64Register::Rbp, offset, width, signed)
+    end
+
     def move_rbp_from_register(offset : Int32, source : X86_64Register) : Nil
       write_memory_store(X86_64Register::Rbp, offset, source)
+    end
+
+    def move_rbp_from_register_sized(offset : Int32, source : X86_64Register, width : Int32) : Nil
+      move_memory_from_register_sized(X86_64Register::Rbp, offset, source, width)
     end
 
     def move_rsp_from_register(offset : Int32, source : X86_64Register) : Nil
@@ -1209,8 +1438,57 @@ module Smalang
       write_memory_move(destination, base, offset)
     end
 
+    def move_register_from_memory_sized(destination : X86_64Register, base : X86_64Register, offset : Int32, width : Int32, signed : Bool) : Nil
+      case width
+      when 8, 16
+        write_rex(true, destination, base)
+        @buffer.write_bytes([0x0f_u8, (signed ? 0xbe_u8 : 0xb6_u8) + (width == 16 ? 1_u8 : 0_u8)])
+        write_memory_operand(destination, base, offset)
+      when 32
+        if signed
+          write_rex(true, destination, base)
+          @buffer.write_u8(0x63_u8)
+        else
+          write_rex(false, destination, base)
+          @buffer.write_u8(0x8b_u8)
+        end
+        write_memory_operand(destination, base, offset)
+      when 64
+        write_memory_move(destination, base, offset)
+      else
+        raise X86_64BackendFailure.new("unsupported memory load width #{width}")
+      end
+    end
+
     def move_memory_from_register(base : X86_64Register, offset : Int32, source : X86_64Register) : Nil
       write_memory_store(base, offset, source)
+    end
+
+    def move_memory_from_register_sized(base : X86_64Register, offset : Int32, source : X86_64Register, width : Int32) : Nil
+      case width
+      when 8
+        write_rex(false, source, base)
+        @buffer.write_u8(0x88_u8)
+      when 16
+        @buffer.write_u8(0x66_u8)
+        write_rex(false, source, base)
+        @buffer.write_u8(0x89_u8)
+      when 32
+        write_rex(false, source, base)
+        @buffer.write_u8(0x89_u8)
+      when 64
+        write_memory_store(base, offset, source)
+        return
+      else
+        raise X86_64BackendFailure.new("unsupported memory store width #{width}")
+      end
+      write_memory_operand(source, base, offset)
+    end
+
+    def lea_rbp_relative(destination : X86_64Register, offset : Int32) : Nil
+      write_rex(true, destination, X86_64Register::Rbp)
+      @buffer.write_u8(0x8d_u8)
+      write_memory_operand(destination, X86_64Register::Rbp, offset)
     end
 
     def move_immediate_to_memory(base : X86_64Register, offset : Int32, value : UInt32) : Nil
@@ -1311,6 +1589,13 @@ module Smalang
       write_modrm(0b11_u8, destination, source)
     end
 
+    def multiply_immediate_register(register : X86_64Register, value : Int32) : Nil
+      write_rex(true, register, register)
+      @buffer.write_u8(0x69_u8)
+      write_modrm(0b11_u8, register, register)
+      @buffer.write_i32(value)
+    end
+
     def multiply_rbp_memory(destination : X86_64Register, offset : Int32) : Nil
       write_rex(true, destination, X86_64Register::Rbp)
       @buffer.write_bytes([0x0f_u8, 0xaf_u8])
@@ -1374,6 +1659,11 @@ module Smalang
 
     def jump_if_not_equal_to(label : Int32) : Nil
       jump_if_not_zero_to(label)
+    end
+
+    def jump_if_above_or_equal_to(label : Int32) : Nil
+      @buffer.write_bytes([0x0f_u8, 0x83_u8])
+      record_branch_fixup(label)
     end
 
     def jump_if_sign_to(label : Int32) : Nil
@@ -1585,20 +1875,30 @@ module Smalang
 
     def initialize_parameters(function : IrFunction) : Nil
       parameters = function.parameters.reject { |parameter| parameter.type.zero_sized? }
-      staged_count = {parameters.size, ARGUMENT_REGISTERS.size}.min
+      has_hidden_result = function.signature.result_type.is_a?(IrArrayType) && !function.signature.result_type.zero_sized?
+      hidden_argument_count = has_hidden_result ? 1 : 0
+      staged_count = {parameters.size + hidden_argument_count, ARGUMENT_REGISTERS.size}.min
 
       staged_count.times do |index|
         @code.move_rbp_from_register(@frame.argument_stage_offset(index), ARGUMENT_REGISTERS[index])
       end
 
+      if has_hidden_result
+        @code.move_register_from_rbp(X86_64Register::Rax, @frame.argument_stage_offset(0))
+        @code.move_rbp_from_register(@frame.hidden_return_pointer_offset, X86_64Register::Rax)
+      end
+
       parameters.each_with_index do |parameter, index|
-        if index < staged_count
-          @code.move_register_from_rbp(X86_64Register::Rax, @frame.argument_stage_offset(index))
+        machine_index = index + hidden_argument_count
+        if machine_index < staged_count
+          @code.move_register_from_rbp(X86_64Register::Rax, @frame.argument_stage_offset(machine_index))
         else
-          stack_offset = 16 + (index - ARGUMENT_REGISTERS.size) * 8
+          stack_offset = 16 + (machine_index - ARGUMENT_REGISTERS.size) * 8
           @code.move_register_from_rbp(X86_64Register::Rax, stack_offset)
         end
-        normalize_integer_register(X86_64Register::Rax, parameter.type)
+        unless parameter.type.is_a?(IrArrayType)
+          normalize_integer_register(X86_64Register::Rax, parameter.type)
+        end
         location(parameter.value_id).store_from(@code, X86_64Register::Rax, @frame)
       end
     end
@@ -1634,6 +1934,11 @@ module Smalang
       end
 
       argument_index = 0
+      if call.result_type.is_a?(IrArrayType) && !call.result_type.zero_sized?
+        location(call.result_id).load_to(@code, X86_64Register::Rax, @frame)
+        @code.move_rbp_from_register(@frame.argument_stage_offset(0), X86_64Register::Rax)
+        argument_index = 1
+      end
       call.arguments.each_with_index do |value_id, parameter_index|
         next if call.argument_types[parameter_index].zero_sized?
 
@@ -1711,6 +2016,110 @@ module Smalang
       @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_exception_offset)
       location(division.exception_id).store_from(@code, X86_64Register::Rax, @frame)
       @code.jump_to(division.exception_successor_label)
+    end
+
+    def emit_array_literal(literal : MachineArrayLiteral) : Nil
+      element_type = literal.array_type.element_type
+      element_size = storage_size(element_type)
+      literal.elements.each_with_index do |value_id, index|
+        destination_offset = frame.array_offset(literal.result_id) + index * element_size
+        if element_type.is_a?(IrArrayType)
+          location(value_id).load_to(@code, X86_64Register::Rax, @frame)
+          @frame.copy_address_to_memory(@code, X86_64Register::Rax, X86_64Register::Rbp, destination_offset, element_size)
+        else
+          location(value_id).load_to(@code, X86_64Register::Rax, @frame)
+          @code.move_rbp_from_register_sized(destination_offset, X86_64Register::Rax, element_size * 8)
+        end
+      end
+    end
+
+    def emit_array_get(access : MachineArrayAccess) : Nil
+      spills = @allocation.call_spills_at(access.position)
+      save_call_spills(spills)
+      index = location(access.index_id)
+      index.load_to(@code, X86_64Register::R10, @frame)
+      bounds_failure = @code.new_label
+      @code.compare_register_immediate(X86_64Register::R10, checked_array_length(access.array_type))
+      @code.jump_if_above_or_equal_to(bounds_failure)
+
+      location(access.array_id).load_to(@code, X86_64Register::Rax, @frame)
+      scale_index(access.array_type.element_type, X86_64Register::R10)
+      @code.add_register(X86_64Register::Rax, X86_64Register::R10)
+      result_type = access.array_type.element_type
+      if result_type.is_a?(IrArrayType)
+        location(access.result_id).store_from(@code, X86_64Register::Rax, @frame)
+      else
+        @code.move_register_from_memory_sized(
+          X86_64Register::Rax,
+          X86_64Register::Rax,
+          0,
+          storage_size(result_type) * 8,
+          result_type.signed?
+        )
+        normalize_integer_register(X86_64Register::Rax, result_type)
+        location(access.result_id).store_from(@code, X86_64Register::Rax, @frame)
+      end
+      restore_call_spills(spills)
+      @code.jump_to(access.normal_successor_label)
+
+      @code.mark_label(bounds_failure)
+      call_runtime(X86_64RuntimeSymbols::INDEX_OUT_OF_BOUNDS)
+      restore_call_spills(spills)
+      location(access.exception_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.jump_to(access.exception_successor_label)
+    end
+
+    def emit_array_set(update : MachineArrayUpdate) : Nil
+      spills = @allocation.call_spills_at(update.position)
+      save_call_spills(spills)
+      index = location(update.index_id)
+      index.load_to(@code, X86_64Register::R10, @frame)
+      bounds_failure = @code.new_label
+      @code.compare_register_immediate(X86_64Register::R10, checked_array_length(update.array_type))
+      @code.jump_if_above_or_equal_to(bounds_failure)
+      @code.move_rbp_from_register(@frame.invoke_normal_result_offset, X86_64Register::R10)
+
+      location(update.array_id).load_to(@code, X86_64Register::Rax, @frame)
+      @frame.copy_address_to_array(@code, X86_64Register::Rax, update.result_id)
+      @code.move_register_from_rbp(X86_64Register::R10, @frame.invoke_normal_result_offset)
+      location(update.result_id).load_to(@code, X86_64Register::Rax, @frame)
+      scale_index(update.array_type.element_type, X86_64Register::R10)
+      @code.add_register(X86_64Register::Rax, X86_64Register::R10)
+      element_type = update.array_type.element_type
+      if element_type.is_a?(IrArrayType)
+        location(update.value_id).load_to(@code, X86_64Register::R11, @frame)
+        @frame.copy_address_to_memory(@code, X86_64Register::R11, X86_64Register::Rax, 0, storage_size(element_type))
+      else
+        location(update.value_id).load_to(@code, X86_64Register::R11, @frame)
+        @code.move_memory_from_register_sized(X86_64Register::Rax, 0, X86_64Register::R11, storage_size(element_type) * 8)
+      end
+      @code.move_immediate(X86_64Register::Rax, 0_u64)
+      location(update.exception_id).store_from(@code, X86_64Register::Rax, @frame)
+      restore_call_spills(spills)
+      @code.jump_to(update.normal_successor_label)
+
+      @code.mark_label(bounds_failure)
+      call_runtime(X86_64RuntimeSymbols::INDEX_OUT_OF_BOUNDS)
+      restore_call_spills(spills)
+      location(update.exception_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.jump_to(update.exception_successor_label)
+    end
+
+    def emit_return(value_id : ValueId, result_type : IrType) : Nil
+      if array_type = result_type.as?(IrArrayType)
+        unless array_type.zero_sized?
+          @code.move_register_from_rbp(X86_64Register::Rcx, @frame.hidden_return_pointer_offset)
+          location(value_id).load_to(@code, X86_64Register::Rax, @frame)
+          @frame.copy_address_to_memory(@code, X86_64Register::Rax, X86_64Register::Rcx, 0, storage_size(array_type))
+          @code.move_register(X86_64Register::Rax, X86_64Register::Rcx)
+        else
+          @code.xor_register(X86_64Register::Rax)
+        end
+      else
+        location(value_id).load_to(@code, X86_64Register::Rax, @frame)
+      end
+      @code.xor_register(X86_64Register::Rdx)
+      @code.emit_epilogue
     end
 
     def emit_exception_dispatch(dispatch : MachineExceptionDispatch) : Nil
@@ -1801,9 +2210,29 @@ module Smalang
       case kind
       when IrExceptionKind::DivisionByZero
         1
+      when IrExceptionKind::IndexOutOfBounds
+        2
       else
         raise X86_64BackendFailure.new("unsupported exception kind #{kind}")
       end
+    end
+
+    private def checked_array_length(type : IrArrayType) : Int32
+      raise X86_64BackendFailure.new("array length exceeds backend bounds-check range") if type.length > Int32::MAX
+      type.length.to_i32
+    end
+
+    private def storage_size(type : IrType) : Int32
+      size = type.storage_size || raise X86_64BackendFailure.new("type #{type.label} has no storage size")
+      raise X86_64BackendFailure.new("type #{type.label} is too large for backend addressing") if size > Int32::MAX
+      size.to_i32
+    end
+
+    private def scale_index(element_type : IrType, index_register : X86_64Register) : Nil
+      stride = storage_size(element_type)
+      return if stride <= 1
+      raise X86_64BackendFailure.new("array element stride exceeds backend immediate range") if stride > Int32::MAX
+      @code.multiply_immediate_register(index_register, stride)
     end
 
     private def set_function_name(name : String) : Nil
@@ -1847,11 +2276,12 @@ module Smalang
       max_outgoing_arguments = instructions.map(&.outgoing_argument_count).max? || 0
       argument_register_count = X86_64EmissionContext::ARGUMENT_REGISTERS.size
       machine_parameter_count = function.parameters.count { |parameter| !parameter.type.zero_sized? }
+      machine_parameter_count += 1 if function.signature.result_type.is_a?(IrArrayType) && !function.signature.result_type.zero_sized?
       parameter_stage_count = {machine_parameter_count, argument_register_count}.min
       call_stage_count = {max_outgoing_arguments, argument_register_count}.min
       staged_argument_count = parameter_stage_count > call_stage_count ? parameter_stage_count : call_stage_count
       outgoing_stack_argument_count = max_outgoing_arguments > argument_register_count ? max_outgoing_arguments - argument_register_count : 0
-      frame = X86_64FrameLayout.new(allocation.spill_slot_count, staged_argument_count, outgoing_stack_argument_count)
+      frame = X86_64FrameLayout.new(function, allocation.spill_slot_count, staged_argument_count, outgoing_stack_argument_count)
       code = X86_64CodeBuffer.new
       code.emit_prologue(frame.frame_size)
       context = X86_64EmissionContext.new(code, frame, allocation)
@@ -1918,6 +2348,7 @@ module Smalang
     EXIT_SYSCALL                        =   60_u64
     PAGE_SIZE                           = 4096_u64
     EXCEPTION_KIND_DIVISION_BY_ZERO     =        1
+    EXCEPTION_KIND_INDEX_OUT_OF_BOUNDS  =        2
     EXCEPTION_RECORD_KIND_OFFSET        =        0
     EXCEPTION_RECORD_SUPPRESSED_OFFSET  =        8
     EXCEPTION_RECORD_FRAME_COUNT_OFFSET =       16
@@ -1926,25 +2357,41 @@ module Smalang
     MAX_EXCEPTION_FRAMES                =       64
 
     def emit : Array(EmittedFunction)
-      [emit_division_by_zero, emit_release, emit_report_uncaught]
+      [emit_division_by_zero, emit_index_out_of_bounds, emit_release, emit_report_uncaught]
     end
 
     private def emit_division_by_zero : EmittedFunction
+      emit_exception_constructor(
+        X86_64RuntimeSymbols::DIVISION_BY_ZERO,
+        "__smalang_new_division_by_zero",
+        EXCEPTION_KIND_DIVISION_BY_ZERO
+      )
+    end
+
+    private def emit_index_out_of_bounds : EmittedFunction
+      emit_exception_constructor(
+        X86_64RuntimeSymbols::INDEX_OUT_OF_BOUNDS,
+        "__smalang_new_index_out_of_bounds",
+        EXCEPTION_KIND_INDEX_OUT_OF_BOUNDS
+      )
+    end
+
+    private def emit_exception_constructor(function_id : FunctionId, name : String, kind_tag : Int32) : EmittedFunction
       code = X86_64CodeBuffer.new
       capture_loop = code.new_label
       capture_done = code.new_label
       allocation_failed = code.new_label
-      emit_exception_allocation(code, allocation_failed)
+      emit_exception_allocation(code, allocation_failed, kind_tag)
       emit_frame_capture_loop(code, capture_loop, capture_done)
       emit_exception_capture_return(code, capture_done)
 
       code.mark_label(allocation_failed)
       emit_exit(code, 127_u64)
       code.resolve_labels
-      emit_helper(X86_64RuntimeSymbols::DIVISION_BY_ZERO, "__smalang_new_division_by_zero", code)
+      emit_helper(function_id, name, code)
     end
 
-    private def emit_exception_allocation(code : X86_64CodeBuffer, allocation_failed : Int32) : Nil
+    private def emit_exception_allocation(code : X86_64CodeBuffer, allocation_failed : Int32, kind_tag : Int32) : Nil
       code.move_immediate(X86_64Register::Rax, MAP_SYSCALL)
       code.xor_register(X86_64Register::Rdi)
       code.move_immediate(X86_64Register::Rsi, PAGE_SIZE)
@@ -1956,7 +2403,7 @@ module Smalang
       code.test_register(X86_64Register::Rax)
       code.jump_if_sign_to(allocation_failed)
       code.move_register(X86_64Register::Rdi, X86_64Register::Rax)
-      code.move_immediate(X86_64Register::Rcx, EXCEPTION_KIND_DIVISION_BY_ZERO.to_u64)
+      code.move_immediate(X86_64Register::Rcx, kind_tag.to_u64)
       code.move_memory_from_register(X86_64Register::Rdi, EXCEPTION_RECORD_KIND_OFFSET, X86_64Register::Rcx)
     end
 
@@ -2064,11 +2511,17 @@ module Smalang
 
     private def emit_exception_kind(code : X86_64CodeBuffer, strings : X86_64RuntimeStringPool) : Nil
       unknown_kind = code.new_label
+      index_out_of_bounds = code.new_label
       done = code.new_label
       code.move_register_from_memory(X86_64Register::Rcx, X86_64Register::R12, EXCEPTION_RECORD_KIND_OFFSET)
       code.compare_register_immediate(X86_64Register::Rcx, EXCEPTION_KIND_DIVISION_BY_ZERO)
-      code.jump_if_not_equal_to(unknown_kind)
+      code.jump_if_not_equal_to(index_out_of_bounds)
       strings.write("DivisionByZero\n")
+      code.jump_to(done)
+      code.mark_label(index_out_of_bounds)
+      code.compare_register_immediate(X86_64Register::Rcx, EXCEPTION_KIND_INDEX_OUT_OF_BOUNDS)
+      code.jump_if_not_equal_to(unknown_kind)
+      strings.write("IndexOutOfBounds\n")
       code.jump_to(done)
       code.mark_label(unknown_kind)
       strings.write("Unknown\n")

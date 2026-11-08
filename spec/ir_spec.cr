@@ -13,6 +13,73 @@ FIXED_WIDTH_IR_TYPES = [
 ]
 
 describe Smalang::IrModule do
+  it "represents fixed arrays as recursive, inline IR types" do
+    byte_array = Smalang::IrArrayType.new(Smalang::IrType::Int8, 3_u128)
+    nested_array = Smalang::IrArrayType.new(byte_array, 2_u128)
+    empty_array = Smalang::IrArrayType.new(Smalang::IrType::Usize, 0_u128)
+
+    byte_array.label.should eq("array[int8, 3]")
+    byte_array.storage_size.should eq(3_u128)
+    nested_array.label.should eq("array[array[int8, 3], 2]")
+    nested_array.storage_size.should eq(6_u128)
+    empty_array.zero_sized?.should be_true
+    empty_array.storage_size.should eq(0_u128)
+    Smalang::IrArrayType.new(Smalang::IrType::Unit, 1_u128).valid_element_type?.should be_false
+  end
+
+  it "dumps typed array literals and checked indexed reads in s notation" do
+    ir = Smalang::IrModule.new
+    array_type = Smalang::IrArrayType.new(Smalang::IrType::Isize, 2_u128)
+    function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    first = function.emit_constant(entry, Smalang::IrType::Isize, 10)
+    second = function.emit_constant(entry, Smalang::IrType::Isize, 20)
+    array = function.emit_array_literal(entry, array_type, [first, second])
+    index = function.emit_constant(entry, Smalang::IrType::Usize, 1)
+    normal = function.add_block("normal")
+    unwind = function.add_block("unwind")
+    result = function.emit_invoke_array_get(entry, array, index, array_type, normal, unwind)
+    function.emit_return(normal, result.value_id)
+    function.emit_resume_exception(unwind, result.exception_id)
+
+    dump = Smalang::IrSExpressionDumper.new.dump(ir)
+    dump.should contain("(%v2 array[isize, 2] (array %v0 %v1))")
+    dump.should contain("(invoke (array.get %v2 %v3) (normal @normal %v4) (exception @unwind %v5)")
+    ir.verify.should be_empty
+  end
+
+  it "verifies and dumps checked indexed array updates" do
+    ir = Smalang::IrModule.new
+    array_type = Smalang::IrArrayType.new(Smalang::IrType::Isize, 2_u128)
+    function = ir.add_function("replace", Array(Smalang::IrType).new, array_type)
+    entry = function.entry_block_id
+    first = function.emit_constant(entry, Smalang::IrType::Isize, 10)
+    second = function.emit_constant(entry, Smalang::IrType::Isize, 20)
+    array = function.emit_array_literal(entry, array_type, [first, second])
+    index = function.emit_constant(entry, Smalang::IrType::Usize, 1)
+    replacement = function.emit_constant(entry, Smalang::IrType::Isize, 42)
+    normal = function.add_block("normal")
+    unwind = function.add_block("unwind")
+    result = function.emit_invoke_array_set(entry, array, index, replacement, array_type, normal, unwind)
+    function.emit_return(normal, result.value_id)
+    function.emit_resume_exception(unwind, result.exception_id)
+
+    Smalang::IrSExpressionDumper.new.dump(ir).should contain("(invoke (array.set %v2 %v3 %v4)")
+    ir.verify.should be_empty
+  end
+
+  it "rejects arrays containing IR-only unit values" do
+    ir = Smalang::IrModule.new
+    array_type = Smalang::IrArrayType.new(Smalang::IrType::Unit, 1_u128)
+    parameter_types = Array(Smalang::IrType).new
+    parameter_types << array_type
+    function = ir.add_function("invalid", parameter_types, Smalang::IrType::Isize)
+    value = function.emit_constant(function.entry_block_id, Smalang::IrType::Isize, 0)
+    function.emit_return(function.entry_block_id, value)
+
+    ir.verify.join("\n").should contain("array type with unsupported elements")
+  end
+
   it "represents and dumps the first-slice program as typed SSA" do
     ir = Smalang::IrModule.new
     increment = ir.add_function(
@@ -59,7 +126,7 @@ describe Smalang::IrModule do
       {Smalang::IrType::Int64, 64, true},
       {Smalang::IrType::UInt64, 64, false},
     ]
-    labels = Smalang::IrType.values.map(&.label)
+    labels = Smalang::IrType::SCALAR_TYPES.map(&.label)
 
     fixed_widths.each do |type, width, signed|
       label = type.label

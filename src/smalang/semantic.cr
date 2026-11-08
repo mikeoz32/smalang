@@ -19,6 +19,14 @@ module Smalang
     end
   end
 
+  struct ArrayTypeInfo
+    getter element_type_id : TypeId
+    getter length : UInt128
+
+    def initialize(@element_type_id : TypeId, @length : UInt128)
+    end
+  end
+
   class SemanticTypeTable
     POINTER_WIDTH = 64
 
@@ -26,12 +34,16 @@ module Smalang
     getter uint_type_id : TypeId
     getter bool_type_id : TypeId
 
-    @types : Array(IntegerTypeInfo)
+    alias TypeInfo = IntegerTypeInfo | ArrayTypeInfo
+
+    @types : Array(TypeInfo)
     @type_ids_by_ast_type : Hash(AstType, TypeId)
+    @array_type_ids : Hash(Tuple(TypeId, UInt128), TypeId)
 
     def initialize
-      @types = [] of IntegerTypeInfo
+      @types = [] of TypeInfo
       @type_ids_by_ast_type = {} of AstType => TypeId
+      @array_type_ids = {} of Tuple(TypeId, UInt128) => TypeId
       register_type(AstType::Int, IntegerTypeInfo.new("int", POINTER_WIDTH, true))
       register_type(AstType::UInt, IntegerTypeInfo.new("uint", POINTER_WIDTH, false))
       register_type(AstType::Bool, IntegerTypeInfo.new("bool", 0, false))
@@ -52,21 +64,73 @@ module Smalang
       @type_ids_by_ast_type[source_type]
     end
 
+    def id_for(source_type_id : AstTypeId, arena : AstTypeArena) : TypeId
+      case syntax = arena.type(source_type_id)
+      when ScalarTypeSyntax
+        id_for(syntax.type)
+      when ArrayTypeSyntax
+        element_type_id = id_for(syntax.element_type_id, arena)
+        key = {element_type_id, syntax.length}
+        @array_type_ids[key]? || register_array_type(element_type_id, syntax.length)
+      else
+        raise "unknown AST type syntax"
+      end
+    end
+
     def label(type_id : TypeId) : String
-      @types[type_id].name
+      case type_info = @types[type_id]
+      when IntegerTypeInfo
+        type_info.name
+      when ArrayTypeInfo
+        "array[#{label(type_info.element_type_id)}, #{type_info.length}]"
+      else
+        raise "unknown semantic type info"
+      end
     end
 
     def fits_nonnegative_literal?(type_id : TypeId, value : UInt128) : Bool
-      @types[type_id].fits_nonnegative_literal?(value)
+      type_info = @types[type_id].as?(IntegerTypeInfo)
+      type_info ? type_info.fits_nonnegative_literal?(value) : false
     end
 
     def supports_integer_arithmetic?(type_id : TypeId) : Bool
-      @types[type_id].bit_width > 0
+      type_info = @types[type_id].as?(IntegerTypeInfo)
+      type_info ? type_info.bit_width > 0 : false
+    end
+
+    def array_type(type_id : TypeId) : ArrayTypeInfo?
+      @types[type_id].as?(ArrayTypeInfo)
+    end
+
+    def scalar_type(type_id : TypeId) : IntegerTypeInfo?
+      @types[type_id].as?(IntegerTypeInfo)
+    end
+
+    def storage_size(type_id : TypeId) : UInt128?
+      case type_info = @types[type_id]
+      when IntegerTypeInfo
+        type_info.bit_width == 0 ? 1_u128 : (type_info.bit_width // 8).to_u128
+      when ArrayTypeInfo
+        element_size = storage_size(type_info.element_type_id)
+        return nil unless element_size
+        return 0_u128 if type_info.length == 0
+        return nil if element_size > UInt128::MAX // type_info.length
+        element_size * type_info.length
+      else
+        nil
+      end
     end
 
     private def register_type(ast_type : AstType, type_info : IntegerTypeInfo) : Nil
       @type_ids_by_ast_type[ast_type] = @types.size
       @types << type_info
+    end
+
+    private def register_array_type(element_type_id : TypeId, length : UInt128) : TypeId
+      type_id = @types.size
+      @types << ArrayTypeInfo.new(element_type_id, length)
+      @array_type_ids[{element_type_id, length}] = type_id
+      type_id
     end
   end
 
@@ -250,7 +314,7 @@ module Smalang
         declaration_id,
         declaration.name,
         parameter_types,
-        @type_table.id_for(declaration.return_type)
+        @type_table.id_for(declaration.return_type, @parsed_module.type_arena)
       )
       @module_scope.declare(name, symbol)
       @symbols << symbol
@@ -264,7 +328,7 @@ module Smalang
         @symbols.size,
         declaration_id,
         declaration.name,
-        @type_table.id_for(declaration.type),
+        @type_table.id_for(declaration.type, @parsed_module.type_arena),
         declaration.mutability
       )
       @symbols << symbol
@@ -277,7 +341,7 @@ module Smalang
         @symbols.size,
         declaration_id,
         declaration.name,
-        @type_table.id_for(declaration.type),
+        @type_table.id_for(declaration.type, @parsed_module.type_arena),
         declaration.mutability
       )
       @symbols << symbol
@@ -315,7 +379,7 @@ module Smalang
       parameters.count.times do |index|
         parameter_id = @arena.child(parameters, index)
         parameter = @arena.node(parameter_id).as(ParameterNode)
-        types << @type_table.id_for(parameter.type)
+        types << @type_table.id_for(parameter.type, @parsed_module.type_arena)
       end
       types
     end
@@ -443,6 +507,12 @@ module Smalang
     def visit(node : BinaryExpr) : Nil
     end
 
+    def visit(node : ArrayLiteralExpr) : Nil
+    end
+
+    def visit(node : IndexExpr) : Nil
+    end
+
     def visit(node : CallExpr) : Nil
     end
 
@@ -542,7 +612,7 @@ module Smalang
         return
       end
 
-      type_id = @context.type_table.id_for(node.type)
+      type_id = @context.type_table.id_for(node.type, @context.parsed_module.type_arena)
       initializer_type_id = analyze_expression(node.initializer, type_id)
       return if @context.diagnostic
       unless initializer_type_id == type_id
@@ -557,27 +627,54 @@ module Smalang
 
     def visit(node : AssignmentNode) : Nil
       scope = @current_binding_scope.not_nil!
-      name = @context.parsed_module.source_file.slice(node.target)
-      binding = scope.resolve(name)
-      unless binding
-        @context.report(node.target, "unknown name '#{name}'")
-        return
-      end
+      target = @context.arena.node(node.target)
+      case target
+      when IdentifierExpr
+        name = @context.parsed_module.source_file.slice(target.span)
+        binding = scope.resolve(name)
+        unless binding
+          @context.report(target.span, "unknown name '#{name}'")
+          return
+        end
+        unless binding.mutable?
+          @context.report(target.span, "cannot assign to immutable binding '#{name}'")
+          return
+        end
 
-      unless binding.mutable?
-        @context.report(node.target, "cannot assign to immutable binding '#{name}'")
-        return
-      end
+        value_type_id = analyze_expression(node.value, binding.type_id)
+        return if @context.diagnostic
+        unless value_type_id == binding.type_id
+          actual_type = value_type_id.try { |id| type_label(id) } || "unknown"
+          @context.report(target.span, "assignment has type #{actual_type}, expected #{type_label(binding.type_id)}")
+          return
+        end
+        @context.set_symbol(current_node_id, binding.id)
+      when IndexExpr
+        target_type_id = analyze_expression(node.target)
+        return if @context.diagnostic
+        root_binding = mutable_array_binding(node.target)
+        return if @context.diagnostic
+        unless root_binding
+          @context.report(target.span, "indexed assignment requires a mutable array binding")
+          return
+        end
+        unless root_binding.mutable?
+          @context.report(target.span, "cannot modify elements of immutable binding '#{binding_name(root_binding)}'")
+          return
+        end
 
-      value_type_id = analyze_expression(node.value, binding.type_id)
-      return if @context.diagnostic
-      unless value_type_id == binding.type_id
-        actual_type = value_type_id.try { |id| type_label(id) } || "unknown"
-        @context.report(node.target, "assignment has type #{actual_type}, expected #{type_label(binding.type_id)}")
-        return
+        value_type_id = target_type_id.try { |id| analyze_expression(node.value, id) }
+        return if @context.diagnostic
+        unless target_type_id && value_type_id == target_type_id
+          actual_type = value_type_id.try { |id| type_label(id) } || "unknown"
+          expected_type = target_type_id.try { |id| type_label(id) } || "unknown"
+          @context.report(target.span, "indexed assignment has type #{actual_type}, expected #{expected_type}")
+          return
+        end
+        @context.set_symbol(current_node_id, root_binding.id)
+      else
+        @context.report(target.span, "invalid assignment target")
       end
-
-      @context.set_symbol(current_node_id, binding.id)
     end
 
     def visit(node : ReturnNode) : Nil
@@ -672,6 +769,68 @@ module Smalang
       @context.set_type(current_node_id, left_type)
     end
 
+    def visit(node : ArrayLiteralExpr) : Nil
+      expected_type_id = @expected_type_id
+      unless expected_type_id
+        @context.report(node.span, "array literal requires an expected array type")
+        return
+      end
+      array_type = @context.type_table.array_type(expected_type_id)
+      unless array_type
+        @context.report(node.span, "array literal has an expected non-array type #{type_label(expected_type_id)}")
+        return
+      end
+      unless node.elements.count.to_u128 == array_type.length
+        @context.report(node.span, "array literal has #{node.elements.count} elements, expected #{array_type.length}")
+        return
+      end
+
+      node.elements.count.times do |index|
+        element_id = @context.arena.child(node.elements, index)
+        unless compile_time_constant_expression?(element_id)
+          @context.report(@context.arena.node(element_id).span, "array literal elements must be compile-time constants")
+          return
+        end
+        element_type_id = analyze_expression(element_id, array_type.element_type_id)
+        return if @context.diagnostic
+        unless element_type_id == array_type.element_type_id
+          actual_type = element_type_id.try { |id| type_label(id) } || "unknown"
+          @context.report(@context.arena.node(element_id).span, "array element has type #{actual_type}, expected #{type_label(array_type.element_type_id)}")
+          return
+        end
+      end
+      @context.set_type(current_node_id, expected_type_id)
+    end
+
+    def visit(node : IndexExpr) : Nil
+      array_type_id = analyze_expression(node.array)
+      return if @context.diagnostic
+      unless array_type_id
+        @context.report(@context.arena.node(node.array).span, "cannot infer indexed value type")
+        return
+      end
+      array_type = @context.type_table.array_type(array_type_id)
+      unless array_type
+        @context.report(@context.arena.node(node.array).span, "indexing requires an array, got #{type_label(array_type_id)}")
+        return
+      end
+
+      index_type_id = analyze_expression(node.index, @context.type_table.uint_type_id)
+      return if @context.diagnostic
+      unless index_type_id == @context.type_table.uint_type_id
+        actual_type = index_type_id.try { |id| type_label(id) } || "unknown"
+        @context.report(@context.arena.node(node.index).span, "array index must have type uint, got #{actual_type}")
+        return
+      end
+      if index = constant_uint_value(node.index)
+        if index >= array_type.length
+          @context.report(@context.arena.node(node.index).span, "array index #{index} is out of bounds for length #{array_type.length}")
+          return
+        end
+      end
+      @context.set_type(current_node_id, array_type.element_type_id)
+    end
+
     def visit(node : CallExpr) : Nil
       name = @context.parsed_module.source_file.slice(node.callee)
       function = @context.module_scope.resolve(name)
@@ -750,6 +909,63 @@ module Smalang
       visit_node(node_id)
       @expected_type_id = previous_expected_type_id
       @context.type_of(node_id)
+    end
+
+    private def compile_time_constant_expression?(node_id : NodeId) : Bool
+      case node = @context.arena.node(node_id)
+      when IntegerLiteralExpr, BooleanLiteralExpr
+        true
+      when ArrayLiteralExpr
+        node.elements.count.times.all? do |index|
+          compile_time_constant_expression?(@context.arena.child(node.elements, index))
+        end
+      when BinaryExpr
+        compile_time_constant_expression?(node.left) && compile_time_constant_expression?(node.right)
+      else
+        false
+      end
+    end
+
+    private def constant_uint_value(node_id : NodeId) : UInt128?
+      case node = @context.arena.node(node_id)
+      when IntegerLiteralExpr
+        @context.parsed_module.source_file.slice(node.span).to_u128?
+      when BinaryExpr
+        left = constant_uint_value(node.left)
+        right = constant_uint_value(node.right)
+        return nil unless left && right
+        left_value = left.to_u64
+        right_value = right.to_u64
+        case node.operator
+        when BinaryOperator::Add
+          (left_value &+ right_value).to_u128
+        when BinaryOperator::Subtract
+          (left_value &- right_value).to_u128
+        end
+      else
+        nil
+      end
+    end
+
+    private def mutable_array_binding(node_id : NodeId) : SemanticBindingSymbol?
+      case node = @context.arena.node(node_id)
+      when IdentifierExpr
+        name = @context.parsed_module.source_file.slice(node.span)
+        binding = @current_binding_scope.try(&.resolve(name))
+        unless binding
+          @context.report(node.span, "unknown name '#{name}'")
+          return nil
+        end
+        binding
+      when IndexExpr
+        mutable_array_binding(node.array)
+      else
+        nil
+      end
+    end
+
+    private def binding_name(binding : SemanticBindingSymbol) : String
+      @context.parsed_module.source_file.slice(binding.name_span)
     end
 
     private def validate_boolean_match_cases(node : MatchExpressionNode) : Bool

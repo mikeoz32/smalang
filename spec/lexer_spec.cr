@@ -2,6 +2,12 @@ require "spec"
 require "../src/smalang/lexer"
 
 describe Smalang::Lexer do
+  it "tokenizes square brackets for array types and literals" do
+    tokens = Smalang::Lexer.new.tokenize("[ ]\n", "array_tokens.py")
+
+    tokens.tokens.map(&.kind.to_s).should eq(["LeftBracket", "RightBracket", "Newline", "Eof"])
+  end
+
   it "emits EOF for empty or blank-only source" do
     ["", " \n\n"].each do |source|
       stream = Smalang::Lexer.new.tokenize(source)

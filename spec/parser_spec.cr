@@ -13,6 +13,10 @@ module ParserSpecHelpers
     function_id = parsed.arena.child(module_node.functions, index)
     parsed.arena.node(function_id).as(Smalang::FunctionNode)
   end
+
+  def self.scalar_type(parsed : Smalang::ParsedModule, type_id : Smalang::AstTypeId) : Smalang::AstType
+    parsed.type_arena.type(type_id).as(Smalang::ScalarTypeSyntax).type
+  end
 end
 
 class ParserSpecVisitor < Smalang::AstVisitor
@@ -66,6 +70,14 @@ class ParserSpecVisitor < Smalang::AstVisitor
     @visited << :binary
   end
 
+  def visit(node : Smalang::ArrayLiteralExpr) : Nil
+    @visited << :array_literal
+  end
+
+  def visit(node : Smalang::IndexExpr) : Nil
+    @visited << :index
+  end
+
   def visit(node : Smalang::CallExpr) : Nil
     @visited << :call
   end
@@ -101,7 +113,7 @@ describe Smalang::Parser do
     function_id = parsed.arena.child(module_node.functions, 0)
     function = parsed.arena.node(function_id).as(Smalang::FunctionNode)
     parsed.source_file.slice(function.name).should eq("main")
-    function.return_type.should eq(Smalang::AstType::Int)
+    ParserSpecHelpers.scalar_type(parsed, function.return_type).should eq(Smalang::AstType::Int)
 
     return_node = parsed.arena.node(function.body).as(Smalang::ReturnNode)
     literal = parsed.arena.node(return_node.value).as(Smalang::IntegerLiteralExpr)
@@ -179,15 +191,15 @@ describe Smalang::Parser do
     function = parsed.arena.node(parsed.arena.child(module_node.functions, 0)).as(Smalang::FunctionNode)
 
     parsed.source_file.slice(function.name).should eq("compute")
-    function.return_type.should eq(Smalang::AstType::UInt)
+    ParserSpecHelpers.scalar_type(result.parsed_module, function.return_type).should eq(Smalang::AstType::UInt)
     function.parameters.count.should eq(2)
 
     left = parsed.arena.node(parsed.arena.child(function.parameters, 0)).as(Smalang::ParameterNode)
     right = parsed.arena.node(parsed.arena.child(function.parameters, 1)).as(Smalang::ParameterNode)
     parsed.source_file.slice(left.name).should eq("left")
-    left.type.should eq(Smalang::AstType::UInt)
+    ParserSpecHelpers.scalar_type(parsed, left.type).should eq(Smalang::AstType::UInt)
     parsed.source_file.slice(right.name).should eq("right")
-    right.type.should eq(Smalang::AstType::Int)
+    ParserSpecHelpers.scalar_type(parsed, right.type).should eq(Smalang::AstType::Int)
   end
 
   it "parses each fixed-width integer type in parameter and result annotations" do
@@ -207,9 +219,9 @@ describe Smalang::Parser do
       result.diagnostics.should be_empty
 
       function = ParserSpecHelpers.function_at(result.parsed_module, 0)
-      function.return_type.should eq(ast_type)
+      ParserSpecHelpers.scalar_type(result.parsed_module, function.return_type).should eq(ast_type)
       parameter = result.parsed_module.arena.node(result.parsed_module.arena.child(function.parameters, 0)).as(Smalang::ParameterNode)
-      parameter.type.should eq(ast_type)
+      ParserSpecHelpers.scalar_type(result.parsed_module, parameter.type).should eq(ast_type)
     end
   end
 
@@ -221,9 +233,9 @@ describe Smalang::Parser do
 
     parsed = result.parsed_module
     identity = ParserSpecHelpers.function_at(parsed, 0)
-    identity.return_type.should eq(Smalang::AstType::Bool)
+    ParserSpecHelpers.scalar_type(result.parsed_module, identity.return_type).should eq(Smalang::AstType::Bool)
     parameter = parsed.arena.node(parsed.arena.child(identity.parameters, 0)).as(Smalang::ParameterNode)
-    parameter.type.should eq(Smalang::AstType::Bool)
+    ParserSpecHelpers.scalar_type(parsed, parameter.type).should eq(Smalang::AstType::Bool)
     truth = ParserSpecHelpers.function_at(parsed, 1)
     literal = parsed.arena.node(parsed.arena.node(truth.body).as(Smalang::ReturnNode).value).as(Smalang::BooleanLiteralExpr)
     parsed.source_file.slice(literal.span).should eq("True")
@@ -489,5 +501,23 @@ describe Smalang::Parser do
     result.diagnostics.size.should eq(1)
     parsed.arena.node(broken.body).as(Smalang::ErrorNode)
     parsed.source_file.slice(later.name).should eq("next")
+  end
+
+  it "parses nested array types with compile-time lengths" do
+    result = ParserSpecHelpers.parse(
+      "def read(matrix: array[array[int, 4], 3]) -> int:\n    return 0\n"
+    )
+
+    result.success?.should eq(true)
+    function = ParserSpecHelpers.function_at(result.parsed_module, 0)
+    parameter = result.parsed_module.arena.node(
+      result.parsed_module.arena.child(function.parameters, 0)
+    ).as(Smalang::ParameterNode)
+    outer = result.parsed_module.type_arena.type(parameter.type).as(Smalang::ArrayTypeSyntax)
+    outer.length.should eq(3_u128)
+    inner = result.parsed_module.type_arena.type(outer.element_type_id).as(Smalang::ArrayTypeSyntax)
+    inner.length.should eq(4_u128)
+    scalar = result.parsed_module.type_arena.type(inner.element_type_id).as(Smalang::ScalarTypeSyntax)
+    scalar.type.should eq(Smalang::AstType::Int)
   end
 end
