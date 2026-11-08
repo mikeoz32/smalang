@@ -128,6 +128,65 @@ describe Smalang::SemanticAnalyzer do
     result.success?.should eq(true)
   end
 
+  it "checks a typed local initializer and resolves the binding in later statements" do
+    result = SemanticSpecHelpers.analyze(
+      "def main() -> int:\n    total: int = 40\n    return total\n"
+    )
+
+    result.success?.should eq(true)
+  end
+
+  it "allows mutable parameters and local bindings to be reassigned" do
+    result = SemanticSpecHelpers.analyze(
+      "def update(value: mut[int]) -> int:\n    current: mut[int] = value\n    current = current + 1\n    value = current\n    return value\n\ndef main() -> int:\n    return update(40)\n"
+    )
+
+    result.success?.should eq(true)
+  end
+
+  it "rejects reassignment to immutable locals and parameters" do
+    invalid_bindings = [
+      {"def work() -> int:\n    value: int = 1\n    value = 2\n    return value\n\ndef main() -> int:\n    return work()\n", "immutable binding 'value'"},
+      {"def work(value: int) -> int:\n    value = 2\n    return value\n\ndef main() -> int:\n    return work(1)\n", "immutable binding 'value'"},
+      {"def work() -> int:\n    value: const[int] = 1\n    value = 2\n    return value\n\ndef main() -> int:\n    return work()\n", "immutable binding 'value'"},
+    ]
+
+    invalid_bindings.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.message.should contain(expected_message)
+    end
+  end
+
+  it "points to an assignment that violates binding immutability" do
+    result = SemanticSpecHelpers.analyze(
+      "def work() -> int:\n    value: int = 1\n    value = 2\n    return value\n\ndef main() -> int:\n    return work()\n",
+      "immutable.py"
+    )
+
+    result.success?.should eq(false)
+    diagnostic = result.diagnostic.not_nil!.message
+    diagnostic.should contain("immutable.py:3:5:")
+    diagnostic.should contain("cannot assign to immutable binding 'value'")
+  end
+
+  it "rejects duplicate names, use before declaration, and mismatched binding types" do
+    invalid_programs = [
+      {"def work(value: int) -> int:\n    value: mut[int] = 1\n    return value\n\ndef main() -> int:\n    return work(1)\n", "duplicate binding 'value'"},
+      {"def work() -> int:\n    value: int = 1\n    value: mut[int] = 2\n    return value\n\ndef main() -> int:\n    return work()\n", "duplicate binding 'value'"},
+      {"def work() -> int:\n    value = 1\n    return 0\n\ndef main() -> int:\n    return work()\n", "unknown name 'value'"},
+      {"def work() -> int:\n    result: int = value\n    value: int = 1\n    return result\n\ndef main() -> int:\n    return work()\n", "unknown name 'value'"},
+      {"def work() -> int:\n    value: int = True\n    return 0\n\ndef main() -> int:\n    return work()\n", "initializer has type bool, expected int"},
+      {"def work() -> int:\n    value: mut[int] = 1\n    value = True\n    return value\n\ndef main() -> int:\n    return work()\n", "assignment has type bool, expected int"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.message.should contain(expected_message)
+    end
+  end
+
   it "rejects implicit conversions between bool and integer types" do
     result = SemanticSpecHelpers.analyze(
       "def identity(value: bool) -> bool:\n    return value\n\ndef main() -> int:\n    return identity(1)\n"

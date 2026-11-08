@@ -162,6 +162,24 @@ describe Smalang::Lexer do
     identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("matchish")
   end
 
+  it "tokenizes binding qualifiers, assignment, and type brackets" do
+    stream = Smalang::Lexer.new.tokenize("mut const = [int]\n")
+    stream.tokens.map(&.kind).should eq([
+      Smalang::TokenKind::Mut,
+      Smalang::TokenKind::Const,
+      Smalang::TokenKind::Assign,
+      Smalang::TokenKind::LeftBracket,
+      Smalang::TokenKind::IntType,
+      Smalang::TokenKind::RightBracket,
+      Smalang::TokenKind::Newline,
+      Smalang::TokenKind::Eof,
+    ])
+
+    identifiers = Smalang::Lexer.new.tokenize("mutable constant\n").tokens
+      .select { |token| token.kind == Smalang::TokenKind::Identifier }
+    identifiers.size.should eq(2)
+  end
+
   it "ignores blank lines, accepts CRLF, and inserts the final newline" do
     stream = Smalang::Lexer.new.tokenize(
       "\r\n    \r\ndef main() -> int:\r\n    return 1"

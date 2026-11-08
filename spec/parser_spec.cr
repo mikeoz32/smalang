@@ -34,6 +34,14 @@ class ParserSpecVisitor < Smalang::AstVisitor
     @visited << :parameter
   end
 
+  def visit(node : Smalang::VariableDeclarationNode) : Nil
+    @visited << :variable_declaration
+  end
+
+  def visit(node : Smalang::AssignmentNode) : Nil
+    @visited << :assignment
+  end
+
   def visit(node : Smalang::ReturnNode) : Nil
     @visited << :return
   end
@@ -98,6 +106,47 @@ describe Smalang::Parser do
     return_node = parsed.arena.node(function.body).as(Smalang::ReturnNode)
     literal = parsed.arena.node(return_node.value).as(Smalang::IntegerLiteralExpr)
     parsed.source_file.slice(literal.span).should eq("42")
+  end
+
+  it "parses typed local bindings, assignments, and a final return" do
+    result = ParserSpecHelpers.parse(
+      "def main(base: int, amount: mut[int], fixed: const[int]) -> int:\n    total: int = base + 1\n    copy: const[int] = total\n    total = copy + amount\n    amount = 2\n    return total\n"
+    )
+
+    result.diagnostics.should be_empty
+    function = ParserSpecHelpers.function_at(result.parsed_module, 0)
+    result.parsed_module.arena.node(result.parsed_module.arena.child(function.parameters, 0))
+      .as(Smalang::ParameterNode).mutability.should eq(Smalang::BindingMutability::Immutable)
+    result.parsed_module.arena.node(result.parsed_module.arena.child(function.parameters, 1))
+      .as(Smalang::ParameterNode).mutability.should eq(Smalang::BindingMutability::Mutable)
+    result.parsed_module.arena.node(result.parsed_module.arena.child(function.parameters, 2))
+      .as(Smalang::ParameterNode).mutability.should eq(Smalang::BindingMutability::Immutable)
+    function.statements.count.should eq(4)
+    result.parsed_module.arena.node(result.parsed_module.arena.child(function.statements, 0))
+      .as(Smalang::VariableDeclarationNode).mutability.should eq(Smalang::BindingMutability::Immutable)
+    result.parsed_module.arena.node(result.parsed_module.arena.child(function.statements, 1))
+      .as(Smalang::VariableDeclarationNode).mutability.should eq(Smalang::BindingMutability::Immutable)
+    result.parsed_module.arena.node(result.parsed_module.arena.child(function.statements, 2))
+      .should be_a(Smalang::AssignmentNode)
+    result.parsed_module.arena.node(result.parsed_module.arena.child(function.statements, 3))
+      .should be_a(Smalang::AssignmentNode)
+  end
+
+  it "rejects uninitialized bindings, qualified return types, and invalid return placement" do
+    invalid_programs = [
+      {"def main() -> int:\n    value: int\n    return 0\n", "expected '=' before the binding initializer"},
+      {"def main() -> int:\n    value: mut int = 1\n    return value\n", "expected '[' after 'mut'"},
+      {"def main() -> int:\n    value: mut[const[int]] = 1\n    return value\n", "expected a type"},
+      {"def main() -> mut[int]:\n    return 0\n", "expected a type"},
+      {"def main() -> int:\n    return 0\n    value: int = 1\n", "return must be the final function statement"},
+      {"def main() -> int:\n    value: int = 1\n", "expected a final return statement"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = ParserSpecHelpers.parse(source)
+      result.success?.should eq(false)
+      result.diagnostics.first.message.should contain(expected_message)
+    end
   end
 
   it "parses the checked-in first program into both function ASTs" do

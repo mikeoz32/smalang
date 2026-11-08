@@ -129,6 +129,12 @@ module Smalang
     def visit(node : ParameterNode) : Nil
     end
 
+    def visit(node : VariableDeclarationNode) : Nil
+    end
+
+    def visit(node : AssignmentNode) : Nil
+    end
+
     def visit(node : ReturnNode) : Nil
     end
 
@@ -236,14 +242,14 @@ module Smalang
   end
 
   class IrFunctionBodyPass < IrLoweringAstVisitor
-    @parameter_values_by_symbol : Hash(SymbolId, ValueId)
+    @binding_values_by_symbol : Hash(SymbolId, ValueId)
     @current_function : IrFunction?
     @current_block_id : BlockId?
     @expression_value_id : ValueId?
 
     def initialize(context : IrLoweringContext)
       super(context)
-      @parameter_values_by_symbol = Hash(SymbolId, ValueId).new
+      @binding_values_by_symbol = Hash(SymbolId, ValueId).new
       @current_function = nil
       @current_block_id = nil
       @expression_value_id = nil
@@ -285,6 +291,7 @@ module Smalang
         return
       end
 
+      @binding_values_by_symbol.clear
       node.parameters.count.times do |index|
         parameter_node_id = @context.parsed_module.arena.child(node.parameters, index)
         parameter_symbol_id = @context.semantic_module.symbol_for(parameter_node_id)
@@ -301,11 +308,15 @@ module Smalang
           return
         end
 
-        @parameter_values_by_symbol[parameter_symbol_id] = parameters[index].value_id
+        @binding_values_by_symbol[parameter_symbol_id] = parameters[index].value_id
       end
 
       @current_function = function
       @current_block_id = function.entry_block_id
+      node.statements.count.times do |index|
+        return if @context.diagnostic
+        visit_node(@context.parsed_module.arena.child(node.statements, index))
+      end
       visit_node(node.body)
       @current_block_id = nil
       @current_function = nil
@@ -322,6 +333,32 @@ module Smalang
       end
 
       function.emit_return(current_block_id, value_id)
+    end
+
+    def visit(node : VariableDeclarationNode) : Nil
+      value_id = lower_expression(node.initializer)
+      return unless value_id
+
+      symbol_id = @context.semantic_module.symbol_for(current_node_id)
+      unless symbol_id
+        @context.report(node.name, "missing semantic binding for local declaration")
+        return
+      end
+
+      @binding_values_by_symbol[symbol_id] = value_id
+    end
+
+    def visit(node : AssignmentNode) : Nil
+      value_id = lower_expression(node.value)
+      return unless value_id
+
+      symbol_id = @context.semantic_module.symbol_for(current_node_id)
+      unless symbol_id
+        @context.report(node.target, "missing semantic binding for assignment")
+        return
+      end
+
+      @binding_values_by_symbol[symbol_id] = value_id
     end
 
     def visit(node : MatchExpressionNode) : Nil
@@ -447,9 +484,9 @@ module Smalang
         return
       end
 
-      value_id = @parameter_values_by_symbol[symbol_id]?
+      value_id = @binding_values_by_symbol[symbol_id]?
       unless value_id
-        @context.report(node.span, "identifier has no corresponding IR parameter value")
+        @context.report(node.span, "identifier has no corresponding IR binding value")
         return
       end
 

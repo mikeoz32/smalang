@@ -69,6 +69,16 @@ describe Smalang::IrLowerer do
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
 
+  it "lowers immutable and mutable bindings to the current SSA values" do
+    source = File.read("#{__DIR__}/../examples/const_mut_bindings.py")
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(20)
+  end
+
   it "preserves unsigned parameter and expression types" do
     source = "def add(left: uint, right: uint) -> uint:\n    return left + right\n\ndef main() -> int:\n    return 0\n"
     result = IrLoweringSpecHelpers.lower(source)

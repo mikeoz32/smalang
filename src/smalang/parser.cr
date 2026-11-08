@@ -15,6 +15,11 @@ module Smalang
     UInt64
   end
 
+  enum BindingMutability : UInt8
+    Immutable
+    Mutable
+  end
+
   enum BinaryOperator : UInt8
     Add
     Subtract
@@ -82,9 +87,10 @@ module Smalang
     getter name : SourceSpan
     getter return_type : AstType
     getter parameters : NodeRange
+    getter statements : NodeRange
     getter body : NodeId
 
-    def initialize(@span : SourceSpan, @name : SourceSpan, @return_type : AstType, @parameters : NodeRange, @body : NodeId)
+    def initialize(@span : SourceSpan, @name : SourceSpan, @return_type : AstType, @parameters : NodeRange, @statements : NodeRange, @body : NodeId)
     end
   end
 
@@ -92,8 +98,29 @@ module Smalang
     getter span : SourceSpan
     getter name : SourceSpan
     getter type : AstType
+    getter mutability : BindingMutability
 
-    def initialize(@span : SourceSpan, @name : SourceSpan, @type : AstType)
+    def initialize(@span : SourceSpan, @name : SourceSpan, @type : AstType, @mutability : BindingMutability)
+    end
+  end
+
+  struct VariableDeclarationNode
+    getter span : SourceSpan
+    getter name : SourceSpan
+    getter type : AstType
+    getter mutability : BindingMutability
+    getter initializer : NodeId
+
+    def initialize(@span : SourceSpan, @name : SourceSpan, @type : AstType, @mutability : BindingMutability, @initializer : NodeId)
+    end
+  end
+
+  struct AssignmentNode
+    getter span : SourceSpan
+    getter target : SourceSpan
+    getter value : NodeId
+
+    def initialize(@span : SourceSpan, @target : SourceSpan, @value : NodeId)
     end
   end
 
@@ -172,12 +199,14 @@ module Smalang
     end
   end
 
-  alias AstNode = ModuleNode | FunctionNode | ParameterNode | ReturnNode | MatchExpressionNode | MatchCaseNode | SourceMatchPatternNode | BinaryExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
+  alias AstNode = ModuleNode | FunctionNode | ParameterNode | VariableDeclarationNode | AssignmentNode | ReturnNode | MatchExpressionNode | MatchCaseNode | SourceMatchPatternNode | BinaryExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
 
   abstract class AstVisitor
     abstract def visit(node : ModuleNode) : Nil
     abstract def visit(node : FunctionNode) : Nil
     abstract def visit(node : ParameterNode) : Nil
+    abstract def visit(node : VariableDeclarationNode) : Nil
+    abstract def visit(node : AssignmentNode) : Nil
     abstract def visit(node : ReturnNode) : Nil
     abstract def visit(node : MatchExpressionNode) : Nil
     abstract def visit(node : MatchCaseNode) : Nil
@@ -204,6 +233,18 @@ module Smalang
   end
 
   struct ParameterNode
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct VariableDeclarationNode
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct AssignmentNode
     def accept(visitor : AstVisitor) : Nil
       visitor.visit(self)
     end
@@ -396,13 +437,13 @@ module Smalang
       expect(TokenKind::Newline, "expected a newline after the function signature")
       expect(TokenKind::Indent, "expected an indented function body")
 
-      body = parse_function_body(arena)
+      statements, body = parse_function_body(arena)
       function_end = current_token.span.start
       if current_token.kind == TokenKind::Dedent
         function_end = advance.span.start
       end
       function_span = span_between(start, function_end)
-      arena.add(FunctionNode.new(function_span, name, return_type, parameters, body))
+      arena.add(FunctionNode.new(function_span, name, return_type, parameters, statements, body))
     end
 
     private def parse_parameters(arena : AstArena) : NodeRange
@@ -412,9 +453,9 @@ module Smalang
     private def parse_parameter(arena : AstArena) : NodeId
       name = expect(TokenKind::Identifier, "expected a parameter name").span
       expect(TokenKind::Colon, "expected ':' after the parameter name")
-      type = parse_type
+      type, mutability = parse_binding_type
       span = SourceSpan.new(name.start, previous_token.span.end_offset - name.start)
-      arena.add(ParameterNode.new(span, name, type))
+      arena.add(ParameterNode.new(span, name, type, mutability))
     end
 
     private def parse_delimited_list(arena : AstArena, item_name : String, &parse_item : -> NodeId) : NodeRange
@@ -524,23 +565,113 @@ module Smalang
       arena.add(ReturnNode.new(span, value))
     end
 
-    private def parse_function_body(arena : AstArena) : NodeId
-      body = begin
-        parse_return(arena)
-      rescue failure : ParseFailure
-        @diagnostics << failure.diagnostic
-        finish = synchronize_function_end
-        finish = failure.diagnostic.span.end_offset if finish < failure.diagnostic.span.end_offset
-        error_span = span_between(failure.diagnostic.span.start, finish)
-        return arena.add(ErrorNode.new(error_span))
+    private def parse_function_body(arena : AstArena) : Tuple(NodeRange, NodeId)
+      statements = Array(NodeId).new
+      diagnostic_count = @diagnostics.size
+      until function_body_terminator?
+        if current_token.kind == TokenKind::Newline
+          advance
+          next
+        end
+
+        cursor_before = @cursor
+        begin
+          if current_token.kind == TokenKind::Return
+            return_node = parse_return(arena)
+            unless function_body_terminator?
+              diagnostic = report("return must be the final function statement")
+              finish = synchronize_function_end
+              error = arena.add(ErrorNode.new(span_between(diagnostic.span.start, finish), return_node))
+              return {arena.append_children(statements), error}
+            end
+            return {arena.append_children(statements), return_node}
+          end
+
+          statements << parse_binding_statement(arena)
+        rescue failure : ParseFailure
+          @diagnostics << failure.diagnostic
+          if @indent_depth > 1
+            finish = synchronize_function_end
+            error = arena.add(ErrorNode.new(span_between(failure.diagnostic.span.start, finish)))
+            return {arena.append_children(statements), error}
+          end
+          synchronize_statement
+          finish = previous_token.span.end_offset
+          error_span = span_between(failure.diagnostic.span.start, finish)
+          statements << arena.add(ErrorNode.new(error_span))
+        end
+        advance if @cursor == cursor_before && !function_body_terminator?
       end
 
-      return body if current_token.kind == TokenKind::Dedent || current_token.kind == TokenKind::Eof || top_level_function_start?
-
-      diagnostic = report("expected the end of the function body")
       finish = synchronize_function_end
-      error_span = span_between(diagnostic.span.start, finish)
-      arena.add(ErrorNode.new(error_span, body))
+      if @diagnostics.size > diagnostic_count
+        diagnostic = @diagnostics[diagnostic_count]
+        return {arena.append_children(statements), arena.add(ErrorNode.new(span_between(diagnostic.span.start, finish)))}
+      end
+
+      diagnostic = report("expected a final return statement")
+      {arena.append_children(statements), arena.add(ErrorNode.new(span_between(diagnostic.span.start, finish)))}
+    end
+
+    private def parse_binding_statement(arena : AstArena) : NodeId
+      name = expect(TokenKind::Identifier, "expected a local declaration, assignment, or return").span
+      case current_token.kind
+      when TokenKind::Colon
+        parse_variable_declaration(arena, name)
+      when TokenKind::Assign
+        parse_assignment(arena, name)
+      else
+        fail("expected ':' or '=' after the binding name")
+      end
+    end
+
+    private def parse_variable_declaration(arena : AstArena, name : SourceSpan) : NodeId
+      expect(TokenKind::Colon, "expected ':' after the binding name")
+      type, mutability = parse_binding_type
+      expect(TokenKind::Assign, "expected '=' before the binding initializer")
+      initializer = parse_expression(arena)
+      finish = finish_simple_statement
+      arena.add(VariableDeclarationNode.new(span_between(name.start, finish), name, type, mutability, initializer))
+    end
+
+    private def parse_assignment(arena : AstArena, target : SourceSpan) : NodeId
+      expect(TokenKind::Assign, "expected '=' after the assignment target")
+      value = parse_expression(arena)
+      finish = finish_simple_statement
+      arena.add(AssignmentNode.new(span_between(target.start, finish), target, value))
+    end
+
+    private def finish_simple_statement : Int32
+      if current_token.kind == TokenKind::Newline
+        advance.span.start
+      elsif current_token.kind == TokenKind::Dedent || current_token.kind == TokenKind::Eof || top_level_function_start?
+        current_token.span.start
+      else
+        fail("expected a newline after the statement")
+      end
+    end
+
+    private def function_body_terminator? : Bool
+      current_token.kind == TokenKind::Dedent || current_token.kind == TokenKind::Eof || top_level_function_start?
+    end
+
+    private def parse_binding_type : Tuple(AstType, BindingMutability)
+      case current_token.kind
+      when TokenKind::Mut
+        advance
+        expect(TokenKind::LeftBracket, "expected '[' after 'mut'")
+        type = parse_type
+        expect(TokenKind::RightBracket, "expected ']' after the mutable binding type")
+        {type, BindingMutability::Mutable}
+      when TokenKind::Const
+        advance
+        expect(TokenKind::LeftBracket, "expected '[' after 'const'")
+        type = parse_type
+        expect(TokenKind::RightBracket, "expected ']' after the constant binding type")
+        {type, BindingMutability::Immutable}
+      else
+        {parse_type, BindingMutability::Immutable}
+      end
     end
 
     private def parse_expression(arena : AstArena, minimum_precedence : Int32 = PRECEDENCE) : NodeId

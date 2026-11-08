@@ -4,6 +4,8 @@ module Smalang
     Return
     Match
     Case
+    Mut
+    Const
     IntType
     UIntType
     BoolType
@@ -25,6 +27,9 @@ module Smalang
     RightParen
     Colon
     Comma
+    Assign
+    LeftBracket
+    RightBracket
     Arrow
     Newline
     Indent
@@ -139,13 +144,16 @@ module Smalang
     UPPER_A    =  65_u8
     UPPER_Z    =  90_u8
 
-    PLUS        = 43_u8
-    MINUS       = 45_u8
-    LEFT_PAREN  = 40_u8
-    RIGHT_PAREN = 41_u8
-    COLON       = 58_u8
-    COMMA       = 44_u8
-    GREATER     = 62_u8
+    PLUS          = 43_u8
+    MINUS         = 45_u8
+    LEFT_PAREN    = 40_u8
+    RIGHT_PAREN   = 41_u8
+    COLON         = 58_u8
+    COMMA         = 44_u8
+    EQUAL         = 61_u8
+    LEFT_BRACKET  = 91_u8
+    RIGHT_BRACKET = 93_u8
+    GREATER       = 62_u8
 
     def initialize(source : String, name : String)
       @source_file = SourceFile.new(name, source)
@@ -223,6 +231,12 @@ module Smalang
         emit_single(TokenKind::Colon)
       when COMMA
         emit_single(TokenKind::Comma)
+      when EQUAL
+        emit_single(TokenKind::Assign)
+      when LEFT_BRACKET
+        emit_single(TokenKind::LeftBracket)
+      when RIGHT_BRACKET
+        emit_single(TokenKind::RightBracket)
       else
         if identifier_start?(byte)
           scan_identifier
@@ -276,6 +290,7 @@ module Smalang
       when 3
         return TokenKind::Def if matches_keyword?(start, "def")
         return TokenKind::IntType if matches_keyword?(start, "int")
+        return TokenKind::Mut if matches_keyword?(start, "mut")
       when 4
         return TokenKind::Case if matches_keyword?(start, "case")
         return TokenKind::UIntType if matches_keyword?(start, "uint")
@@ -284,6 +299,7 @@ module Smalang
         return TokenKind::Int8Type if matches_keyword?(start, "int8")
       when 5
         return TokenKind::Match if matches_keyword?(start, "match")
+        return TokenKind::Const if matches_keyword?(start, "const")
         return TokenKind::FalseLiteral if matches_keyword?(start, "False")
         return TokenKind::UInt8Type if matches_keyword?(start, "uint8")
         return TokenKind::Int16Type if matches_keyword?(start, "int16")

@@ -98,11 +98,28 @@ module Smalang
     end
   end
 
-  class SemanticParameterSymbol < SemanticSymbol
+  abstract class SemanticBindingSymbol < SemanticSymbol
     getter type_id : TypeId
+    getter mutability : BindingMutability
 
-    def initialize(id : SymbolId, declaration_id : NodeId, name_span : SourceSpan, @type_id : TypeId)
+    def initialize(id : SymbolId, declaration_id : NodeId, name_span : SourceSpan, @type_id : TypeId, @mutability : BindingMutability)
       super(id, declaration_id, name_span)
+    end
+
+    def mutable? : Bool
+      @mutability == BindingMutability::Mutable
+    end
+  end
+
+  class SemanticParameterSymbol < SemanticBindingSymbol
+    def initialize(id : SymbolId, declaration_id : NodeId, name_span : SourceSpan, type_id : TypeId, mutability : BindingMutability)
+      super(id, declaration_id, name_span, type_id, mutability)
+    end
+  end
+
+  class SemanticLocalSymbol < SemanticBindingSymbol
+    def initialize(id : SymbolId, declaration_id : NodeId, name_span : SourceSpan, type_id : TypeId, mutability : BindingMutability)
+      super(id, declaration_id, name_span, type_id, mutability)
     end
   end
 
@@ -124,20 +141,20 @@ module Smalang
     end
   end
 
-  class FunctionParameterScope
-    @symbols_by_name : Hash(String, SemanticParameterSymbol)
+  class FunctionBindingScope
+    @symbols_by_name : Hash(String, SemanticBindingSymbol)
 
     def initialize
-      @symbols_by_name = Hash(String, SemanticParameterSymbol).new
+      @symbols_by_name = Hash(String, SemanticBindingSymbol).new
     end
 
-    def declare(name : String, symbol : SemanticParameterSymbol) : Bool
+    def declare(name : String, symbol : SemanticBindingSymbol) : Bool
       return false if @symbols_by_name.has_key?(name)
       @symbols_by_name[name] = symbol
       true
     end
 
-    def resolve(name : String) : SemanticParameterSymbol?
+    def resolve(name : String) : SemanticBindingSymbol?
       @symbols_by_name[name]?
     end
   end
@@ -247,7 +264,21 @@ module Smalang
         @symbols.size,
         declaration_id,
         declaration.name,
-        @type_table.id_for(declaration.type)
+        @type_table.id_for(declaration.type),
+        declaration.mutability
+      )
+      @symbols << symbol
+      @node_symbols[declaration_id] = symbol.id
+      symbol
+    end
+
+    def add_local_binding(declaration_id : NodeId, declaration : VariableDeclarationNode) : SemanticLocalSymbol
+      symbol = SemanticLocalSymbol.new(
+        @symbols.size,
+        declaration_id,
+        declaration.name,
+        @type_table.id_for(declaration.type),
+        declaration.mutability
       )
       @symbols << symbol
       @node_symbols[declaration_id] = symbol.id
@@ -388,6 +419,12 @@ module Smalang
     def visit(node : ParameterNode) : Nil
     end
 
+    def visit(node : VariableDeclarationNode) : Nil
+    end
+
+    def visit(node : AssignmentNode) : Nil
+    end
+
     def visit(node : ReturnNode) : Nil
     end
 
@@ -443,13 +480,13 @@ module Smalang
 
   class FunctionBodyChecker < SemanticAstVisitor
     @current_function : SemanticFunctionSymbol?
-    @current_parameter_scope : FunctionParameterScope?
+    @current_binding_scope : FunctionBindingScope?
     @expected_type_id : TypeId?
 
     def initialize(context : SemanticContext)
       super(context)
       @current_function = nil
-      @current_parameter_scope = nil
+      @current_binding_scope = nil
       @expected_type_id = nil
     end
 
@@ -471,26 +508,76 @@ module Smalang
         return
       end
 
-      parameter_scope = FunctionParameterScope.new
+      binding_scope = FunctionBindingScope.new
       node.parameters.count.times do |index|
         return if @context.diagnostic
         parameter_id = @context.arena.child(node.parameters, index)
         parameter = @context.arena.node(parameter_id).as(ParameterNode)
         name = @context.parsed_module.source_file.slice(parameter.name)
-        if parameter_scope.resolve(name)
+        if binding_scope.resolve(name)
           @context.report(parameter.name, "duplicate parameter '#{name}'")
           return
         end
 
         parameter_symbol = @context.add_parameter(parameter_id, parameter)
-        parameter_scope.declare(name, parameter_symbol)
+        binding_scope.declare(name, parameter_symbol)
       end
 
       @current_function = function_symbol
-      @current_parameter_scope = parameter_scope
+      @current_binding_scope = binding_scope
+      node.statements.count.times do |index|
+        return if @context.diagnostic
+        visit_node(@context.arena.child(node.statements, index))
+      end
       visit_node(node.body)
       @current_function = nil
-      @current_parameter_scope = nil
+      @current_binding_scope = nil
+    end
+
+    def visit(node : VariableDeclarationNode) : Nil
+      scope = @current_binding_scope.not_nil!
+      name = @context.parsed_module.source_file.slice(node.name)
+      if scope.resolve(name)
+        @context.report(node.name, "duplicate binding '#{name}'")
+        return
+      end
+
+      type_id = @context.type_table.id_for(node.type)
+      initializer_type_id = analyze_expression(node.initializer, type_id)
+      return if @context.diagnostic
+      unless initializer_type_id == type_id
+        actual_type = initializer_type_id.try { |id| type_label(id) } || "unknown"
+        @context.report(node.name, "initializer has type #{actual_type}, expected #{type_label(type_id)}")
+        return
+      end
+
+      symbol = @context.add_local_binding(current_node_id, node)
+      scope.declare(name, symbol)
+    end
+
+    def visit(node : AssignmentNode) : Nil
+      scope = @current_binding_scope.not_nil!
+      name = @context.parsed_module.source_file.slice(node.target)
+      binding = scope.resolve(name)
+      unless binding
+        @context.report(node.target, "unknown name '#{name}'")
+        return
+      end
+
+      unless binding.mutable?
+        @context.report(node.target, "cannot assign to immutable binding '#{name}'")
+        return
+      end
+
+      value_type_id = analyze_expression(node.value, binding.type_id)
+      return if @context.diagnostic
+      unless value_type_id == binding.type_id
+        actual_type = value_type_id.try { |id| type_label(id) } || "unknown"
+        @context.report(node.target, "assignment has type #{actual_type}, expected #{type_label(binding.type_id)}")
+        return
+      end
+
+      @context.set_symbol(current_node_id, binding.id)
     end
 
     def visit(node : ReturnNode) : Nil
@@ -623,14 +710,14 @@ module Smalang
 
     def visit(node : IdentifierExpr) : Nil
       name = @context.parsed_module.source_file.slice(node.span)
-      parameter = @current_parameter_scope.try(&.resolve(name))
-      unless parameter
+      binding = @current_binding_scope.try(&.resolve(name))
+      unless binding
         @context.report(node.span, "unknown name '#{name}'")
         return
       end
 
-      @context.set_symbol(current_node_id, parameter.id)
-      @context.set_type(current_node_id, parameter.type_id)
+      @context.set_symbol(current_node_id, binding.id)
+      @context.set_type(current_node_id, binding.type_id)
     end
 
     def visit(node : IntegerLiteralExpr) : Nil
