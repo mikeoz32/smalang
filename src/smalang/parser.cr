@@ -1,5 +1,6 @@
 module Smalang
   alias NodeId = Int32
+  alias AstTypeId = Int32
 
   enum AstType : UInt8
     Int
@@ -13,6 +14,49 @@ module Smalang
     UInt32
     Int64
     UInt64
+  end
+
+  abstract class AstTypeSyntax
+    getter span : SourceSpan
+
+    def initialize(@span : SourceSpan)
+    end
+  end
+
+  class ScalarTypeSyntax < AstTypeSyntax
+    getter type : AstType
+
+    def initialize(span : SourceSpan, @type : AstType)
+      super(span)
+    end
+  end
+
+  class ArrayTypeSyntax < AstTypeSyntax
+    getter element_type_id : AstTypeId
+    getter length : UInt128
+
+    def initialize(span : SourceSpan, @element_type_id : AstTypeId, @length : UInt128)
+      super(span)
+    end
+  end
+
+  class AstTypeArena
+    @types : Array(AstTypeSyntax)
+
+    def initialize(source_size : Int32)
+      capacity = source_size // 16
+      capacity = 1 if capacity < 1
+      @types = Array(AstTypeSyntax).new(capacity)
+    end
+
+    def add(type : AstTypeSyntax) : AstTypeId
+      @types << type
+      @types.size - 1
+    end
+
+    def type(id : AstTypeId) : AstTypeSyntax
+      @types[id]
+    end
   end
 
   enum BindingMutability : UInt8
@@ -85,42 +129,42 @@ module Smalang
   struct FunctionNode
     getter span : SourceSpan
     getter name : SourceSpan
-    getter return_type : AstType
+    getter return_type : AstTypeId
     getter parameters : NodeRange
     getter statements : NodeRange
     getter body : NodeId
 
-    def initialize(@span : SourceSpan, @name : SourceSpan, @return_type : AstType, @parameters : NodeRange, @statements : NodeRange, @body : NodeId)
+    def initialize(@span : SourceSpan, @name : SourceSpan, @return_type : AstTypeId, @parameters : NodeRange, @statements : NodeRange, @body : NodeId)
     end
   end
 
   struct ParameterNode
     getter span : SourceSpan
     getter name : SourceSpan
-    getter type : AstType
+    getter type : AstTypeId
     getter mutability : BindingMutability
 
-    def initialize(@span : SourceSpan, @name : SourceSpan, @type : AstType, @mutability : BindingMutability)
+    def initialize(@span : SourceSpan, @name : SourceSpan, @type : AstTypeId, @mutability : BindingMutability)
     end
   end
 
   struct VariableDeclarationNode
     getter span : SourceSpan
     getter name : SourceSpan
-    getter type : AstType
+    getter type : AstTypeId
     getter mutability : BindingMutability
     getter initializer : NodeId
 
-    def initialize(@span : SourceSpan, @name : SourceSpan, @type : AstType, @mutability : BindingMutability, @initializer : NodeId)
+    def initialize(@span : SourceSpan, @name : SourceSpan, @type : AstTypeId, @mutability : BindingMutability, @initializer : NodeId)
     end
   end
 
   struct AssignmentNode
     getter span : SourceSpan
-    getter target : SourceSpan
+    getter target : NodeId
     getter value : NodeId
 
-    def initialize(@span : SourceSpan, @target : SourceSpan, @value : NodeId)
+    def initialize(@span : SourceSpan, @target : NodeId, @value : NodeId)
     end
   end
 
@@ -157,6 +201,23 @@ module Smalang
     getter right : NodeId
 
     def initialize(@span : SourceSpan, @operator : BinaryOperator, @left : NodeId, @right : NodeId)
+    end
+  end
+
+  struct ArrayLiteralExpr
+    getter span : SourceSpan
+    getter elements : NodeRange
+
+    def initialize(@span : SourceSpan, @elements : NodeRange)
+    end
+  end
+
+  struct IndexExpr
+    getter span : SourceSpan
+    getter array : NodeId
+    getter index : NodeId
+
+    def initialize(@span : SourceSpan, @array : NodeId, @index : NodeId)
     end
   end
 
@@ -199,7 +260,7 @@ module Smalang
     end
   end
 
-  alias AstNode = ModuleNode | FunctionNode | ParameterNode | VariableDeclarationNode | AssignmentNode | ReturnNode | MatchExpressionNode | MatchCaseNode | SourceMatchPatternNode | BinaryExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
+  alias AstNode = ModuleNode | FunctionNode | ParameterNode | VariableDeclarationNode | AssignmentNode | ReturnNode | MatchExpressionNode | MatchCaseNode | SourceMatchPatternNode | BinaryExpr | ArrayLiteralExpr | IndexExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
 
   abstract class AstVisitor
     abstract def visit(node : ModuleNode) : Nil
@@ -213,6 +274,8 @@ module Smalang
     abstract def visit(node : BooleanMatchPatternNode) : Nil
     abstract def visit(node : WildcardMatchPatternNode) : Nil
     abstract def visit(node : BinaryExpr) : Nil
+    abstract def visit(node : ArrayLiteralExpr) : Nil
+    abstract def visit(node : IndexExpr) : Nil
     abstract def visit(node : CallExpr) : Nil
     abstract def visit(node : IdentifierExpr) : Nil
     abstract def visit(node : IntegerLiteralExpr) : Nil
@@ -275,6 +338,18 @@ module Smalang
   end
 
   struct CallExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct ArrayLiteralExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct IndexExpr
     def accept(visitor : AstVisitor) : Nil
       visitor.visit(self)
     end
@@ -345,9 +420,10 @@ module Smalang
   class ParsedModule
     getter source_file : SourceFile
     getter arena : AstArena
+    getter type_arena : AstTypeArena
     getter root_id : NodeId
 
-    def initialize(@source_file : SourceFile, @arena : AstArena, @root_id : NodeId)
+    def initialize(@source_file : SourceFile, @arena : AstArena, @type_arena : AstTypeArena, @root_id : NodeId)
     end
   end
 
@@ -399,13 +475,14 @@ module Smalang
       @indent_depth = 0
       @diagnostics.clear
       arena = AstArena.new(@tokens.source_file.source.bytesize)
+      type_arena = AstTypeArena.new(@tokens.source_file.source.bytesize)
       function_ids = Array(NodeId).new
 
       until current_token.kind == TokenKind::Eof
         start = current_token.span.start
         if top_level_function_start?
           begin
-            function_ids << parse_function(arena)
+            function_ids << parse_function(arena, type_arena)
           rescue failure : ParseFailure
             @diagnostics << failure.diagnostic
             finish = synchronize_top_level(start)
@@ -421,23 +498,23 @@ module Smalang
       function_range = arena.append_children(function_ids)
       module_span = SourceSpan.new(0, @tokens.source_file.source.bytesize)
       root_id = arena.add(ModuleNode.new(module_span, function_range))
-      parsed_module = ParsedModule.new(@tokens.source_file, arena, root_id)
+      parsed_module = ParsedModule.new(@tokens.source_file, arena, type_arena, root_id)
       ParseResult.new(parsed_module, @diagnostics)
     end
 
-    private def parse_function(arena : AstArena) : NodeId
+    private def parse_function(arena : AstArena, type_arena : AstTypeArena) : NodeId
       start = expect(TokenKind::Def, "expected a function definition").span.start
       name = expect(TokenKind::Identifier, "expected a function name").span
       expect(TokenKind::LeftParen, "expected '(' after the function name")
-      parameters = parse_parameters(arena)
+      parameters = parse_parameters(arena, type_arena)
       expect(TokenKind::RightParen, "expected ')' after the parameter list")
       expect(TokenKind::Arrow, "expected '->' before the return type")
-      return_type = parse_type
+      return_type = parse_type(type_arena)
       expect(TokenKind::Colon, "expected ':' after the function signature")
       expect(TokenKind::Newline, "expected a newline after the function signature")
       expect(TokenKind::Indent, "expected an indented function body")
 
-      statements, body = parse_function_body(arena)
+      statements, body = parse_function_body(arena, type_arena)
       function_end = current_token.span.start
       if current_token.kind == TokenKind::Dedent
         function_end = advance.span.start
@@ -446,14 +523,14 @@ module Smalang
       arena.add(FunctionNode.new(function_span, name, return_type, parameters, statements, body))
     end
 
-    private def parse_parameters(arena : AstArena) : NodeRange
-      parse_delimited_list(arena, "parameter") { parse_parameter(arena) }
+    private def parse_parameters(arena : AstArena, type_arena : AstTypeArena) : NodeRange
+      parse_delimited_list(arena, "parameter") { parse_parameter(arena, type_arena) }
     end
 
-    private def parse_parameter(arena : AstArena) : NodeId
+    private def parse_parameter(arena : AstArena, type_arena : AstTypeArena) : NodeId
       name = expect(TokenKind::Identifier, "expected a parameter name").span
       expect(TokenKind::Colon, "expected ':' after the parameter name")
-      type, mutability = parse_binding_type
+      type, mutability = parse_binding_type(type_arena)
       span = SourceSpan.new(name.start, previous_token.span.end_offset - name.start)
       arena.add(ParameterNode.new(span, name, type, mutability))
     end
@@ -506,44 +583,52 @@ module Smalang
       arena.append_children(item_ids)
     end
 
-    private def parse_type : AstType
+    private def parse_type(type_arena : AstTypeArena) : AstTypeId
+      if current_token.kind == TokenKind::Identifier && @tokens.source_file.slice(current_token.span) == "array"
+        start = advance.span.start
+        expect(TokenKind::LeftBracket, "expected '[' after 'array'")
+        element_type_id = parse_type(type_arena)
+        expect(TokenKind::Comma, "expected ',' before the array length")
+        length_token = expect(TokenKind::IntegerLiteral, "expected a nonnegative integer array length")
+        length = @tokens.source_file.slice(length_token.span).to_u128?
+        unless length
+          fail("array length is too large")
+        end
+        finish = expect(TokenKind::RightBracket, "expected ']' after the array type").span.end_offset
+        return type_arena.add(ArrayTypeSyntax.new(span_between(start, finish), element_type_id, length))
+      end
+
       case current_token.kind
       when TokenKind::IntType
-        advance
-        AstType::Int
+        add_scalar_type(type_arena, AstType::Int)
       when TokenKind::UIntType
-        advance
-        AstType::UInt
+        add_scalar_type(type_arena, AstType::UInt)
       when TokenKind::BoolType
-        advance
-        AstType::Bool
+        add_scalar_type(type_arena, AstType::Bool)
       when TokenKind::Int8Type
-        advance
-        AstType::Int8
+        add_scalar_type(type_arena, AstType::Int8)
       when TokenKind::UInt8Type
-        advance
-        AstType::UInt8
+        add_scalar_type(type_arena, AstType::UInt8)
       when TokenKind::Int16Type
-        advance
-        AstType::Int16
+        add_scalar_type(type_arena, AstType::Int16)
       when TokenKind::UInt16Type
-        advance
-        AstType::UInt16
+        add_scalar_type(type_arena, AstType::UInt16)
       when TokenKind::Int32Type
-        advance
-        AstType::Int32
+        add_scalar_type(type_arena, AstType::Int32)
       when TokenKind::UInt32Type
-        advance
-        AstType::UInt32
+        add_scalar_type(type_arena, AstType::UInt32)
       when TokenKind::Int64Type
-        advance
-        AstType::Int64
+        add_scalar_type(type_arena, AstType::Int64)
       when TokenKind::UInt64Type
-        advance
-        AstType::UInt64
+        add_scalar_type(type_arena, AstType::UInt64)
       else
         fail("expected a type")
       end
+    end
+
+    private def add_scalar_type(type_arena : AstTypeArena, type : AstType) : AstTypeId
+      token = advance
+      type_arena.add(ScalarTypeSyntax.new(token.span, type))
     end
 
     private def parse_return(arena : AstArena) : NodeId
@@ -565,7 +650,7 @@ module Smalang
       arena.add(ReturnNode.new(span, value))
     end
 
-    private def parse_function_body(arena : AstArena) : Tuple(NodeRange, NodeId)
+    private def parse_function_body(arena : AstArena, type_arena : AstTypeArena) : Tuple(NodeRange, NodeId)
       statements = Array(NodeId).new
       diagnostic_count = @diagnostics.size
       until function_body_terminator?
@@ -587,7 +672,7 @@ module Smalang
             return {arena.append_children(statements), return_node}
           end
 
-          statements << parse_binding_statement(arena)
+          statements << parse_binding_statement(arena, type_arena)
         rescue failure : ParseFailure
           @diagnostics << failure.diagnostic
           if @indent_depth > 1
@@ -613,32 +698,43 @@ module Smalang
       {arena.append_children(statements), arena.add(ErrorNode.new(span_between(diagnostic.span.start, finish)))}
     end
 
-    private def parse_binding_statement(arena : AstArena) : NodeId
+    private def parse_binding_statement(arena : AstArena, type_arena : AstTypeArena) : NodeId
       name = expect(TokenKind::Identifier, "expected a local declaration, assignment, or return").span
       case current_token.kind
       when TokenKind::Colon
-        parse_variable_declaration(arena, name)
+        parse_variable_declaration(arena, type_arena, name)
       when TokenKind::Assign
-        parse_assignment(arena, name)
+        target = arena.add(IdentifierExpr.new(name))
+        parse_assignment(arena, target)
+      when TokenKind::LeftBracket
+        target = arena.add(IdentifierExpr.new(name))
+        target = parse_postfix(arena, target)
+        expect(TokenKind::Assign, "expected '=' after the assignment target")
+        parse_assignment_value(arena, target)
       else
         fail("expected ':' or '=' after the binding name")
       end
     end
 
-    private def parse_variable_declaration(arena : AstArena, name : SourceSpan) : NodeId
+    private def parse_variable_declaration(arena : AstArena, type_arena : AstTypeArena, name : SourceSpan) : NodeId
       expect(TokenKind::Colon, "expected ':' after the binding name")
-      type, mutability = parse_binding_type
+      type, mutability = parse_binding_type(type_arena)
       expect(TokenKind::Assign, "expected '=' before the binding initializer")
       initializer = parse_expression(arena)
       finish = finish_simple_statement
       arena.add(VariableDeclarationNode.new(span_between(name.start, finish), name, type, mutability, initializer))
     end
 
-    private def parse_assignment(arena : AstArena, target : SourceSpan) : NodeId
+    private def parse_assignment(arena : AstArena, target : NodeId) : NodeId
       expect(TokenKind::Assign, "expected '=' after the assignment target")
+      parse_assignment_value(arena, target)
+    end
+
+    private def parse_assignment_value(arena : AstArena, target : NodeId) : NodeId
       value = parse_expression(arena)
       finish = finish_simple_statement
-      arena.add(AssignmentNode.new(span_between(target.start, finish), target, value))
+      target_span = arena.node(target).span
+      arena.add(AssignmentNode.new(span_between(target_span.start, finish), target, value))
     end
 
     private def finish_simple_statement : Int32
@@ -655,28 +751,28 @@ module Smalang
       current_token.kind == TokenKind::Dedent || current_token.kind == TokenKind::Eof || top_level_function_start?
     end
 
-    private def parse_binding_type : Tuple(AstType, BindingMutability)
+    private def parse_binding_type(type_arena : AstTypeArena) : Tuple(AstTypeId, BindingMutability)
       case current_token.kind
       when TokenKind::Mut
         advance
         expect(TokenKind::LeftBracket, "expected '[' after 'mut'")
-        type = parse_type
+        type = parse_type(type_arena)
         expect(TokenKind::RightBracket, "expected ']' after the mutable binding type")
         {type, BindingMutability::Mutable}
       when TokenKind::Const
         advance
         expect(TokenKind::LeftBracket, "expected '[' after 'const'")
-        type = parse_type
+        type = parse_type(type_arena)
         expect(TokenKind::RightBracket, "expected ']' after the constant binding type")
         {type, BindingMutability::Immutable}
       else
-        {parse_type, BindingMutability::Immutable}
+        {parse_type(type_arena), BindingMutability::Immutable}
       end
     end
 
     private def parse_expression(arena : AstArena, minimum_precedence : Int32 = PRECEDENCE) : NodeId
       left = begin
-        parse_primary(arena)
+        parse_postfix(arena, parse_primary(arena))
       rescue failure : ParseFailure
         raise failure if @indent_depth > 1
         @diagnostics << failure.diagnostic
@@ -709,6 +805,8 @@ module Smalang
       when TokenKind::FalseLiteral
         token = advance
         arena.add(BooleanLiteralExpr.new(token.span, false))
+      when TokenKind::LeftBracket
+        parse_array_literal(arena)
       when TokenKind::Match
         parse_match_expression(arena)
       when TokenKind::Identifier
@@ -739,6 +837,38 @@ module Smalang
       else
         fail("expected an expression")
       end
+    end
+
+    private def parse_array_literal(arena : AstArena) : NodeId
+      start = expect(TokenKind::LeftBracket, "expected '['").span.start
+      element_ids = Array(NodeId).new
+      unless current_token.kind == TokenKind::RightBracket
+        loop do
+          element_ids << parse_expression(arena)
+          break unless current_token.kind == TokenKind::Comma
+
+          comma = advance
+          if current_token.kind == TokenKind::RightBracket
+            fail("trailing commas are not supported")
+          end
+        end
+      end
+
+      finish = expect(TokenKind::RightBracket, "expected ']' after the array literal").span.end_offset
+      elements = arena.append_children(element_ids)
+      arena.add(ArrayLiteralExpr.new(span_between(start, finish), elements))
+    end
+
+    private def parse_postfix(arena : AstArena, expression_id : NodeId) : NodeId
+      current = expression_id
+      while current_token.kind == TokenKind::LeftBracket
+        advance
+        index_id = parse_expression(arena)
+        finish = expect(TokenKind::RightBracket, "expected ']' after the index").span.end_offset
+        expression_span = arena.node(current).span
+        current = arena.add(IndexExpr.new(span_between(expression_span.start, finish), current, index_id))
+      end
+      current
     end
 
     private def parse_match_expression(arena : AstArena) : NodeId
