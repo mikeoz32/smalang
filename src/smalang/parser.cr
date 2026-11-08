@@ -20,6 +20,47 @@ module Smalang
     Subtract
   end
 
+  abstract class SourceMatchPatternVisitor
+    abstract def visit(pattern : BooleanMatchPatternNode) : Nil
+    abstract def visit(pattern : WildcardMatchPatternNode) : Nil
+  end
+
+  abstract class SourceMatchPatternNode
+    getter span : SourceSpan
+
+    def initialize(@span : SourceSpan)
+    end
+
+    abstract def accept(visitor : SourceMatchPatternVisitor) : Nil
+    abstract def accept(visitor : AstVisitor) : Nil
+  end
+
+  class BooleanMatchPatternNode < SourceMatchPatternNode
+    getter value : Bool
+
+    def initialize(span : SourceSpan, @value : Bool)
+      super(span)
+    end
+
+    def accept(visitor : SourceMatchPatternVisitor) : Nil
+      visitor.visit(self)
+    end
+
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class WildcardMatchPatternNode < SourceMatchPatternNode
+    def accept(visitor : SourceMatchPatternVisitor) : Nil
+      visitor.visit(self)
+    end
+
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
   struct NodeRange
     getter start : Int32
     getter count : Int32
@@ -61,6 +102,24 @@ module Smalang
     getter value : NodeId
 
     def initialize(@span : SourceSpan, @value : NodeId)
+    end
+  end
+
+  struct MatchCaseNode
+    getter span : SourceSpan
+    getter pattern : NodeId
+    getter result : NodeId
+
+    def initialize(@span : SourceSpan, @pattern : NodeId, @result : NodeId)
+    end
+  end
+
+  struct MatchExpressionNode
+    getter span : SourceSpan
+    getter scrutinee : NodeId
+    getter cases : NodeRange
+
+    def initialize(@span : SourceSpan, @scrutinee : NodeId, @cases : NodeRange)
     end
   end
 
@@ -113,13 +172,17 @@ module Smalang
     end
   end
 
-  alias AstNode = ModuleNode | FunctionNode | ParameterNode | ReturnNode | BinaryExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
+  alias AstNode = ModuleNode | FunctionNode | ParameterNode | ReturnNode | MatchExpressionNode | MatchCaseNode | SourceMatchPatternNode | BinaryExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
 
   abstract class AstVisitor
     abstract def visit(node : ModuleNode) : Nil
     abstract def visit(node : FunctionNode) : Nil
     abstract def visit(node : ParameterNode) : Nil
     abstract def visit(node : ReturnNode) : Nil
+    abstract def visit(node : MatchExpressionNode) : Nil
+    abstract def visit(node : MatchCaseNode) : Nil
+    abstract def visit(node : BooleanMatchPatternNode) : Nil
+    abstract def visit(node : WildcardMatchPatternNode) : Nil
     abstract def visit(node : BinaryExpr) : Nil
     abstract def visit(node : CallExpr) : Nil
     abstract def visit(node : IdentifierExpr) : Nil
@@ -147,6 +210,18 @@ module Smalang
   end
 
   struct ReturnNode
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct MatchExpressionNode
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct MatchCaseNode
     def accept(visitor : AstVisitor) : Nil
       visitor.visit(self)
     end
@@ -274,11 +349,13 @@ module Smalang
 
     def initialize(@tokens : TokenStream)
       @cursor = 0
+      @indent_depth = 0
       @diagnostics = Array(ParseDiagnostic).new
     end
 
     def parse : ParseResult
       @cursor = 0
+      @indent_depth = 0
       @diagnostics.clear
       arena = AstArena.new(@tokens.source_file.source.bytesize)
       function_ids = Array(NodeId).new
@@ -470,6 +547,7 @@ module Smalang
       left = begin
         parse_primary(arena)
       rescue failure : ParseFailure
+        raise failure if @indent_depth > 1
         @diagnostics << failure.diagnostic
         synchronize_expression
         arena.add(ErrorNode.new(failure.diagnostic.span))
@@ -500,6 +578,8 @@ module Smalang
       when TokenKind::FalseLiteral
         token = advance
         arena.add(BooleanLiteralExpr.new(token.span, false))
+      when TokenKind::Match
+        parse_match_expression(arena)
       when TokenKind::Identifier
         name = advance.span
         if current_token.kind == TokenKind::LeftParen
@@ -528,6 +608,65 @@ module Smalang
       else
         fail("expected an expression")
       end
+    end
+
+    private def parse_match_expression(arena : AstArena) : NodeId
+      start = expect(TokenKind::Match, "expected 'match'").span.start
+      scrutinee = parse_expression(arena)
+      expect(TokenKind::Colon, "expected ':' after the match value")
+      expect(TokenKind::Newline, "expected a newline after the match header")
+      expect(TokenKind::Indent, "expected an indented match body")
+
+      case_ids = Array(NodeId).new
+      while current_token.kind == TokenKind::Case
+        case_ids << parse_match_case(arena)
+      end
+      fail("expected a case clause in the match body") if case_ids.empty?
+
+      end_offset = arena.node(case_ids.last).span.end_offset
+      expect(TokenKind::Dedent, "expected the end of the match body")
+      cases = arena.append_children(case_ids)
+      arena.add(MatchExpressionNode.new(span_between(start, end_offset), scrutinee, cases))
+    end
+
+    private def parse_match_case(arena : AstArena) : NodeId
+      start = expect(TokenKind::Case, "expected 'case'").span.start
+      pattern_token = current_token
+      pattern = case pattern_token.kind
+                when TokenKind::TrueLiteral
+                  advance
+                  arena.add(BooleanMatchPatternNode.new(pattern_token.span, true))
+                when TokenKind::FalseLiteral
+                  advance
+                  arena.add(BooleanMatchPatternNode.new(pattern_token.span, false))
+                when TokenKind::Identifier
+                  if @tokens.source_file.slice(pattern_token.span) == "_"
+                    advance
+                    arena.add(WildcardMatchPatternNode.new(pattern_token.span))
+                  else
+                    fail("expected 'true', 'false', or '_' as a case pattern")
+                  end
+                else
+                  fail("expected 'true', 'false', or '_' as a case pattern")
+                end
+
+      expect(TokenKind::Colon, "expected ':' after the case pattern")
+      result = parse_expression(arena)
+      result_span = arena.node(result).span
+      if current_token.kind == TokenKind::Newline
+        advance
+      elsif !nested_expression_ended_case_line?(result_span)
+        fail("expected a newline after the case result")
+      end
+      arena.add(MatchCaseNode.new(span_between(start, result_span.end_offset), pattern, result))
+    end
+
+    private def nested_expression_ended_case_line?(result_span : SourceSpan) : Bool
+      return false unless current_token.kind == TokenKind::Case || current_token.kind == TokenKind::Dedent
+
+      result_line = @tokens.source_file.position_at(result_span.end_offset).line
+      next_token_line = @tokens.source_file.position_at(current_token.span.start).line
+      next_token_line > result_line
     end
 
     private def parse_call(arena : AstArena, callee : SourceSpan) : NodeId
@@ -579,7 +718,9 @@ module Smalang
     private def synchronize_function_end : Int32
       start = current_token.span.start
       cursor_before = @cursor
-      until current_token.kind == TokenKind::Dedent || current_token.kind == TokenKind::Eof || top_level_function_start?
+      until current_token.kind == TokenKind::Eof ||
+            (current_token.kind == TokenKind::Dedent && @indent_depth == 1) ||
+            top_level_function_start?
         advance
       end
 
@@ -665,6 +806,12 @@ module Smalang
     private def advance : Token
       token = current_token
       @cursor += 1
+      case token.kind
+      when TokenKind::Indent
+        @indent_depth += 1
+      when TokenKind::Dedent
+        @indent_depth -= 1 if @indent_depth > 0
+      end
       token
     end
 

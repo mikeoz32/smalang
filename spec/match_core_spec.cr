@@ -122,6 +122,61 @@ describe Smalang::MatchLowerer do
     end
   end
 
+  it "lowers a final wildcard to the missing boolean outcome" do
+    [
+      {true, 42},
+      {false, 7},
+    ].each do |condition, expected|
+      fixture = MatchCoreFixture.new(condition_value: condition)
+      true_clause = fixture.default_clauses.first
+      false_clause = fixture.default_clauses.last
+      clauses = [
+        true_clause,
+        Smalang::MatchClause.new(
+          [Smalang::WildcardPattern.new],
+          false_clause.body_block_id,
+          false_clause.result_value_id
+        ),
+      ] of Smalang::MatchClause
+
+      result = Smalang::MatchLowerer.new.lower(
+        fixture.function,
+        fixture.entry,
+        fixture.join,
+        fixture.expression(clauses: clauses)
+      )
+      fixture.function.emit_return(fixture.join, result)
+
+      fixture.ir.verify.should be_empty
+      BackendSpecHelpers.link_and_run(fixture.ir).should eq(expected)
+    end
+  end
+
+  it "accepts false followed by a wildcard as exhaustive" do
+    fixture = MatchCoreFixture.new(condition_value: true)
+    true_clause = fixture.default_clauses.first
+    false_clause = fixture.default_clauses.last
+    clauses = [
+      false_clause,
+      Smalang::MatchClause.new(
+        [Smalang::WildcardPattern.new],
+        true_clause.body_block_id,
+        true_clause.result_value_id
+      ),
+    ] of Smalang::MatchClause
+
+    result = Smalang::MatchLowerer.new.lower(
+      fixture.function,
+      fixture.entry,
+      fixture.join,
+      fixture.expression(clauses: clauses)
+    )
+    fixture.function.emit_return(fixture.join, result)
+
+    fixture.ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(fixture.ir).should eq(42)
+  end
+
   it "matches a bool parameter passed through a function call" do
     ir = Smalang::IrModule.new
     choose = ir.add_function("choose", [Smalang::IrType::Bool], Smalang::IrType::Isize)
@@ -370,7 +425,7 @@ describe Smalang::MatchLowerer do
       fixture,
       fixture.expression(clauses: clauses),
       Smalang::MatchDiagnosticKind::UnsupportedPattern,
-      "current Match lowerer supports bool literal patterns only"
+      "current Match lowerer supports bool literal and wildcard patterns only"
     )
   end
 
@@ -523,6 +578,136 @@ describe Smalang::MatchLowerer do
       fixture.expression,
       Smalang::MatchDiagnosticKind::UnexpectedBodyPredecessor,
       "Match body block has a predecessor outside the Match source"
+    )
+  end
+
+  it "rejects a result block outside its case body region" do
+    fixture = MatchCoreFixture.new
+    detached_result_block = fixture.function.add_block("detached_result")
+    result = fixture.function.emit_constant(detached_result_block, Smalang::IrType::Isize, 5)
+    fixture.function.emit_jump(detached_result_block, fixture.join)
+    clauses = [
+      Smalang::MatchClause.new(
+        [Smalang::BooleanLiteralPattern.new(true)],
+        fixture.truth,
+        result,
+        detached_result_block
+      ),
+      fixture.default_clauses.last,
+    ] of Smalang::MatchClause
+
+    MatchCoreSpecHelpers.expect_failure(
+      fixture,
+      fixture.expression(clauses: clauses),
+      Smalang::MatchDiagnosticKind::BodyDoesNotJumpToJoin,
+      "Match result block must be reachable from its case body"
+    )
+  end
+
+  it "rejects an external predecessor inside a Match case body region" do
+    fixture = MatchCoreFixture.new
+    case_entry = fixture.function.add_block("case_entry")
+    result_block = fixture.function.add_block("case_result")
+    external_predecessor = fixture.function.add_block("external_predecessor")
+    fixture.function.emit_jump(case_entry, result_block)
+    result = fixture.function.emit_constant(result_block, Smalang::IrType::Isize, 5)
+    fixture.function.emit_jump(result_block, fixture.join)
+    fixture.function.emit_jump(external_predecessor, result_block)
+    clauses = [
+      Smalang::MatchClause.new(
+        [Smalang::BooleanLiteralPattern.new(true)],
+        case_entry,
+        result,
+        result_block
+      ),
+      fixture.default_clauses.last,
+    ] of Smalang::MatchClause
+
+    MatchCoreSpecHelpers.expect_failure(
+      fixture,
+      fixture.expression(clauses: clauses),
+      Smalang::MatchDiagnosticKind::UnexpectedBodyPredecessor,
+      "Match body block has a predecessor outside its case body"
+    )
+  end
+
+  it "rejects an unknown successor inside a Match case body region" do
+    fixture = MatchCoreFixture.new
+    case_entry = fixture.function.add_block("case_entry")
+    result_block = fixture.function.add_block("case_result")
+    unknown_block = fixture.function.block_count + 1
+    condition = fixture.scrutinees.first
+    fixture.function.emit_branch(case_entry, condition, unknown_block, result_block)
+    result = fixture.function.emit_constant(result_block, Smalang::IrType::Isize, 5)
+    fixture.function.emit_jump(result_block, fixture.join)
+    clauses = [
+      Smalang::MatchClause.new(
+        [Smalang::BooleanLiteralPattern.new(true)],
+        case_entry,
+        result,
+        result_block
+      ),
+      fixture.default_clauses.last,
+    ] of Smalang::MatchClause
+
+    MatchCoreSpecHelpers.expect_failure(
+      fixture,
+      fixture.expression(clauses: clauses),
+      Smalang::MatchDiagnosticKind::UnknownBodyBlock,
+      "unknown Match body block #{unknown_block}"
+    )
+  end
+
+  it "rejects a case body that re-enters the Match source block" do
+    fixture = MatchCoreFixture.new
+    case_entry = fixture.function.add_block("case_entry")
+    result_block = fixture.function.add_block("case_result")
+    condition = fixture.scrutinees.first
+    fixture.function.emit_branch(case_entry, condition, fixture.entry, result_block)
+    result = fixture.function.emit_constant(result_block, Smalang::IrType::Isize, 5)
+    fixture.function.emit_jump(result_block, fixture.join)
+    clauses = [
+      Smalang::MatchClause.new(
+        [Smalang::BooleanLiteralPattern.new(true)],
+        case_entry,
+        result,
+        result_block
+      ),
+      fixture.default_clauses.last,
+    ] of Smalang::MatchClause
+
+    MatchCoreSpecHelpers.expect_failure(
+      fixture,
+      fixture.expression(clauses: clauses),
+      Smalang::MatchDiagnosticKind::BodyBlockAlias,
+      "Match body region cannot re-enter the source block"
+    )
+  end
+
+  it "rejects an unterminated block inside a Match case body region" do
+    fixture = MatchCoreFixture.new
+    case_entry = fixture.function.add_block("case_entry")
+    result_block = fixture.function.add_block("case_result")
+    unterminated_block = fixture.function.add_block("unterminated_case_path")
+    condition = fixture.scrutinees.first
+    fixture.function.emit_branch(case_entry, condition, unterminated_block, result_block)
+    result = fixture.function.emit_constant(result_block, Smalang::IrType::Isize, 5)
+    fixture.function.emit_jump(result_block, fixture.join)
+    clauses = [
+      Smalang::MatchClause.new(
+        [Smalang::BooleanLiteralPattern.new(true)],
+        case_entry,
+        result,
+        result_block
+      ),
+      fixture.default_clauses.last,
+    ] of Smalang::MatchClause
+
+    MatchCoreSpecHelpers.expect_failure(
+      fixture,
+      fixture.expression(clauses: clauses),
+      Smalang::MatchDiagnosticKind::BodyDoesNotJumpToJoin,
+      "Match body block must jump to the join block"
     )
   end
 

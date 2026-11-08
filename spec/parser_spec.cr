@@ -38,6 +38,22 @@ class ParserSpecVisitor < Smalang::AstVisitor
     @visited << :return
   end
 
+  def visit(node : Smalang::MatchExpressionNode) : Nil
+    @visited << :match_expression
+  end
+
+  def visit(node : Smalang::MatchCaseNode) : Nil
+    @visited << :match_case
+  end
+
+  def visit(node : Smalang::BooleanMatchPatternNode) : Nil
+    @visited << :boolean_match_pattern
+  end
+
+  def visit(node : Smalang::WildcardMatchPatternNode) : Nil
+    @visited << :wildcard_match_pattern
+  end
+
   def visit(node : Smalang::BinaryExpr) : Nil
     @visited << :binary
   end
@@ -162,6 +178,113 @@ describe Smalang::Parser do
     truth = ParserSpecHelpers.function_at(parsed, 1)
     literal = parsed.arena.node(parsed.arena.node(truth.body).as(Smalang::ReturnNode).value).as(Smalang::BooleanLiteralExpr)
     parsed.source_file.slice(literal.span).should eq("true")
+  end
+
+  it "parses a boolean match expression with inline case results" do
+    result = ParserSpecHelpers.parse(
+      "def choose(value: bool) -> int:\n    return match value:\n        case true: 1\n        case false: 2\n"
+    )
+
+    result.diagnostics.should be_empty
+    result.success?.should eq(true)
+
+    parsed = result.parsed_module
+    returned = parsed.arena.node(ParserSpecHelpers.function_at(parsed, 0).body).as(Smalang::ReturnNode)
+    match_expression = parsed.arena.node(returned.value).as(Smalang::MatchExpressionNode)
+    scrutinee = parsed.arena.node(match_expression.scrutinee).as(Smalang::IdentifierExpr)
+    parsed.source_file.slice(scrutinee.span).should eq("value")
+    match_expression.cases.count.should eq(2)
+
+    true_case = parsed.arena.node(parsed.arena.child(match_expression.cases, 0)).as(Smalang::MatchCaseNode)
+    true_pattern = parsed.arena.node(true_case.pattern).as(Smalang::BooleanMatchPatternNode)
+    true_pattern.value.should eq(true)
+    parsed.source_file.slice(parsed.arena.node(true_case.result).span).should eq("1")
+
+    false_case = parsed.arena.node(parsed.arena.child(match_expression.cases, 1)).as(Smalang::MatchCaseNode)
+    false_pattern = parsed.arena.node(false_case.pattern).as(Smalang::BooleanMatchPatternNode)
+    false_pattern.value.should eq(false)
+    parsed.source_file.slice(parsed.arena.node(false_case.result).span).should eq("2")
+  end
+
+  it "parses a wildcard default and full expressions as case results" do
+    result = ParserSpecHelpers.parse(
+      "def choose(value: bool) -> int:\n    return match value:\n        case true: calculate(1 + 2)\n        case _: 0\n"
+    )
+    result.diagnostics.should be_empty
+
+    parsed = result.parsed_module
+    returned = parsed.arena.node(ParserSpecHelpers.function_at(parsed, 0).body).as(Smalang::ReturnNode)
+    match_expression = parsed.arena.node(returned.value).as(Smalang::MatchExpressionNode)
+    true_case = parsed.arena.node(parsed.arena.child(match_expression.cases, 0)).as(Smalang::MatchCaseNode)
+    call = parsed.arena.node(true_case.result).as(Smalang::CallExpr)
+    parsed.source_file.slice(call.callee).should eq("calculate")
+
+    wildcard_case = parsed.arena.node(parsed.arena.child(match_expression.cases, 1)).as(Smalang::MatchCaseNode)
+    parsed.arena.node(wildcard_case.pattern).should be_a(Smalang::WildcardMatchPatternNode)
+    parsed.source_file.slice(parsed.arena.node(wildcard_case.result).span).should eq("0")
+  end
+
+  it "parses a match expression nested as a case result" do
+    result = ParserSpecHelpers.parse(
+      "def choose(first: bool, second: bool) -> int:\n    return match first:\n        case true: match second:\n            case true: 1\n            case false: 2\n        case false: 0\n"
+    )
+    result.diagnostics.should be_empty
+
+    parsed = result.parsed_module
+    returned = parsed.arena.node(ParserSpecHelpers.function_at(parsed, 0).body).as(Smalang::ReturnNode)
+    outer_match = parsed.arena.node(returned.value).as(Smalang::MatchExpressionNode)
+    first_case = parsed.arena.node(parsed.arena.child(outer_match.cases, 0)).as(Smalang::MatchCaseNode)
+    inner_match = parsed.arena.node(first_case.result).as(Smalang::MatchExpressionNode)
+    inner_match.cases.count.should eq(2)
+    final_case = parsed.arena.node(parsed.arena.child(outer_match.cases, 1)).as(Smalang::MatchCaseNode)
+    parsed.source_file.slice(parsed.arena.node(final_case.result).span).should eq("0")
+  end
+
+  it "parses a match expression as a function-call argument" do
+    result = ParserSpecHelpers.parse(
+      "def choose(value: bool) -> int:\n    return wrap(match value:\n        case true: 1\n        case false: 0\n    )\n"
+    )
+    result.diagnostics.should be_empty
+
+    parsed = result.parsed_module
+    returned = parsed.arena.node(ParserSpecHelpers.function_at(parsed, 0).body).as(Smalang::ReturnNode)
+    call = parsed.arena.node(returned.value).as(Smalang::CallExpr)
+    call.arguments.count.should eq(1)
+    parsed.arena.node(parsed.arena.child(call.arguments, 0)).should be_a(Smalang::MatchExpressionNode)
+  end
+
+  it "reports invalid match patterns and recovers through nested indentation" do
+    result = ParserSpecHelpers.parse(
+      "def broken(value: bool) -> int:\n    return match value:\n        case unknown: 1\n            return 9\n\ndef later() -> int:\n    return 7\n",
+      "match_recovery.py"
+    )
+    parsed = result.parsed_module
+    module_node = parsed.arena.node(parsed.root_id).as(Smalang::ModuleNode)
+
+    result.success?.should eq(false)
+    result.diagnostics.size.should eq(1)
+    result.diagnostics.first.message.should contain("match_recovery.py:3:14:")
+    result.diagnostics.first.message.should contain("expected 'true', 'false', or '_' as a case pattern")
+    module_node.functions.count.should eq(2)
+    broken_function = parsed.arena.node(parsed.arena.child(module_node.functions, 0)).as(Smalang::FunctionNode)
+    parsed.arena.node(broken_function.body).should be_a(Smalang::ErrorNode)
+    parsed.source_file.slice(ParserSpecHelpers.function_at(parsed, 1).name).should eq("later")
+  end
+
+  it "reports a missing case result and keeps the following function" do
+    result = ParserSpecHelpers.parse(
+      "def broken(value: bool) -> int:\n    return match value:\n        case true:\n\ndef later() -> int:\n    return 7\n",
+      "missing_case_result.py"
+    )
+    parsed = result.parsed_module
+    module_node = parsed.arena.node(parsed.root_id).as(Smalang::ModuleNode)
+
+    result.success?.should eq(false)
+    result.diagnostics.size.should eq(1)
+    result.diagnostics.first.message.should contain("missing_case_result.py:3:19:")
+    result.diagnostics.first.message.should contain("expected an expression")
+    module_node.functions.count.should eq(2)
+    parsed.source_file.slice(ParserSpecHelpers.function_at(parsed, 1).name).should eq("later")
   end
 
   it "builds nested calls and left-associative arithmetic expressions" do

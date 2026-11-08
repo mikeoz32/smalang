@@ -1,5 +1,6 @@
 require "./semantic"
 require "./ir"
+require "./match_core"
 
 module Smalang
   class IrLoweringDiagnostic
@@ -131,6 +132,18 @@ module Smalang
     def visit(node : ReturnNode) : Nil
     end
 
+    def visit(node : MatchExpressionNode) : Nil
+    end
+
+    def visit(node : MatchCaseNode) : Nil
+    end
+
+    def visit(node : BooleanMatchPatternNode) : Nil
+    end
+
+    def visit(node : WildcardMatchPatternNode) : Nil
+    end
+
     def visit(node : BinaryExpr) : Nil
     end
 
@@ -149,6 +162,24 @@ module Smalang
 
     def visit(node : ErrorNode) : Nil
       @context.report(node.span, "cannot lower syntax containing parse errors")
+    end
+  end
+
+  class MatchCorePatternConverter < SourceMatchPatternVisitor
+    @result : MatchPattern?
+
+    def convert(pattern : SourceMatchPatternNode) : MatchPattern
+      @result = nil
+      pattern.accept(self)
+      @result.not_nil!
+    end
+
+    def visit(pattern : BooleanMatchPatternNode) : Nil
+      @result = BooleanLiteralPattern.new(pattern.value)
+    end
+
+    def visit(pattern : WildcardMatchPatternNode) : Nil
+      @result = WildcardPattern.new
     end
   end
 
@@ -291,6 +322,49 @@ module Smalang
       end
 
       function.emit_return(current_block_id, value_id)
+    end
+
+    def visit(node : MatchExpressionNode) : Nil
+      function = @current_function
+      unless function
+        @context.report(node.span, "match expression is not inside a function")
+        return
+      end
+
+      scrutinee_id = lower_expression(node.scrutinee)
+      return unless scrutinee_id
+      source_block_id = current_block_id
+
+      result_type_id = @context.type_of(current_node_id)
+      return unless result_type_id
+      result_type = @context.ir_type_for(result_type_id, node.span)
+      return unless result_type
+
+      join_block_id = function.add_block("match_join_#{function.block_count}")
+      clauses = Array(MatchClause).new(node.cases.count)
+      node.cases.count.times do |index|
+        case_node_id = @context.parsed_module.arena.child(node.cases, index)
+        case_node = @context.parsed_module.arena.node(case_node_id).as(MatchCaseNode)
+        body_block_id = function.add_block("match_case_#{function.block_count}")
+        @current_block_id = body_block_id
+
+        result_value_id = lower_expression(case_node.result)
+        return unless result_value_id
+        result_block_id = current_block_id
+        function.emit_jump(result_block_id, join_block_id)
+
+        source_pattern = @context.parsed_module.arena.node(case_node.pattern).as(SourceMatchPatternNode)
+        pattern = MatchCorePatternConverter.new.convert(source_pattern)
+        clauses << MatchClause.new([pattern], body_block_id, result_value_id, result_block_id)
+      end
+
+      match_expression = MatchExpression.new([scrutinee_id], result_type, clauses)
+      begin
+        @expression_value_id = MatchLowerer.new.lower(function, source_block_id, join_block_id, match_expression)
+        @current_block_id = join_block_id
+      rescue failure : MatchLoweringFailure
+        @context.report(node.span, failure.message || "invalid Match core expression")
+      end
     end
 
     def visit(node : BinaryExpr) : Nil

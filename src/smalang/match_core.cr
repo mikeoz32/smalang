@@ -17,6 +17,8 @@ module Smalang
     UnsupportedPattern
     DuplicateTruePattern
     DuplicateFalsePattern
+    DuplicateWildcardPattern
+    WildcardNotLast
     DuplicateBodyBlock
     UnexpectedBodyPredecessor
     BodyBlockAlias
@@ -33,6 +35,10 @@ module Smalang
     def boolean_literal_value : Bool?
       nil
     end
+
+    def wildcard? : Bool
+      false
+    end
   end
 
   class BooleanLiteralPattern < MatchPattern
@@ -46,13 +52,26 @@ module Smalang
     end
   end
 
+  class WildcardPattern < MatchPattern
+    def wildcard? : Bool
+      true
+    end
+  end
+
   class MatchClause
     @patterns : Array(MatchPattern)
 
     getter body_block_id : BlockId
+    getter result_block_id : BlockId
     getter result_value_id : ValueId
 
-    def initialize(patterns : Array(T), @body_block_id : BlockId, @result_value_id : ValueId) forall T
+    def initialize(
+      patterns : Array(T),
+      @body_block_id : BlockId,
+      @result_value_id : ValueId,
+      result_block_id : BlockId? = nil,
+    ) forall T
+      @result_block_id = result_block_id || @body_block_id
       @patterns = patterns.map do |pattern|
         pattern.as?(MatchPattern) || raise MatchLoweringFailure.new(
           MatchDiagnosticKind::InvalidPatternValue,
@@ -112,8 +131,8 @@ module Smalang
       )
 
       function.emit_phi(join_block_id, expression.result_type, [
-        IrPhiIncoming.new(true_clause.body_block_id, true_clause.result_value_id),
-        IrPhiIncoming.new(false_clause.body_block_id, false_clause.result_value_id),
+        IrPhiIncoming.new(true_clause.result_block_id, true_clause.result_value_id),
+        IrPhiIncoming.new(false_clause.result_block_id, false_clause.result_value_id),
       ])
     end
 
@@ -224,9 +243,28 @@ module Smalang
 
       true_clause : MatchClause? = nil
       false_clause : MatchClause? = nil
-      clauses.each do |clause|
+      wildcard_clause : MatchClause? = nil
+      clauses.each_with_index do |clause, index|
         validate_clause_arity(clause, scrutinees.size)
-        case clause.patterns.first.boolean_literal_value
+        pattern = clause.patterns.first
+        if pattern.wildcard?
+          if wildcard_clause
+            raise MatchLoweringFailure.new(
+              MatchDiagnosticKind::DuplicateWildcardPattern,
+              "duplicate wildcard pattern"
+            )
+          end
+          if index != clauses.size - 1
+            raise MatchLoweringFailure.new(
+              MatchDiagnosticKind::WildcardNotLast,
+              "wildcard pattern must be the final case"
+            )
+          end
+          wildcard_clause = clause
+          next
+        end
+
+        case pattern.boolean_literal_value
         when true
           true_clause = unique_clause(true_clause, clause, MatchDiagnosticKind::DuplicateTruePattern, "duplicate bool pattern true")
         when false
@@ -234,7 +272,20 @@ module Smalang
         else
           raise MatchLoweringFailure.new(
             MatchDiagnosticKind::UnsupportedPattern,
-            "current Match lowerer supports bool literal patterns only"
+            "current Match lowerer supports bool literal and wildcard patterns only"
+          )
+        end
+      end
+
+      if wildcard_clause
+        if true_clause && !false_clause
+          false_clause = wildcard_clause
+        elsif false_clause && !true_clause
+          true_clause = wildcard_clause
+        else
+          raise MatchLoweringFailure.new(
+            MatchDiagnosticKind::NonExhaustive,
+            "bool wildcard must follow exactly one bool literal pattern"
           )
         end
       end
@@ -285,11 +336,36 @@ module Smalang
       end
 
       body_block_ids.each do |block_id|
-        validate_body_block(function, block_id, source_block_id, join_block_id)
+        validate_body_entry(function, block_id, source_block_id, join_block_id)
+      end
+
+      true_region = match_body_region_block_ids(function, true_clause.body_block_id, source_block_id, join_block_id)
+      false_region = match_body_region_block_ids(function, false_clause.body_block_id, source_block_id, join_block_id)
+      if true_region.any? { |block_id| false_region.includes?(block_id) }
+        raise MatchLoweringFailure.new(
+          MatchDiagnosticKind::DuplicateBodyBlock,
+          "bool match clauses must have separate body regions"
+        )
+      end
+      validate_body_region_predecessors(function, true_region, true_clause.body_block_id)
+      validate_body_region_predecessors(function, false_region, false_clause.body_block_id)
+
+      result_block_ids = [true_clause.result_block_id, false_clause.result_block_id]
+      if result_block_ids.uniq.size != result_block_ids.size
+        raise MatchLoweringFailure.new(
+          MatchDiagnosticKind::DuplicateBodyBlock,
+          "bool match clauses must have distinct result blocks"
+        )
+      end
+      [
+        {true_clause, true_region},
+        {false_clause, false_region},
+      ].each do |clause, region|
+        validate_result_block(function, clause, source_block_id, join_block_id, region)
       end
     end
 
-    private def validate_body_block(
+    private def validate_body_entry(
       function : IrFunction,
       block_id : BlockId,
       source_block_id : BlockId,
@@ -315,14 +391,117 @@ module Smalang
           "Match body block has a predecessor outside the Match source"
         )
       end
+    end
 
-      terminator = body_block.instruction_ids.last?.try { |instruction_id| function.instruction(instruction_id) }
-      unless terminator.is_a?(IrJumpInstruction) && terminator.target_block_id == join_block_id
+    private def validate_result_block(
+      function : IrFunction,
+      clause : MatchClause,
+      source_block_id : BlockId,
+      join_block_id : BlockId,
+      body_region : Array(BlockId),
+    ) : Nil
+      block_id = clause.result_block_id
+      if block_id == source_block_id || block_id == join_block_id
         raise MatchLoweringFailure.new(
+          MatchDiagnosticKind::BodyBlockAlias,
+          "Match result block cannot be the source or join block"
+        )
+      end
+
+      result_block = function.block(block_id)
+      unless result_block
+        raise MatchLoweringFailure.new(
+          MatchDiagnosticKind::UnknownBodyBlock,
+          "unknown Match result block #{block_id}"
+        )
+      end
+      unless body_region.includes?(block_id)
+        raise MatchLoweringFailure.new(
+          MatchDiagnosticKind::BodyDoesNotJumpToJoin,
+          "Match result block must be reachable from its case body"
+        )
+      end
+
+      terminator = result_block.instruction_ids.last?.try { |instruction_id| function.instruction(instruction_id) }
+      unless terminator.is_a?(IrJumpInstruction) && terminator.target_block_id == join_block_id
+        description = if clause.result_block_id == clause.body_block_id
+                        "Match body block must jump to the join block"
+                      else
+                        "Match result block must jump to the join block"
+                      end
+        raise MatchLoweringFailure.new(
+          MatchDiagnosticKind::BodyDoesNotJumpToJoin,
+          description
+        )
+      end
+    end
+
+    private def validate_body_region_predecessors(
+      function : IrFunction,
+      body_region : Array(BlockId),
+      entry_block_id : BlockId,
+    ) : Nil
+      body_region.each do |block_id|
+        next if block_id == entry_block_id
+        next if predecessor_block_ids(function, block_id).all? { |predecessor_id| body_region.includes?(predecessor_id) }
+
+        raise MatchLoweringFailure.new(
+          MatchDiagnosticKind::UnexpectedBodyPredecessor,
+          "Match body block has a predecessor outside its case body"
+        )
+      end
+    end
+
+    private def match_body_region_block_ids(
+      function : IrFunction,
+      entry_block_id : BlockId,
+      source_block_id : BlockId,
+      join_block_id : BlockId,
+    ) : Array(BlockId)
+      pending_block_ids = [entry_block_id]
+      region_block_ids = [] of BlockId
+      index = 0
+
+      while index < pending_block_ids.size
+        block_id = pending_block_ids[index]
+        index += 1
+        next if block_id == join_block_id || region_block_ids.includes?(block_id)
+        if block_id == source_block_id
+          raise MatchLoweringFailure.new(
+            MatchDiagnosticKind::BodyBlockAlias,
+            "Match body region cannot re-enter the source block"
+          )
+        end
+        region_block_ids << block_id
+
+        block = function.block(block_id)
+        unless block
+          raise MatchLoweringFailure.new(
+            MatchDiagnosticKind::UnknownBodyBlock,
+            "unknown Match body block #{block_id}"
+          )
+        end
+        instruction_id = block.instruction_ids.last? || raise MatchLoweringFailure.new(
           MatchDiagnosticKind::BodyDoesNotJumpToJoin,
           "Match body block must jump to the join block"
         )
+        instruction = function.instruction(instruction_id) || raise MatchLoweringFailure.new(
+          MatchDiagnosticKind::UnknownBodyBlock,
+          "unknown Match body terminator #{instruction_id}"
+        )
+        unless instruction.terminator?
+          raise MatchLoweringFailure.new(
+            MatchDiagnosticKind::BodyDoesNotJumpToJoin,
+            "Match body block must jump to the join block"
+          )
+        end
+
+        instruction.successor_block_ids.each do |successor_block_id|
+          pending_block_ids << successor_block_id
+        end
       end
+
+      region_block_ids
     end
 
     private def validate_join_predecessors(
@@ -331,7 +510,7 @@ module Smalang
       true_clause : MatchClause,
       false_clause : MatchClause,
     ) : Nil
-      expected_predecessors = [true_clause.body_block_id, false_clause.body_block_id].sort
+      expected_predecessors = [true_clause.result_block_id, false_clause.result_block_id].sort
       return if predecessor_block_ids(function, join_block_id).sort == expected_predecessors
       raise MatchLoweringFailure.new(
         MatchDiagnosticKind::UnexpectedJoinPredecessor,
@@ -371,7 +550,7 @@ module Smalang
         )
       end
 
-      return if value_available_on_match_body_edge?(function, clause.result_value_id, source_block_id, clause.body_block_id)
+      return if value_available_on_match_body_edge?(function, clause.result_value_id, source_block_id, clause.result_block_id)
       raise MatchLoweringFailure.new(
         MatchDiagnosticKind::ResultUnavailable,
         "Match result does not dominate its body block"

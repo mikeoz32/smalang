@@ -290,6 +290,75 @@ module Smalang
     end
   end
 
+  class BooleanMatchPatternValidator < SourceMatchPatternVisitor
+    getter failure : Tuple(SourceSpan, String)?
+
+    @current_index : Int32
+    @case_count : Int32
+    @has_true : Bool
+    @has_false : Bool
+    @has_wildcard : Bool
+
+    def initialize
+      @failure = nil
+      @current_index = 0
+      @case_count = 0
+      @has_true = false
+      @has_false = false
+      @has_wildcard = false
+    end
+
+    def validate_case(pattern : SourceMatchPatternNode, index : Int32, case_count : Int32) : Nil
+      @current_index = index
+      @case_count = case_count
+      pattern.accept(self)
+    end
+
+    def finish(span : SourceSpan) : Nil
+      return if @failure
+
+      if @case_count != 2
+        fail_at(span, "bool match must have exactly two cases")
+      elsif @has_true && @has_false
+        return
+      elsif @has_wildcard && (@has_true != @has_false)
+        return
+      else
+        fail_at(span, "bool match must cover true and false, or use one final wildcard case")
+      end
+    end
+
+    def visit(pattern : BooleanMatchPatternNode) : Nil
+      if @has_wildcard
+        fail_at(pattern.span, "case is unreachable after wildcard pattern")
+      elsif pattern.value
+        if @has_true
+          fail_at(pattern.span, "duplicate bool pattern true")
+        else
+          @has_true = true
+        end
+      elsif @has_false
+        fail_at(pattern.span, "duplicate bool pattern false")
+      else
+        @has_false = true
+      end
+    end
+
+    def visit(pattern : WildcardMatchPatternNode) : Nil
+      if @has_wildcard
+        fail_at(pattern.span, "duplicate wildcard pattern")
+      elsif @current_index != @case_count - 1
+        fail_at(pattern.span, "wildcard pattern must be the final case")
+      else
+        @has_wildcard = true
+      end
+    end
+
+    private def fail_at(span : SourceSpan, description : String) : Nil
+      @failure = {span, description}
+    end
+  end
+
   abstract class SemanticAstVisitor < AstVisitor
     protected getter context : SemanticContext
 
@@ -320,6 +389,18 @@ module Smalang
     end
 
     def visit(node : ReturnNode) : Nil
+    end
+
+    def visit(node : MatchExpressionNode) : Nil
+    end
+
+    def visit(node : MatchCaseNode) : Nil
+    end
+
+    def visit(node : BooleanMatchPatternNode) : Nil
+    end
+
+    def visit(node : WildcardMatchPatternNode) : Nil
     end
 
     def visit(node : BinaryExpr) : Nil
@@ -425,6 +506,48 @@ module Smalang
         value_span = @context.arena.node(node.value).span
         @context.report(value_span, "return has type #{type_label(value_type)}, expected #{type_label(function.result_type_id)}")
       end
+    end
+
+    def visit(node : MatchExpressionNode) : Nil
+      bool_type_id = @context.type_table.bool_type_id
+      scrutinee_type = analyze_expression(node.scrutinee, bool_type_id)
+      return if @context.diagnostic
+      unless scrutinee_type == bool_type_id
+        actual_type = scrutinee_type.try { |type_id| type_label(type_id) } || "unknown"
+        @context.report(@context.arena.node(node.scrutinee).span, "match value has type #{actual_type}, expected bool")
+        return
+      end
+
+      return unless validate_boolean_match_cases(node)
+
+      case_types = Array(TypeId?).new(node.cases.count)
+      node.cases.count.times do |index|
+        case_node = @context.arena.node(@context.arena.child(node.cases, index)).as(MatchCaseNode)
+        case_types << analyze_expression(case_node.result, @expected_type_id)
+        return if @context.diagnostic
+      end
+
+      result_type_id = @expected_type_id || case_types.compact.first?
+      return unless result_type_id
+
+      node.cases.count.times do |index|
+        case_node = @context.arena.node(@context.arena.child(node.cases, index)).as(MatchCaseNode)
+        result_type = case_types[index] || analyze_expression(case_node.result, result_type_id)
+        return if @context.diagnostic
+        unless result_type
+          @context.report(@context.arena.node(case_node.result).span, "match case result requires an expected type")
+          return
+        end
+        if result_type != result_type_id
+          @context.report(
+            @context.arena.node(case_node.result).span,
+            "match case has type #{type_label(result_type)}, expected #{type_label(result_type_id)}"
+          )
+          return
+        end
+      end
+
+      @context.set_type(current_node_id, result_type_id)
     end
 
     def visit(node : BinaryExpr) : Nil
@@ -540,6 +663,23 @@ module Smalang
       visit_node(node_id)
       @expected_type_id = previous_expected_type_id
       @context.type_of(node_id)
+    end
+
+    private def validate_boolean_match_cases(node : MatchExpressionNode) : Bool
+      validator = BooleanMatchPatternValidator.new
+      node.cases.count.times do |index|
+        case_node = @context.arena.node(@context.arena.child(node.cases, index)).as(MatchCaseNode)
+        pattern = @context.arena.node(case_node.pattern).as(SourceMatchPatternNode)
+        validator.validate_case(pattern, index, node.cases.count)
+        break if validator.failure
+      end
+
+      validator.finish(node.span)
+      unless failure = validator.failure
+        return true
+      end
+      @context.report(failure[0], failure[1])
+      false
     end
 
     private def type_label(type_id : TypeId) : String

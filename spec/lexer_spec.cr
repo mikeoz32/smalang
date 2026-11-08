@@ -150,6 +150,17 @@ describe Smalang::Lexer do
     identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("falsehood")
   end
 
+  it "recognizes match and case as whole keywords" do
+    stream = Smalang::Lexer.new.tokenize("match case matcher_case match_case matchish\n")
+
+    stream.tokens.map(&.kind).should contain(Smalang::TokenKind::Match)
+    stream.tokens.map(&.kind).should contain(Smalang::TokenKind::Case)
+    identifiers = stream.tokens.select { |token| token.kind == Smalang::TokenKind::Identifier }
+    identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("matcher_case")
+    identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("match_case")
+    identifiers.map { |token| stream.source_file.slice(token.span) }.should contain("matchish")
+  end
+
   it "ignores blank lines, accepts CRLF, and inserts the final newline" do
     stream = Smalang::Lexer.new.tokenize(
       "\r\n    \r\ndef main() -> int:\r\n    return 1"
