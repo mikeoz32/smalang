@@ -80,6 +80,38 @@ describe Smalang::IrModule do
     ir.verify.join("\n").should contain("array type with unsupported elements")
   end
 
+  it "rejects raw pointers as inline array elements" do
+    ir = Smalang::IrModule.new
+    pointer_type = Smalang::IrPointerType.new(Smalang::IrType::Int64)
+    array_type = Smalang::IrArrayType.new(pointer_type, 1_u128)
+    parameter_types = [] of Smalang::IrType
+    parameter_types << array_type
+    function = ir.add_function("invalid", parameter_types, Smalang::IrType::Isize)
+    result = function.emit_constant(function.entry_block_id, Smalang::IrType::Isize, 0)
+    function.emit_return(function.entry_block_id, result)
+
+    ir.verify.join("\n").should contain("array type with unsupported elements")
+  end
+
+  it "rejects pointer signatures with unsupported pointee types" do
+    pointer_types = [
+      Smalang::IrPointerType.new(Smalang::IrType::Unit),
+      Smalang::IrPointerType.new(Smalang::IrArrayType.new(Smalang::IrType::Int64, 2_u128)),
+    ]
+
+    pointer_types.each do |pointer_type|
+      ir = Smalang::IrModule.new
+      parameter_types = [] of Smalang::IrType
+      parameter_types << pointer_type
+      function = ir.add_function("invalid", parameter_types, pointer_type)
+      function.emit_return(function.entry_block_id, function.parameters.first.value_id)
+
+      diagnostics = ir.verify.join("\n")
+      diagnostics.should contain("parameter 0 has pointer type #{pointer_type.label} with unsupported pointee")
+      diagnostics.should contain("result has pointer type #{pointer_type.label} with unsupported pointee")
+    end
+  end
+
   it "represents and dumps the first-slice program as typed SSA" do
     ir = Smalang::IrModule.new
     increment = ir.add_function(

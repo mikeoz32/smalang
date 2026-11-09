@@ -6,7 +6,10 @@ module BackendSpecHelpers
     link_and_capture(ir)[:exit_code]
   end
 
-  def self.link_and_capture(ir : Smalang::IrModule) : NamedTuple(exit_code: Int32, stdout: String, stderr: String)
+  def self.link_and_capture(
+    ir : Smalang::IrModule,
+    virtual_memory_limit_kib : Int32? = nil,
+  ) : NamedTuple(exit_code: Int32, stdout: String, stderr: String)
     object_bytes = Smalang::X86_64Backend.new.emit(ir)
     object_path = File.join(Dir.tempdir, "smalang-backend-#{Process.pid}.o")
     executable_path = File.join(Dir.tempdir, "smalang-backend-#{Process.pid}")
@@ -24,11 +27,20 @@ module BackendSpecHelpers
 
       output = IO::Memory.new
       error = IO::Memory.new
-      status = Process.run(
-        executable_path,
-        output: output,
-        error: error
-      )
+      status = if memory_limit_kib = virtual_memory_limit_kib
+                 Process.run(
+                   "bash",
+                   ["-c", "ulimit -v \"$1\"; exec \"$2\"", "smalang-test", memory_limit_kib.to_s, executable_path],
+                   output: output,
+                   error: error
+                 )
+               else
+                 Process.run(
+                   executable_path,
+                   output: output,
+                   error: error
+                 )
+               end
       exit_code = status.exit_code? || 128 + status.exit_signal?.not_nil!.to_i
       {exit_code: exit_code, stdout: output.to_s, stderr: error.to_s}
     ensure

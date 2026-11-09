@@ -5,6 +5,7 @@ module Smalang
     EXCEPTION_RELEASE   = -3
     REPORT_UNCAUGHT     = -4
     INDEX_OUT_OF_BOUNDS = -5
+    OUT_OF_MEMORY       = -6
   end
 
   class X86_64BackendFailure < Exception
@@ -276,6 +277,116 @@ module Smalang
 
     def emit(context : X86_64EmissionContext) : Nil
       context.emit_array_literal(self)
+    end
+  end
+
+  class MachinePointerLoad < MachineInstruction
+    getter result_id : ValueId
+    getter address_id : ValueId
+    getter pointer_type : IrPointerType
+
+    def initialize(position : Int32, @result_id : ValueId, @address_id : ValueId, @pointer_type : IrPointerType)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@address_id]
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_pointer_load(self)
+    end
+  end
+
+  class MachinePointerStore < MachineInstruction
+    getter address_id : ValueId
+    getter value_id : ValueId
+    getter pointer_type : IrPointerType
+
+    def initialize(position : Int32, @address_id : ValueId, @value_id : ValueId, @pointer_type : IrPointerType)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@address_id, @value_id]
+    end
+
+    def result_value_id : ValueId?
+      nil
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_pointer_store(self)
+    end
+  end
+
+  class MachinePointerFree < MachineInstruction
+    getter address_id : ValueId
+    getter pointer_type : IrPointerType
+
+    def initialize(position : Int32, @address_id : ValueId, @pointer_type : IrPointerType)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@address_id]
+    end
+
+    def result_value_id : ValueId?
+      nil
+    end
+
+    def call_boundary? : Bool
+      true
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_pointer_free(self)
+    end
+  end
+
+  class MachineAllocate < MachineInstruction
+    getter result_id : ValueId
+    getter exception_id : ValueId
+    getter initial_value_id : ValueId
+    getter pointer_type : IrPointerType
+    getter normal_successor_label : Int32
+    getter exception_successor_label : Int32
+
+    def initialize(
+      position : Int32,
+      @result_id : ValueId,
+      @exception_id : ValueId,
+      @initial_value_id : ValueId,
+      @pointer_type : IrPointerType,
+      @normal_successor_label : Int32,
+      @exception_successor_label : Int32,
+    )
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@initial_value_id]
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def defined_value_ids : Array(ValueId)
+      [@result_id, @exception_id]
+    end
+
+    def call_boundary? : Bool
+      true
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_allocate(self)
     end
   end
 
@@ -866,6 +977,25 @@ module Smalang
       @instructions << MachineArrayLiteral.new(@instructions.size, result_id, array_type, instruction.elements)
     end
 
+    def visit(instruction : IrLoadInstruction) : Nil
+      result_id = instruction.result_id
+      raise X86_64BackendFailure.new("pointer load is missing its result") unless result_id
+      @instructions << MachinePointerLoad.new(@instructions.size, result_id, instruction.address_id, instruction.pointer_type)
+    end
+
+    def visit(instruction : IrStoreInstruction) : Nil
+      @instructions << MachinePointerStore.new(
+        @instructions.size,
+        instruction.address_id,
+        instruction.value_id,
+        instruction.pointer_type
+      )
+    end
+
+    def visit(instruction : IrFreeInstruction) : Nil
+      @instructions << MachinePointerFree.new(@instructions.size, instruction.address_id, instruction.pointer_type)
+    end
+
     def visit(instruction : IrAddInstruction) : Nil
       append_binary(instruction, MachineAddOperation.new)
     end
@@ -921,6 +1051,18 @@ module Smalang
         operation.target.signature.parameter_types,
         normal_label,
         exception_label
+      )
+    end
+
+    def visit(operation : IrAllocateOperation, instruction : IrInvokeInstruction) : Nil
+      @instructions << MachineAllocate.new(
+        @instructions.size,
+        instruction.normal_result_id,
+        instruction.exception_result_id,
+        operation.initial_value_id,
+        operation.pointer_type,
+        target_label(instruction.block_id, instruction.normal_successor),
+        target_label(instruction.block_id, instruction.exception_successor)
       )
     end
 
@@ -2033,6 +2175,85 @@ module Smalang
       end
     end
 
+    def emit_pointer_load(load : MachinePointerLoad) : Nil
+      value_type = load.pointer_type.pointee_type
+      location(load.address_id).load_to(@code, X86_64Register::Rax, @frame)
+      @code.move_register_from_memory_sized(
+        X86_64Register::Rax,
+        X86_64Register::Rax,
+        0,
+        storage_size(value_type) * 8,
+        value_type.signed?
+      )
+      normalize_integer_register(X86_64Register::Rax, value_type)
+      location(load.result_id).store_from(@code, X86_64Register::Rax, @frame)
+    end
+
+    def emit_pointer_store(store : MachinePointerStore) : Nil
+      location(store.address_id).load_to(@code, X86_64Register::Rax, @frame)
+      location(store.value_id).load_to(@code, X86_64Register::R11, @frame)
+      @code.move_memory_from_register_sized(
+        X86_64Register::Rax,
+        0,
+        X86_64Register::R11,
+        storage_size(store.pointer_type.pointee_type) * 8
+      )
+    end
+
+    def emit_pointer_free(release : MachinePointerFree) : Nil
+      spills = @allocation.call_spills_at(release.position)
+      save_call_spills(spills)
+      location(release.address_id).load_to(@code, X86_64Register::Rdi, @frame)
+      @code.move_immediate(X86_64Register::Rsi, storage_size(release.pointer_type.pointee_type).to_u64)
+      @code.move_immediate(X86_64Register::Rax, X86_64RuntimeEmitter::UNMAP_SYSCALL)
+      @code.emit_syscall
+      restore_call_spills(spills)
+    end
+
+    def emit_allocate(allocation : MachineAllocate) : Nil
+      spills = @allocation.call_spills_at(allocation.position)
+      save_call_spills(spills)
+
+      location(allocation.initial_value_id).load_to(@code, X86_64Register::R10, @frame)
+      @code.move_rbp_from_register(@frame.invoke_normal_result_offset, X86_64Register::R10)
+      @code.move_immediate(X86_64Register::Rax, X86_64RuntimeEmitter::MAP_SYSCALL)
+      @code.xor_register(X86_64Register::Rdi)
+      @code.move_immediate(X86_64Register::Rsi, storage_size(allocation.pointer_type.pointee_type).to_u64)
+      @code.move_immediate(X86_64Register::Rdx, 3_u64)
+      @code.move_immediate(X86_64Register::R10, 0x22_u64)
+      @code.move_immediate(X86_64Register::R8, UInt64::MAX)
+      @code.xor_register(X86_64Register::R9)
+      @code.emit_syscall
+
+      allocation_failed = @code.new_label
+      @code.test_register(X86_64Register::Rax)
+      @code.jump_if_sign_to(allocation_failed)
+      @code.move_register_from_rbp(X86_64Register::R10, @frame.invoke_normal_result_offset)
+      @code.move_memory_from_register_sized(
+        X86_64Register::Rax,
+        0,
+        X86_64Register::R10,
+        storage_size(allocation.pointer_type.pointee_type) * 8
+      )
+      @code.move_rbp_from_register(@frame.invoke_normal_result_offset, X86_64Register::Rax)
+      @code.xor_register(X86_64Register::Rax)
+      @code.move_rbp_from_register(@frame.invoke_exception_offset, X86_64Register::Rax)
+      restore_call_spills(spills)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_normal_result_offset)
+      location(allocation.result_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_exception_offset)
+      location(allocation.exception_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.jump_to(allocation.normal_successor_label)
+
+      @code.mark_label(allocation_failed)
+      call_runtime(X86_64RuntimeSymbols::OUT_OF_MEMORY)
+      @code.move_rbp_from_register(@frame.invoke_exception_offset, X86_64Register::Rax)
+      restore_call_spills(spills)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_exception_offset)
+      location(allocation.exception_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.jump_to(allocation.exception_successor_label)
+    end
+
     def emit_array_get(access : MachineArrayAccess) : Nil
       spills = @allocation.call_spills_at(access.position)
       save_call_spills(spills)
@@ -2212,6 +2433,8 @@ module Smalang
         1
       when IrExceptionKind::IndexOutOfBounds
         2
+      when IrExceptionKind::OutOfMemory
+        3
       else
         raise X86_64BackendFailure.new("unsupported exception kind #{kind}")
       end
@@ -2349,6 +2572,7 @@ module Smalang
     PAGE_SIZE                           = 4096_u64
     EXCEPTION_KIND_DIVISION_BY_ZERO     =        1
     EXCEPTION_KIND_INDEX_OUT_OF_BOUNDS  =        2
+    EXCEPTION_KIND_OUT_OF_MEMORY        =        3
     EXCEPTION_RECORD_KIND_OFFSET        =        0
     EXCEPTION_RECORD_SUPPRESSED_OFFSET  =        8
     EXCEPTION_RECORD_FRAME_COUNT_OFFSET =       16
@@ -2357,7 +2581,7 @@ module Smalang
     MAX_EXCEPTION_FRAMES                =       64
 
     def emit : Array(EmittedFunction)
-      [emit_division_by_zero, emit_index_out_of_bounds, emit_release, emit_report_uncaught]
+      [emit_division_by_zero, emit_index_out_of_bounds, emit_out_of_memory, emit_release, emit_report_uncaught]
     end
 
     private def emit_division_by_zero : EmittedFunction
@@ -2376,6 +2600,14 @@ module Smalang
       )
     end
 
+    private def emit_out_of_memory : EmittedFunction
+      emit_exception_constructor(
+        X86_64RuntimeSymbols::OUT_OF_MEMORY,
+        "__smalang_new_out_of_memory",
+        EXCEPTION_KIND_OUT_OF_MEMORY
+      )
+    end
+
     private def emit_exception_constructor(function_id : FunctionId, name : String, kind_tag : Int32) : EmittedFunction
       code = X86_64CodeBuffer.new
       capture_loop = code.new_label
@@ -2386,9 +2618,46 @@ module Smalang
       emit_exception_capture_return(code, capture_done)
 
       code.mark_label(allocation_failed)
-      emit_exit(code, 127_u64)
+      if kind_tag == EXCEPTION_KIND_OUT_OF_MEMORY
+        emit_out_of_memory_fallback(code)
+      else
+        emit_exit(code, 127_u64)
+      end
       code.resolve_labels
       emit_helper(function_id, name, code)
+    end
+
+    private def emit_out_of_memory_fallback(code : X86_64CodeBuffer) : Nil
+      strings = X86_64RuntimeStringPool.new(code)
+      frame_loop = code.new_label
+      frame_done = code.new_label
+      strings.write("Uncaught exception: OutOfMemory\n")
+      code.move_register(X86_64Register::R12, X86_64Register::R15)
+      code.xor_register(X86_64Register::R13)
+      code.mark_label(frame_loop)
+      code.test_register(X86_64Register::R12)
+      code.jump_if_zero_to(frame_done)
+      code.compare_register_immediate(X86_64Register::R13, MAX_EXCEPTION_FRAMES)
+      code.jump_if_greater_equal_to(frame_done)
+      strings.write("  at ")
+      write_frame_field(code, strings, -16, -24)
+      strings.write(" (")
+      write_frame_field(code, strings, -32, -40)
+      strings.write(":")
+      write_frame_field(code, strings, -48, -56)
+      strings.write(")\n")
+      code.move_register_from_memory(X86_64Register::R12, X86_64Register::R12, -8)
+      code.add_immediate_register(X86_64Register::R13, 1)
+      code.jump_to(frame_loop)
+      code.mark_label(frame_done)
+      emit_exit(code, 1_u64)
+      strings.append
+    end
+
+    private def write_frame_field(code : X86_64CodeBuffer, strings : X86_64RuntimeStringPool, pointer_offset : Int32, length_offset : Int32) : Nil
+      code.move_register_from_memory(X86_64Register::Rsi, X86_64Register::R12, pointer_offset)
+      code.move_register_from_memory(X86_64Register::Rdx, X86_64Register::R12, length_offset)
+      strings.write_registers(X86_64Register::Rsi, X86_64Register::Rdx)
     end
 
     private def emit_exception_allocation(code : X86_64CodeBuffer, allocation_failed : Int32, kind_tag : Int32) : Nil
@@ -2512,6 +2781,7 @@ module Smalang
     private def emit_exception_kind(code : X86_64CodeBuffer, strings : X86_64RuntimeStringPool) : Nil
       unknown_kind = code.new_label
       index_out_of_bounds = code.new_label
+      out_of_memory = code.new_label
       done = code.new_label
       code.move_register_from_memory(X86_64Register::Rcx, X86_64Register::R12, EXCEPTION_RECORD_KIND_OFFSET)
       code.compare_register_immediate(X86_64Register::Rcx, EXCEPTION_KIND_DIVISION_BY_ZERO)
@@ -2520,8 +2790,13 @@ module Smalang
       code.jump_to(done)
       code.mark_label(index_out_of_bounds)
       code.compare_register_immediate(X86_64Register::Rcx, EXCEPTION_KIND_INDEX_OUT_OF_BOUNDS)
-      code.jump_if_not_equal_to(unknown_kind)
+      code.jump_if_not_equal_to(out_of_memory)
       strings.write("IndexOutOfBounds\n")
+      code.jump_to(done)
+      code.mark_label(out_of_memory)
+      code.compare_register_immediate(X86_64Register::Rcx, EXCEPTION_KIND_OUT_OF_MEMORY)
+      code.jump_if_not_equal_to(unknown_kind)
+      strings.write("OutOfMemory\n")
       code.jump_to(done)
       code.mark_label(unknown_kind)
       strings.write("Unknown\n")

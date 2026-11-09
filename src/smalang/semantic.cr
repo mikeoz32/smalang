@@ -17,6 +17,14 @@ module Smalang
       value_bits = @bit_width - (@signed ? 1 : 0)
       value <= (1_u128 << value_bits) - 1
     end
+
+    def supported_source_type?(_type_table : SemanticTypeTable) : Bool
+      true
+    end
+
+    def supported_array_element?(_type_table : SemanticTypeTable) : Bool
+      true
+    end
   end
 
   struct ArrayTypeInfo
@@ -24,6 +32,29 @@ module Smalang
     getter length : UInt128
 
     def initialize(@element_type_id : TypeId, @length : UInt128)
+    end
+
+    def supported_source_type?(type_table : SemanticTypeTable) : Bool
+      type_table.supported_array_element_type?(@element_type_id)
+    end
+
+    def supported_array_element?(type_table : SemanticTypeTable) : Bool
+      supported_source_type?(type_table)
+    end
+  end
+
+  struct PointerTypeInfo
+    getter pointee_type_id : TypeId
+
+    def initialize(@pointee_type_id : TypeId)
+    end
+
+    def supported_source_type?(type_table : SemanticTypeTable) : Bool
+      type_table.scalar_type(@pointee_type_id) != nil
+    end
+
+    def supported_array_element?(_type_table : SemanticTypeTable) : Bool
+      false
     end
   end
 
@@ -34,16 +65,18 @@ module Smalang
     getter uint_type_id : TypeId
     getter bool_type_id : TypeId
 
-    alias TypeInfo = IntegerTypeInfo | ArrayTypeInfo
+    alias TypeInfo = IntegerTypeInfo | ArrayTypeInfo | PointerTypeInfo
 
     @types : Array(TypeInfo)
     @type_ids_by_ast_type : Hash(AstType, TypeId)
     @array_type_ids : Hash(Tuple(TypeId, UInt128), TypeId)
+    @pointer_type_ids : Hash(TypeId, TypeId)
 
     def initialize
       @types = [] of TypeInfo
       @type_ids_by_ast_type = {} of AstType => TypeId
       @array_type_ids = {} of Tuple(TypeId, UInt128) => TypeId
+      @pointer_type_ids = {} of TypeId => TypeId
       register_type(AstType::Int, IntegerTypeInfo.new("int", POINTER_WIDTH, true))
       register_type(AstType::UInt, IntegerTypeInfo.new("uint", POINTER_WIDTH, false))
       register_type(AstType::Bool, IntegerTypeInfo.new("bool", 0, false))
@@ -72,6 +105,9 @@ module Smalang
         element_type_id = id_for(syntax.element_type_id, arena)
         key = {element_type_id, syntax.length}
         @array_type_ids[key]? || register_array_type(element_type_id, syntax.length)
+      when PointerTypeSyntax
+        pointee_type_id = id_for(syntax.pointee_type_id, arena)
+        @pointer_type_ids[pointee_type_id]? || register_pointer_type(pointee_type_id)
       else
         raise "unknown AST type syntax"
       end
@@ -83,6 +119,8 @@ module Smalang
         type_info.name
       when ArrayTypeInfo
         "array[#{label(type_info.element_type_id)}, #{type_info.length}]"
+      when PointerTypeInfo
+        "ptr[#{label(type_info.pointee_type_id)}]"
       else
         raise "unknown semantic type info"
       end
@@ -102,6 +140,14 @@ module Smalang
       @types[type_id].as?(ArrayTypeInfo)
     end
 
+    def pointer_type(type_id : TypeId) : PointerTypeInfo?
+      @types[type_id].as?(PointerTypeInfo)
+    end
+
+    def pointer_type_id(pointee_type_id : TypeId) : TypeId
+      @pointer_type_ids[pointee_type_id]? || register_pointer_type(pointee_type_id)
+    end
+
     def scalar_type(type_id : TypeId) : IntegerTypeInfo?
       @types[type_id].as?(IntegerTypeInfo)
     end
@@ -116,6 +162,8 @@ module Smalang
         return 0_u128 if type_info.length == 0
         return nil if element_size > UInt128::MAX // type_info.length
         element_size * type_info.length
+      when PointerTypeInfo
+        (POINTER_WIDTH // 8).to_u128
       else
         nil
       end
@@ -131,6 +179,21 @@ module Smalang
       @types << ArrayTypeInfo.new(element_type_id, length)
       @array_type_ids[{element_type_id, length}] = type_id
       type_id
+    end
+
+    private def register_pointer_type(pointee_type_id : TypeId) : TypeId
+      type_id = @types.size
+      @types << PointerTypeInfo.new(pointee_type_id)
+      @pointer_type_ids[pointee_type_id] = type_id
+      type_id
+    end
+
+    def supported_source_type?(type_id : TypeId) : Bool
+      @types[type_id].supported_source_type?(self)
+    end
+
+    def supported_array_element_type?(type_id : TypeId) : Bool
+      @types[type_id].supported_array_element?(self)
     end
   end
 
@@ -301,6 +364,10 @@ module Smalang
 
     def add_function(declaration_id : NodeId, declaration : FunctionNode) : SemanticFunctionSymbol?
       name = @parsed_module.source_file.slice(declaration.name)
+      if unsafe_memory_operation_name?(name)
+        report(declaration.name, "function name '#{name}' is reserved for an unsafe memory operation")
+        return nil
+      end
       if @module_scope.resolve(name)
         report(declaration.name, "duplicate function '#{name}'")
         return nil
@@ -309,12 +376,30 @@ module Smalang
       parameter_types = parameter_type_ids(declaration.parameters)
       return nil if @diagnostic
 
+      declaration.parameters.count.times do |index|
+        parameter_id = @arena.child(declaration.parameters, index)
+        parameter = @arena.node(parameter_id).as(ParameterNode)
+        type_id = parameter_types[index]
+        unless @type_table.supported_source_type?(type_id)
+          type_syntax = @parsed_module.type_arena.type(parameter.type)
+          report(type_syntax.span, "unsupported type '#{@type_table.label(type_id)}'")
+          return nil
+        end
+      end
+
+      result_type_id = @type_table.id_for(declaration.return_type, @parsed_module.type_arena)
+      unless @type_table.supported_source_type?(result_type_id)
+        type_syntax = @parsed_module.type_arena.type(declaration.return_type)
+        report(type_syntax.span, "unsupported type '#{@type_table.label(result_type_id)}'")
+        return nil
+      end
+
       symbol = SemanticFunctionSymbol.new(
         @symbols.size,
         declaration_id,
         declaration.name,
         parameter_types,
-        @type_table.id_for(declaration.return_type, @parsed_module.type_arena)
+        result_type_id
       )
       @module_scope.declare(name, symbol)
       @symbols << symbol
@@ -382,6 +467,10 @@ module Smalang
         types << @type_table.id_for(parameter.type, @parsed_module.type_arena)
       end
       types
+    end
+
+    private def unsafe_memory_operation_name?(name : String) : Bool
+      name == "alloc" || name == "load" || name == "store" || name == "free"
     end
   end
 
@@ -492,6 +581,30 @@ module Smalang
     def visit(node : ReturnNode) : Nil
     end
 
+    def visit(node : UnsafeBlockNode) : Nil
+    end
+
+    def visit(node : CallStatementNode) : Nil
+    end
+
+    def visit(node : AllocateExpr) : Nil
+    end
+
+    def visit(node : LoadExpr) : Nil
+    end
+
+    def visit(node : StoreExpr) : Nil
+    end
+
+    def visit(node : FreeExpr) : Nil
+    end
+
+    def visit(node : StoreStatementNode) : Nil
+    end
+
+    def visit(node : FreeStatementNode) : Nil
+    end
+
     def visit(node : MatchExpressionNode) : Nil
     end
 
@@ -552,12 +665,14 @@ module Smalang
     @current_function : SemanticFunctionSymbol?
     @current_binding_scope : FunctionBindingScope?
     @expected_type_id : TypeId?
+    @unsafe_depth : Int32
 
     def initialize(context : SemanticContext)
       super(context)
       @current_function = nil
       @current_binding_scope = nil
       @expected_type_id = nil
+      @unsafe_depth = 0
     end
 
     def check : Nil
@@ -613,6 +728,11 @@ module Smalang
       end
 
       type_id = @context.type_table.id_for(node.type, @context.parsed_module.type_arena)
+      unless @context.type_table.supported_source_type?(type_id)
+        type_syntax = @context.parsed_module.type_arena.type(node.type)
+        @context.report(type_syntax.span, "unsupported type '#{@context.type_table.label(type_id)}'")
+        return
+      end
       initializer_type_id = analyze_expression(node.initializer, type_id)
       return if @context.diagnostic
       unless initializer_type_id == type_id
@@ -690,6 +810,48 @@ module Smalang
         value_span = @context.arena.node(node.value).span
         @context.report(value_span, "return has type #{type_label(value_type)}, expected #{type_label(function.result_type_id)}")
       end
+    end
+
+    def visit(node : UnsafeBlockNode) : Nil
+      @unsafe_depth += 1
+      begin
+        node.statements.count.times do |index|
+          return if @context.diagnostic
+          visit_node(@context.arena.child(node.statements, index))
+        end
+      ensure
+        @unsafe_depth -= 1
+      end
+    end
+
+    def visit(node : CallStatementNode) : Nil
+      @context.report(node.span, "expression statements are not supported")
+    end
+
+    def visit(node : AllocateExpr) : Nil
+      analyze_allocation(node)
+    end
+
+    def visit(node : LoadExpr) : Nil
+      analyze_load(node)
+    end
+
+    def visit(node : StoreExpr) : Nil
+      @context.report(node.span, "store must be a standalone statement")
+    end
+
+    def visit(node : FreeExpr) : Nil
+      @context.report(node.span, "free must be a standalone statement")
+    end
+
+    def visit(node : StoreStatementNode) : Nil
+      return unless require_unsafe_context(node.span, "store")
+      check_store_statement(node)
+    end
+
+    def visit(node : FreeStatementNode) : Nil
+      return unless require_unsafe_context(node.span, "free")
+      check_free_statement(node)
     end
 
     def visit(node : MatchExpressionNode) : Nil
@@ -867,6 +1029,111 @@ module Smalang
       @context.set_type(current_node_id, function.result_type_id)
     end
 
+    private def analyze_allocation(node : AllocateExpr) : Nil
+      return unless require_unsafe_context(node.span, "alloc")
+      unless node.arguments.count == 1
+        @context.report(node.span, "alloc expects 1 argument, got #{node.arguments.count}")
+        return
+      end
+
+      expected_type_id = @expected_type_id
+      expected_pointer = expected_type_id.try { |type_id| @context.type_table.pointer_type(type_id) }
+      expected_value_type_id = expected_pointer.try(&.pointee_type_id)
+      if expected_value_type_id.nil? && expected_type_id && @context.type_table.scalar_type(expected_type_id)
+        expected_value_type_id = expected_type_id
+      end
+
+      value_id = @context.arena.child(node.arguments, 0)
+      value_type_id = analyze_expression(value_id, expected_value_type_id)
+      return if @context.diagnostic
+      unless value_type_id
+        @context.report(@context.arena.node(value_id).span, "alloc value requires an explicit scalar type")
+        return
+      end
+      unless @context.type_table.scalar_type(value_type_id)
+        @context.report(@context.arena.node(value_id).span, "alloc supports scalar values only")
+        return
+      end
+      if expected_value_type_id && value_type_id != expected_value_type_id
+        @context.report(
+          @context.arena.node(value_id).span,
+          "alloc value has type #{type_label(value_type_id)}, expected #{type_label(expected_value_type_id)}"
+        )
+        return
+      end
+
+      @context.set_type(current_node_id, @context.type_table.pointer_type_id(value_type_id))
+    end
+
+    private def analyze_load(node : LoadExpr) : Nil
+      return unless require_unsafe_context(node.span, "load")
+      unless node.arguments.count == 1
+        @context.report(node.span, "load expects 1 argument, got #{node.arguments.count}")
+        return
+      end
+
+      address_id = @context.arena.child(node.arguments, 0)
+      address_type_id = analyze_expression(address_id)
+      return if @context.diagnostic
+      pointer_type = address_type_id.try { |type_id| @context.type_table.pointer_type(type_id) }
+      unless pointer_type
+        actual_type = address_type_id.try { |type_id| type_label(type_id) } || "untyped expression"
+        @context.report(@context.arena.node(address_id).span, "load requires ptr[T], got #{actual_type}")
+        return
+      end
+
+      @context.set_type(current_node_id, pointer_type.pointee_type_id)
+    end
+
+    private def check_store_statement(node : StoreStatementNode) : Nil
+      unless node.arguments.count == 2
+        @context.report(node.span, "store expects 2 arguments, got #{node.arguments.count}")
+        return
+      end
+
+      address_id = @context.arena.child(node.arguments, 0)
+      address_type_id = analyze_expression(address_id)
+      return if @context.diagnostic
+      pointer_type = address_type_id.try { |type_id| @context.type_table.pointer_type(type_id) }
+      unless pointer_type
+        actual_type = address_type_id.try { |type_id| type_label(type_id) } || "untyped expression"
+        @context.report(@context.arena.node(address_id).span, "store requires ptr[T], got #{actual_type}")
+        return
+      end
+
+      value_id = @context.arena.child(node.arguments, 1)
+      value_type_id = analyze_expression(value_id, pointer_type.pointee_type_id)
+      return if @context.diagnostic
+      unless value_type_id == pointer_type.pointee_type_id
+        actual_type = value_type_id.try { |type_id| type_label(type_id) } || "unknown"
+        @context.report(
+          @context.arena.node(value_id).span,
+          "store value has type #{actual_type}, expected #{type_label(pointer_type.pointee_type_id)}"
+        )
+      end
+    end
+
+    private def check_free_statement(node : FreeStatementNode) : Nil
+      unless node.arguments.count == 1
+        @context.report(node.span, "free expects 1 argument, got #{node.arguments.count}")
+        return
+      end
+
+      address_id = @context.arena.child(node.arguments, 0)
+      address_type_id = analyze_expression(address_id)
+      return if @context.diagnostic
+      unless address_type_id.try { |type_id| @context.type_table.pointer_type(type_id) }
+        actual_type = address_type_id.try { |type_id| type_label(type_id) } || "untyped expression"
+        @context.report(@context.arena.node(address_id).span, "free requires ptr[T], got #{actual_type}")
+      end
+    end
+
+    private def require_unsafe_context(span : SourceSpan, operation_name : String) : Bool
+      return true if @unsafe_depth > 0
+      @context.report(span, "unsafe operation '#{operation_name}' requires an unsafe block")
+      false
+    end
+
     def visit(node : IdentifierExpr) : Nil
       name = @context.parsed_module.source_file.slice(node.span)
       binding = @current_binding_scope.try(&.resolve(name))
@@ -882,6 +1149,11 @@ module Smalang
     def visit(node : IntegerLiteralExpr) : Nil
       expected_type_id = @expected_type_id
       return unless expected_type_id
+
+      if @context.type_table.pointer_type(expected_type_id)
+        @context.set_type(current_node_id, @context.type_table.int_type_id)
+        return
+      end
 
       if expected_type_id == @context.type_table.bool_type_id
         @context.set_type(current_node_id, @context.type_table.int_type_id)

@@ -2,6 +2,13 @@ require "spec"
 require "../src/smalang/lexer"
 
 describe Smalang::Lexer do
+  it "tokenizes unsafe as a keyword without splitting other identifiers" do
+    tokens = Smalang::Lexer.new.tokenize("unsafe allocator\n")
+
+    tokens.tokens.map(&.kind.to_s).should eq(["Unsafe", "Identifier", "Newline", "Eof"])
+    tokens.source_file.slice(tokens.tokens[1].span).should eq("allocator")
+  end
+
   it "tokenizes square brackets for array types and literals" do
     tokens = Smalang::Lexer.new.tokenize("[ ]\n", "array_tokens.py")
 

@@ -13,6 +13,77 @@ module SemanticSpecHelpers
 end
 
 describe Smalang::SemanticAnalyzer do
+  it "accepts typed raw pointers in function parameters and results" do
+    result = SemanticSpecHelpers.analyze(
+      "def identity(address: ptr[int]) -> ptr[int]:\n    return address\n\ndef main() -> int:\n    return 0\n"
+    )
+
+    result.success?.should eq(true)
+  end
+
+  it "rejects unsupported pointer pointees and integer-pointer mixing" do
+    invalid_programs = [
+      {"def alloc() -> int:\n    return 0\n\ndef main() -> int:\n    return 0\n", "function name 'alloc' is reserved for an unsafe memory operation"},
+      {"def invalid(address: ptr[array[int, 1]]) -> int:\n    return 0\n\ndef main() -> int:\n    return 0\n", "unsupported type 'ptr[array[int, 1]]'"},
+      {"def main() -> int:\n    address: ptr[int] = 42\n    return 0\n", "initializer has type int, expected ptr[int]"},
+      {"def main() -> int:\n    values: array[ptr[int], 1] = [0]\n    return 0\n", "unsupported type 'array[ptr[int], 1]'"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.description.should eq(expected_message)
+    end
+  end
+
+  it "checks scalar pointer operations in an unsafe block" do
+    result = SemanticSpecHelpers.analyze(
+      "def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc(42)\n        store(address, 17)\n        result: int = load(address)\n        free(address)\n    return result\n"
+    )
+
+    result.success?.should eq(true)
+  end
+
+  it "rejects raw memory operations outside an unsafe block" do
+    invalid_programs = [
+      {"def main() -> int:\n    address: ptr[int] = alloc(42)\n    return 0\n", "alloc"},
+      {"def read(address: ptr[int]) -> int:\n    value: int = load(address)\n    return value\n\ndef main() -> int:\n    return 0\n", "load"},
+      {"def write(address: ptr[int]) -> int:\n    store(address, 1)\n    return 0\n\ndef main() -> int:\n    return 0\n", "store"},
+      {"def release(address: ptr[int]) -> int:\n    free(address)\n    return 0\n\ndef main() -> int:\n    return 0\n", "free"},
+    ]
+
+    invalid_programs.each do |source, operation|
+      result = SemanticSpecHelpers.analyze(source)
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.description.should eq("unsafe operation '#{operation}' requires an unsafe block")
+    end
+  end
+
+  it "reports invalid raw memory operations during semantic analysis" do
+    invalid_programs = [
+      {"def main() -> int:\n    unsafe:\n        value: int = 1\n        result: int = load(value)\n    return result\n", "load requires ptr[T], got int"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc(1)\n        value: int = load()\n    return value\n", "load expects 1 argument, got 0"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc(1)\n        store(address)\n    return 0\n", "store expects 2 arguments, got 1"},
+      {"def main() -> int:\n    unsafe:\n        value: int = 1\n        free(value)\n    return 0\n", "free requires ptr[T], got int"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc(1)\n        store(address, True)\n    return 0\n", "store value has type bool, expected int"},
+      {"def main() -> int:\n    unsafe:\n        value: int = 1\n        store(value, 2)\n    return 0\n", "store requires ptr[T], got int"},
+      {"def main() -> int:\n    unsafe:\n        free()\n    return 0\n", "free expects 1 argument, got 0"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc()\n    return 0\n", "alloc expects 1 argument, got 0"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc(1)\n        result: int = store(address, 2)\n    return result\n", "store must be a standalone statement"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc(1)\n        result: int = free(address)\n    return result\n", "free must be a standalone statement"},
+      {"def main() -> int:\n    unsafe:\n        alloc(1)\n    return 0\n", "expression statements are not supported"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.description.should eq(expected_message)
+    end
+  end
+
   it "analyzes the checked-in program and resolves its call and parameter" do
     source = File.read("#{__DIR__}/../examples/first_program.py")
     tokens = Smalang::Lexer.new.tokenize(source, "first_program.py")

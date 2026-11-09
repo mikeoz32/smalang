@@ -75,6 +75,11 @@ module Smalang
         end
         return ir_array_type
       end
+      if pointer_type = type_table.pointer_type(type_id)
+        pointee_type = ir_type_for(pointer_type.pointee_type_id, span)
+        return nil unless pointee_type
+        return IrPointerType.new(pointee_type)
+      end
       return IrType::Isize if type_id == type_table.int_type_id
       return IrType::Usize if type_id == type_table.uint_type_id
       return IrType::Bool if type_id == type_table.bool_type_id
@@ -147,6 +152,30 @@ module Smalang
     end
 
     def visit(node : ReturnNode) : Nil
+    end
+
+    def visit(node : UnsafeBlockNode) : Nil
+    end
+
+    def visit(node : CallStatementNode) : Nil
+    end
+
+    def visit(node : AllocateExpr) : Nil
+    end
+
+    def visit(node : LoadExpr) : Nil
+    end
+
+    def visit(node : StoreExpr) : Nil
+    end
+
+    def visit(node : FreeExpr) : Nil
+    end
+
+    def visit(node : StoreStatementNode) : Nil
+    end
+
+    def visit(node : FreeStatementNode) : Nil
     end
 
     def visit(node : MatchExpressionNode) : Nil
@@ -352,6 +381,72 @@ module Smalang
       function.emit_return(current_block_id, value_id)
     end
 
+    def visit(node : UnsafeBlockNode) : Nil
+      node.statements.count.times do |index|
+        return if @context.diagnostic
+        visit_node(@context.parsed_module.arena.child(node.statements, index))
+      end
+    end
+
+    def visit(node : CallStatementNode) : Nil
+      @context.report(node.span, "expression statements are not supported")
+    end
+
+    def visit(node : AllocateExpr) : Nil
+      lower_allocation(node)
+    end
+
+    def visit(node : LoadExpr) : Nil
+      lower_load(node)
+    end
+
+    def visit(node : StoreExpr) : Nil
+      @context.report(node.span, "store must be a standalone statement")
+    end
+
+    def visit(node : FreeExpr) : Nil
+      @context.report(node.span, "free must be a standalone statement")
+    end
+
+    def visit(node : StoreStatementNode) : Nil
+      address_node_id = @context.parsed_module.arena.child(node.arguments, 0)
+      address_id = lower_expression(address_node_id)
+      return unless address_id
+      address_type_id = @context.type_of(address_node_id)
+      return unless address_type_id
+      pointer_type = pointer_ir_type(address_type_id, node.span)
+      return unless pointer_type
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "unsafe operation is not inside a function")
+        return
+      end
+
+      value_node_id = @context.parsed_module.arena.child(node.arguments, 1)
+      value_id = lower_expression(value_node_id)
+      return unless value_id
+      function.emit_store(current_block_id, address_id, value_id, pointer_type)
+    end
+
+    def visit(node : FreeStatementNode) : Nil
+      address_node_id = @context.parsed_module.arena.child(node.arguments, 0)
+      address_id = lower_expression(address_node_id)
+      return unless address_id
+      address_type_id = @context.type_of(address_node_id)
+      return unless address_type_id
+      pointer_type = pointer_ir_type(address_type_id, node.span)
+      return unless pointer_type
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "unsafe operation is not inside a function")
+        return
+      end
+
+      function.emit_free(current_block_id, address_id, pointer_type)
+    end
+
     def visit(node : VariableDeclarationNode) : Nil
       value_id = lower_expression(node.initializer)
       return unless value_id
@@ -551,6 +646,61 @@ module Smalang
       function.emit_resume_exception(unwind_block, result.exception_id)
       @current_block_id = normal_block
       @expression_value_id = result.value_id
+    end
+
+    private def lower_allocation(node : AllocateExpr) : Nil
+      value_node_id = @context.parsed_module.arena.child(node.arguments, 0)
+      value_id = lower_expression(value_node_id)
+      return unless value_id
+
+      result_type_id = @context.type_of(current_node_id)
+      return unless result_type_id
+      pointer_type = pointer_ir_type(result_type_id, node.span)
+      return unless pointer_type
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "alloc is not inside a function")
+        return
+      end
+
+      normal_block = function.add_block("allocate_normal_#{function.block_count}")
+      unwind_block = function.add_block("allocate_unwind_#{function.block_count}")
+      result = function.emit_invoke_allocate(
+        current_block_id,
+        value_id,
+        pointer_type,
+        normal_block,
+        unwind_block,
+        @context.source_location(node.span)
+      )
+      function.emit_resume_exception(unwind_block, result.exception_id)
+      @current_block_id = normal_block
+      @expression_value_id = result.value_id
+    end
+
+    private def lower_load(node : LoadExpr) : Nil
+      address_node_id = @context.parsed_module.arena.child(node.arguments, 0)
+      address_id = lower_expression(address_node_id)
+      return unless address_id
+      address_type_id = @context.type_of(address_node_id)
+      return unless address_type_id
+      pointer_type = pointer_ir_type(address_type_id, node.span)
+      return unless pointer_type
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "load is not inside a function")
+        return
+      end
+
+      @expression_value_id = function.emit_load(current_block_id, address_id, pointer_type)
+    end
+
+    private def pointer_ir_type(type_id : TypeId, span : SourceSpan) : IrPointerType?
+      @context.ir_type_for(type_id, span).as?(IrPointerType).tap do |pointer_type|
+        @context.report(span, "expected a pointer IR type") unless pointer_type
+      end
     end
 
     def visit(node : IdentifierExpr) : Nil

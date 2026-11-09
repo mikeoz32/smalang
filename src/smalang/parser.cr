@@ -40,6 +40,14 @@ module Smalang
     end
   end
 
+  class PointerTypeSyntax < AstTypeSyntax
+    getter pointee_type_id : AstTypeId
+
+    def initialize(span : SourceSpan, @pointee_type_id : AstTypeId)
+      super(span)
+    end
+  end
+
   class AstTypeArena
     @types : Array(AstTypeSyntax)
 
@@ -176,6 +184,70 @@ module Smalang
     end
   end
 
+  struct UnsafeBlockNode
+    getter span : SourceSpan
+    getter statements : NodeRange
+
+    def initialize(@span : SourceSpan, @statements : NodeRange)
+    end
+  end
+
+  struct CallStatementNode
+    getter span : SourceSpan
+    getter call : NodeId
+
+    def initialize(@span : SourceSpan, @call : NodeId)
+    end
+  end
+
+  struct AllocateExpr
+    getter span : SourceSpan
+    getter arguments : NodeRange
+
+    def initialize(@span : SourceSpan, @arguments : NodeRange)
+    end
+  end
+
+  struct LoadExpr
+    getter span : SourceSpan
+    getter arguments : NodeRange
+
+    def initialize(@span : SourceSpan, @arguments : NodeRange)
+    end
+  end
+
+  struct StoreExpr
+    getter span : SourceSpan
+    getter arguments : NodeRange
+
+    def initialize(@span : SourceSpan, @arguments : NodeRange)
+    end
+  end
+
+  struct FreeExpr
+    getter span : SourceSpan
+    getter arguments : NodeRange
+
+    def initialize(@span : SourceSpan, @arguments : NodeRange)
+    end
+  end
+
+  struct StoreStatementNode
+    getter span : SourceSpan
+    getter arguments : NodeRange
+
+    def initialize(@span : SourceSpan, @arguments : NodeRange)
+    end
+  end
+
+  struct FreeStatementNode
+    getter span : SourceSpan
+    getter arguments : NodeRange
+
+    def initialize(@span : SourceSpan, @arguments : NodeRange)
+    end
+  end
+
   struct MatchCaseNode
     getter span : SourceSpan
     getter pattern : NodeId
@@ -260,7 +332,7 @@ module Smalang
     end
   end
 
-  alias AstNode = ModuleNode | FunctionNode | ParameterNode | VariableDeclarationNode | AssignmentNode | ReturnNode | MatchExpressionNode | MatchCaseNode | SourceMatchPatternNode | BinaryExpr | ArrayLiteralExpr | IndexExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
+  alias AstNode = ModuleNode | FunctionNode | ParameterNode | VariableDeclarationNode | AssignmentNode | ReturnNode | UnsafeBlockNode | CallStatementNode | AllocateExpr | LoadExpr | StoreExpr | FreeExpr | StoreStatementNode | FreeStatementNode | MatchExpressionNode | MatchCaseNode | SourceMatchPatternNode | BinaryExpr | ArrayLiteralExpr | IndexExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
 
   abstract class AstVisitor
     abstract def visit(node : ModuleNode) : Nil
@@ -269,6 +341,14 @@ module Smalang
     abstract def visit(node : VariableDeclarationNode) : Nil
     abstract def visit(node : AssignmentNode) : Nil
     abstract def visit(node : ReturnNode) : Nil
+    abstract def visit(node : UnsafeBlockNode) : Nil
+    abstract def visit(node : CallStatementNode) : Nil
+    abstract def visit(node : AllocateExpr) : Nil
+    abstract def visit(node : LoadExpr) : Nil
+    abstract def visit(node : StoreExpr) : Nil
+    abstract def visit(node : FreeExpr) : Nil
+    abstract def visit(node : StoreStatementNode) : Nil
+    abstract def visit(node : FreeStatementNode) : Nil
     abstract def visit(node : MatchExpressionNode) : Nil
     abstract def visit(node : MatchCaseNode) : Nil
     abstract def visit(node : BooleanMatchPatternNode) : Nil
@@ -314,6 +394,54 @@ module Smalang
   end
 
   struct ReturnNode
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct UnsafeBlockNode
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct CallStatementNode
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct AllocateExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct LoadExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct StoreExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct FreeExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct StoreStatementNode
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct FreeStatementNode
     def accept(visitor : AstVisitor) : Nil
       visitor.visit(self)
     end
@@ -584,18 +712,27 @@ module Smalang
     end
 
     private def parse_type(type_arena : AstTypeArena) : AstTypeId
-      if current_token.kind == TokenKind::Identifier && @tokens.source_file.slice(current_token.span) == "array"
-        start = advance.span.start
-        expect(TokenKind::LeftBracket, "expected '[' after 'array'")
-        element_type_id = parse_type(type_arena)
-        expect(TokenKind::Comma, "expected ',' before the array length")
-        length_token = expect(TokenKind::IntegerLiteral, "expected a nonnegative integer array length")
-        length = @tokens.source_file.slice(length_token.span).to_u128?
-        unless length
-          fail("array length is too large")
+      if current_token.kind == TokenKind::Identifier
+        case @tokens.source_file.slice(current_token.span)
+        when "array"
+          start = advance.span.start
+          expect(TokenKind::LeftBracket, "expected '[' after 'array'")
+          element_type_id = parse_type(type_arena)
+          expect(TokenKind::Comma, "expected ',' before the array length")
+          length_token = expect(TokenKind::IntegerLiteral, "expected a nonnegative integer array length")
+          length = @tokens.source_file.slice(length_token.span).to_u128?
+          unless length
+            fail("array length is too large")
+          end
+          finish = expect(TokenKind::RightBracket, "expected ']' after the array type").span.end_offset
+          return type_arena.add(ArrayTypeSyntax.new(span_between(start, finish), element_type_id, length))
+        when "ptr"
+          start = advance.span.start
+          expect(TokenKind::LeftBracket, "expected '[' after 'ptr'")
+          pointee_type_id = parse_type(type_arena)
+          finish = expect(TokenKind::RightBracket, "expected ']' after the pointer type").span.end_offset
+          return type_arena.add(PointerTypeSyntax.new(span_between(start, finish), pointee_type_id))
         end
-        finish = expect(TokenKind::RightBracket, "expected ']' after the array type").span.end_offset
-        return type_arena.add(ArrayTypeSyntax.new(span_between(start, finish), element_type_id, length))
       end
 
       case current_token.kind
@@ -672,7 +809,11 @@ module Smalang
             return {arena.append_children(statements), return_node}
           end
 
-          statements << parse_binding_statement(arena, type_arena)
+          statements << if current_token.kind == TokenKind::Unsafe
+            parse_unsafe_block(arena, type_arena)
+          else
+            parse_binding_statement(arena, type_arena)
+          end
         rescue failure : ParseFailure
           @diagnostics << failure.diagnostic
           if @indent_depth > 1
@@ -698,6 +839,51 @@ module Smalang
       {arena.append_children(statements), arena.add(ErrorNode.new(span_between(diagnostic.span.start, finish)))}
     end
 
+    private def parse_unsafe_block(arena : AstArena, type_arena : AstTypeArena) : NodeId
+      start = expect(TokenKind::Unsafe, "expected 'unsafe'").span.start
+      expect(TokenKind::Colon, "expected ':' after 'unsafe'")
+      expect(TokenKind::Newline, "expected a newline after 'unsafe:'")
+      expect(TokenKind::Indent, "expected an indented unsafe block")
+      statements = Array(NodeId).new
+
+      until unsafe_block_terminator?
+        if current_token.kind == TokenKind::Newline
+          advance
+          next
+        end
+
+        if current_token.kind == TokenKind::Return
+          fail("return cannot appear inside an unsafe block")
+        end
+        if current_token.kind == TokenKind::Unsafe
+          fail("nested unsafe blocks are not supported")
+        end
+
+        cursor_before = @cursor
+        begin
+          statements << parse_binding_statement(arena, type_arena)
+        rescue failure : ParseFailure
+          @diagnostics << failure.diagnostic
+          synchronize_statement
+          finish = previous_token.span.end_offset
+          statements << arena.add(ErrorNode.new(span_between(failure.diagnostic.span.start, finish)))
+        end
+        advance if @cursor == cursor_before && !unsafe_block_terminator?
+      end
+
+      if statements.empty?
+        fail("unsafe block cannot be empty")
+      end
+
+      finish = expect(TokenKind::Dedent, "expected the end of the unsafe block").span.start
+      arena.add(UnsafeBlockNode.new(span_between(start, finish), arena.append_children(statements)))
+    end
+
+    private def unsafe_block_terminator? : Bool
+      (current_token.kind == TokenKind::Dedent && @indent_depth == 2) ||
+        current_token.kind == TokenKind::Eof || top_level_function_start?
+    end
+
     private def parse_binding_statement(arena : AstArena, type_arena : AstTypeArena) : NodeId
       name = expect(TokenKind::Identifier, "expected a local declaration, assignment, or return").span
       case current_token.kind
@@ -711,6 +897,17 @@ module Smalang
         target = parse_postfix(arena, target)
         expect(TokenKind::Assign, "expected '=' after the assignment target")
         parse_assignment_value(arena, target)
+      when TokenKind::LeftParen
+        case @tokens.source_file.slice(name)
+        when "store"
+          parse_store_statement(arena, name)
+        when "free"
+          parse_free_statement(arena, name)
+        else
+          call_id = parse_call(arena, name)
+          finish = finish_simple_statement
+          arena.add(CallStatementNode.new(span_between(name.start, finish), call_id))
+        end
       else
         fail("expected ':' or '=' after the binding name")
       end
@@ -931,6 +1128,39 @@ module Smalang
     end
 
     private def parse_call(arena : AstArena, callee : SourceSpan) : NodeId
+      arguments, call_span, closed = parse_call_arguments(arena, callee)
+      expression_id = case @tokens.source_file.slice(callee)
+                      when "alloc"
+                        arena.add(AllocateExpr.new(call_span, arguments))
+                      when "load"
+                        arena.add(LoadExpr.new(call_span, arguments))
+                      when "store"
+                        arena.add(StoreExpr.new(call_span, arguments))
+                      when "free"
+                        arena.add(FreeExpr.new(call_span, arguments))
+                      else
+                        arena.add(CallExpr.new(call_span, callee, arguments))
+                      end
+      closed ? expression_id : arena.add(ErrorNode.new(call_span, expression_id))
+    end
+
+    private def parse_store_statement(arena : AstArena, callee : SourceSpan) : NodeId
+      arguments, _, closed = parse_call_arguments(arena, callee)
+      finish = finish_simple_statement
+      span = span_between(callee.start, finish)
+      statement_id = arena.add(StoreStatementNode.new(span, arguments))
+      closed ? statement_id : arena.add(ErrorNode.new(span, statement_id))
+    end
+
+    private def parse_free_statement(arena : AstArena, callee : SourceSpan) : NodeId
+      arguments, _, closed = parse_call_arguments(arena, callee)
+      finish = finish_simple_statement
+      span = span_between(callee.start, finish)
+      statement_id = arena.add(FreeStatementNode.new(span, arguments))
+      closed ? statement_id : arena.add(ErrorNode.new(span, statement_id))
+    end
+
+    private def parse_call_arguments(arena : AstArena, callee : SourceSpan) : Tuple(NodeRange, SourceSpan, Bool)
       expect(TokenKind::LeftParen, "expected '(' after the function name")
       arguments = parse_delimited_list(arena, "argument") { parse_expression(arena) }
       close_paren = if current_token.kind == TokenKind::RightParen
@@ -943,13 +1173,7 @@ module Smalang
 
       finish = close_paren.try(&.span.end_offset) || previous_token.span.end_offset
       finish = callee.end_offset if finish < callee.end_offset
-      call_span = span_between(callee.start, finish)
-      call_id = arena.add(CallExpr.new(call_span, callee, arguments))
-      if close_paren
-        call_id
-      else
-        arena.add(ErrorNode.new(call_span, call_id))
-      end
+      {arguments, span_between(callee.start, finish), !close_paren.nil?}
     end
 
     private def synchronize_expression : Nil

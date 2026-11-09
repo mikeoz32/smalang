@@ -50,6 +50,38 @@ class ParserSpecVisitor < Smalang::AstVisitor
     @visited << :return
   end
 
+  def visit(node : Smalang::UnsafeBlockNode) : Nil
+    @visited << :unsafe_block
+  end
+
+  def visit(node : Smalang::CallStatementNode) : Nil
+    @visited << :call_statement
+  end
+
+  def visit(node : Smalang::AllocateExpr) : Nil
+    @visited << :allocate
+  end
+
+  def visit(node : Smalang::LoadExpr) : Nil
+    @visited << :load
+  end
+
+  def visit(node : Smalang::StoreExpr) : Nil
+    @visited << :store_expression
+  end
+
+  def visit(node : Smalang::FreeExpr) : Nil
+    @visited << :free_expression
+  end
+
+  def visit(node : Smalang::StoreStatementNode) : Nil
+    @visited << :store_statement
+  end
+
+  def visit(node : Smalang::FreeStatementNode) : Nil
+    @visited << :free_statement
+  end
+
   def visit(node : Smalang::MatchExpressionNode) : Nil
     @visited << :match_expression
   end
@@ -100,6 +132,48 @@ class ParserSpecVisitor < Smalang::AstVisitor
 end
 
 describe Smalang::Parser do
+  it "parses typed raw pointers in function signatures and local bindings" do
+    result = ParserSpecHelpers.parse(
+      "def identity(address: ptr[int]) -> ptr[int]:\n    return address\n\ndef main() -> int:\n    value: ptr[bool] = allocate()\n    return 0\n"
+    )
+
+    result.diagnostics.should be_empty
+    result.success?.should eq(true)
+  end
+
+  it "parses unsafe blocks containing pointer reads, writes, allocation, and release" do
+    result = ParserSpecHelpers.parse(
+      "def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc(42)\n        store(address, 17)\n        result: int = load(address)\n        free(address)\n    return result\n"
+    )
+
+    result.diagnostics.should be_empty
+    result.success?.should eq(true)
+    parsed = result.parsed_module
+    function = ParserSpecHelpers.function_at(parsed, 0)
+    unsafe_block = parsed.arena.node(parsed.arena.child(function.statements, 0)).as(Smalang::UnsafeBlockNode)
+    allocation = parsed.arena.node(parsed.arena.child(unsafe_block.statements, 0)).as(Smalang::VariableDeclarationNode)
+    parsed.arena.node(allocation.initializer).should be_a(Smalang::AllocateExpr)
+    parsed.arena.node(parsed.arena.child(unsafe_block.statements, 1)).should be_a(Smalang::StoreStatementNode)
+    load = parsed.arena.node(parsed.arena.child(unsafe_block.statements, 2)).as(Smalang::VariableDeclarationNode)
+    parsed.arena.node(load.initializer).should be_a(Smalang::LoadExpr)
+    parsed.arena.node(parsed.arena.child(unsafe_block.statements, 3)).should be_a(Smalang::FreeStatementNode)
+  end
+
+  it "rejects nested, empty, and returning unsafe blocks" do
+    invalid_programs = [
+      {"def main() -> int:\n    unsafe:\n        return 1\n    return 0\n", "return cannot appear inside an unsafe block"},
+      {"def main() -> int:\n    unsafe:\n        unsafe:\n            value: int = 1\n    return 0\n", "nested unsafe blocks are not supported"},
+      {"def main() -> int:\n    unsafe:\n    return 0\n", "expected an indented unsafe block"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = ParserSpecHelpers.parse(source)
+
+      result.success?.should eq(false)
+      result.diagnostics.first.message.should contain(expected_message)
+    end
+  end
+
   it "builds an AST for a typed function returning an integer literal" do
     tokens = Smalang::Lexer.new.tokenize("def main() -> int:\n    return 42\n", "simple.py")
     result = Smalang::Parser.new(tokens).parse

@@ -35,6 +35,70 @@ module IrLoweringSpecHelpers
 end
 
 describe Smalang::IrLowerer do
+  it "lowers and runs a scalar pointer allocation, store, load, and free" do
+    source = "def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc(42)\n        store(address, 17)\n        result: int = load(address)\n        free(address)\n    return result\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(17)
+  end
+
+  it "passes allocated pointers through function parameters and results" do
+    source = "def allocate(value: int) -> ptr[int]:\n    unsafe:\n        address: ptr[int] = alloc(value)\n    return address\n\ndef read_and_free(address: ptr[int]) -> int:\n    unsafe:\n        result: int = load(address)\n        free(address)\n    return result\n\ndef main() -> int:\n    address: ptr[int] = allocate(42)\n    return read_and_free(address)\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "compiles bool and fixed-width scalar pointers to native behavior" do
+    source = File.read("#{__DIR__}/../examples/unsafe_pointers.py")
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "compiles and runs pointer alias and function API examples" do
+    examples = [
+      {"unsafe_pointer_alias.py", 42},
+      {"unsafe_pointer_functions.py", 42},
+    ]
+
+    examples.each do |filename, expected_result|
+      source = File.read("#{__DIR__}/../examples/#{filename}")
+      result = IrLoweringSpecHelpers.lower(source)
+
+      result.success?.should eq(true)
+      ir = result.ir_module.not_nil!
+      ir.verify.should be_empty
+      BackendSpecHelpers.link_and_run(ir).should eq(expected_result)
+    end
+  end
+
+  it "reports OutOfMemory when the process cannot map another allocation" do
+    source = String.build do |program|
+      program << "def main() -> int:\n    unsafe:\n"
+      4096.times do |index|
+        program << "        address_#{index}: ptr[int] = alloc(1)\n"
+      end
+      program << "    return 0\n"
+    end
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    runtime = BackendSpecHelpers.link_and_capture(result.ir_module.not_nil!, 12 * 1024)
+    runtime[:exit_code].should eq(1)
+    runtime[:stderr].should contain("Uncaught exception: OutOfMemory")
+    runtime[:stderr].should contain("at main (ir_lowering_spec.py:")
+  end
+
   it "lowers the checked-in program to a verified executable returning 42" do
     source = File.read("#{__DIR__}/../examples/first_program.py")
     result = IrLoweringSpecHelpers.lower(source)

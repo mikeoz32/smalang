@@ -4,6 +4,7 @@ module Smalang
     Return
     Match
     Case
+    Unsafe
     Mut
     Const
     IntType
@@ -306,6 +307,7 @@ module Smalang
         return TokenKind::Int32Type if matches_keyword?(start, "int32")
         return TokenKind::Int64Type if matches_keyword?(start, "int64")
       when 6
+        return TokenKind::Unsafe if matches_keyword?(start, "unsafe")
         return TokenKind::Return if matches_keyword?(start, "return")
         return TokenKind::UInt16Type if matches_keyword?(start, "uint16")
         return TokenKind::UInt32Type if matches_keyword?(start, "uint32")

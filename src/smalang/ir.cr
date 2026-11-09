@@ -20,6 +20,7 @@ module Smalang
       UInt64
       Unit
       Array
+      Pointer
     end
 
     Isize        = new(Kind::Isize)
@@ -97,6 +98,8 @@ module Smalang
         8_u128
       when Kind::Unit
         0_u128
+      when Kind::Pointer
+        8_u128
       when Kind::Array
         nil
       end
@@ -104,7 +107,7 @@ module Smalang
 
     def alignment : UInt128
       case @kind
-      when Kind::Isize, Kind::Usize, Kind::Exception, Kind::Int64, Kind::UInt64
+      when Kind::Isize, Kind::Usize, Kind::Exception, Kind::Int64, Kind::UInt64, Kind::Pointer
         8_u128
       when Kind::Int32, Kind::UInt32
         4_u128
@@ -113,6 +116,14 @@ module Smalang
       else
         1_u128
       end
+    end
+
+    def signature_error(_subject : String) : String?
+      nil
+    end
+
+    def valid_array_element_type? : ::Bool
+      self != IrType::Unit && self != IrType::Exception
     end
 
     def fixed_width_constant_fits?(value : Int128) : ::Bool
@@ -166,16 +177,62 @@ module Smalang
       !!other_array && @length == other_array.length && @element_type == other_array.element_type
     end
 
+    def valid_array_element_type? : ::Bool
+      valid_element_type?
+    end
+
     def valid_element_type? : ::Bool
-      return false if @element_type == IrType::Unit || @element_type == IrType::Exception
-      nested = @element_type.as?(IrArrayType)
-      !nested || nested.valid_element_type?
+      @element_type.valid_array_element_type?
+    end
+
+    def signature_error(subject : String) : String?
+      return nil if valid_element_type?
+      "#{subject} has an array type with unsupported elements"
+    end
+  end
+
+  class IrPointerType < IrType
+    getter pointee_type : IrType
+
+    def initialize(@pointee_type : IrType)
+      super(Kind::Pointer)
+    end
+
+    def label : String
+      "ptr[#{@pointee_type.label}]"
+    end
+
+    def storage_size : UInt128?
+      8_u128
+    end
+
+    def alignment : UInt128
+      8_u128
+    end
+
+    def ==(other : IrType) : ::Bool
+      other_pointer = other.as?(IrPointerType)
+      !!other_pointer && @pointee_type == other_pointer.pointee_type
+    end
+
+    def valid_pointee_type? : ::Bool
+      @pointee_type.integer? || @pointee_type == IrType::Bool
+    end
+
+    def valid_array_element_type? : ::Bool
+      false
+    end
+
+    def signature_error(subject : String) : String?
+      return nil if valid_pointee_type?
+      "#{subject} has pointer type #{label} with unsupported pointee"
     end
   end
 
   enum IrExceptionKind : UInt8
     DivisionByZero
     IndexOutOfBounds
+    OutOfMemory
   end
 
   struct IrSourceLocation
@@ -340,6 +397,7 @@ module Smalang
 
   abstract class IrInvokeOperationVisitor
     abstract def visit(operation : IrCallOperation, instruction : IrInvokeInstruction) : Nil
+    abstract def visit(operation : IrAllocateOperation, instruction : IrInvokeInstruction) : Nil
     abstract def visit(operation : IrDivideOperation, instruction : IrInvokeInstruction) : Nil
     abstract def visit(operation : IrRemainderOperation, instruction : IrInvokeInstruction) : Nil
     abstract def visit(operation : IrArrayGetOperation, instruction : IrInvokeInstruction) : Nil
@@ -350,6 +408,9 @@ module Smalang
     abstract def visit(instruction : IrConstantInstruction) : Nil
     abstract def visit(instruction : IrUnitConstantInstruction) : Nil
     abstract def visit(instruction : IrArrayLiteralInstruction) : Nil
+    abstract def visit(instruction : IrLoadInstruction) : Nil
+    abstract def visit(instruction : IrStoreInstruction) : Nil
+    abstract def visit(instruction : IrFreeInstruction) : Nil
     abstract def visit(instruction : IrAddInstruction) : Nil
     abstract def visit(instruction : IrSubtractInstruction) : Nil
     abstract def visit(instruction : IrMultiplyInstruction) : Nil
@@ -499,6 +560,113 @@ module Smalang
     def expression : String
       elements = @elements.map { |value_id| "%v#{value_id}" }.join(" ")
       "(%v#{@result_id.not_nil!} #{@result_type.not_nil!.label} (array #{elements}))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrLoadInstruction < IrInstruction
+    getter address_id : ValueId
+    getter pointer_type : IrPointerType
+
+    def initialize(id : InstructionId, block_id : BlockId, result_id : ValueId, @address_id : ValueId, @pointer_type : IrPointerType)
+      super(id, block_id, result_id, pointer_type.pointee_type)
+    end
+
+    def used_values : Array(ValueId)
+      [@address_id]
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      errors << context.error("load pointer type #{@pointer_type.label} has an unsupported pointee") unless @pointer_type.valid_pointee_type?
+      address_type = operand_types.first?
+      if address_type && address_type != @pointer_type
+        errors << context.error("load address has type #{address_type.label}, expected #{@pointer_type.label}")
+      end
+      errors
+    end
+
+    def expression : String
+      "(%v#{@result_id.not_nil!} #{@pointer_type.pointee_type.label} (load %v#{@address_id}))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrStoreInstruction < IrInstruction
+    getter address_id : ValueId
+    getter value_id : ValueId
+    getter pointer_type : IrPointerType
+
+    def initialize(id : InstructionId, block_id : BlockId, @address_id : ValueId, @value_id : ValueId, @pointer_type : IrPointerType)
+      super(id, block_id, nil, nil)
+    end
+
+    def used_values : Array(ValueId)
+      [@address_id, @value_id]
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      errors << context.error("store pointer type #{@pointer_type.label} has an unsupported pointee") unless @pointer_type.valid_pointee_type?
+      address_type = operand_types[0]?
+      value_type = operand_types[1]?
+      if address_type && address_type != @pointer_type
+        errors << context.error("store address has type #{address_type.label}, expected #{@pointer_type.label}")
+      end
+      if value_type && value_type != @pointer_type.pointee_type
+        errors << context.error("store value has type #{value_type.label}, expected #{@pointer_type.pointee_type.label}")
+      end
+      errors
+    end
+
+    def expression : String
+      "(store %v#{@address_id} %v#{@value_id})"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrFreeInstruction < IrInstruction
+    getter address_id : ValueId
+    getter pointer_type : IrPointerType
+
+    def initialize(id : InstructionId, block_id : BlockId, @address_id : ValueId, @pointer_type : IrPointerType)
+      super(id, block_id, nil, nil)
+    end
+
+    def used_values : Array(ValueId)
+      [@address_id]
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      address_type = operand_types.first?
+      return [] of String if address_type.nil?
+      return [] of String if address_type == @pointer_type && @pointer_type.valid_pointee_type?
+      [context.error("free address has type #{address_type.label}, expected #{@pointer_type.label}")]
+    end
+
+    def expression : String
+      "(free %v#{@address_id})"
     end
 
     def accept(visitor : IrInstructionVisitor) : Nil
@@ -665,6 +833,42 @@ module Smalang
         if actual_type != expected_type
           errors << context.error("call argument #{index} has type #{actual_type.label}, expected #{expected_type.label}")
         end
+      end
+      errors
+    end
+
+    def accept(visitor : IrInvokeOperationVisitor, instruction : IrInvokeInstruction) : Nil
+      visitor.visit(self, instruction)
+    end
+  end
+
+  class IrAllocateOperation < IrInvokeOperation
+    getter initial_value_id : ValueId
+    getter pointer_type : IrPointerType
+
+    def initialize(@initial_value_id : ValueId, @pointer_type : IrPointerType)
+    end
+
+    def used_values : Array(ValueId)
+      [@initial_value_id]
+    end
+
+    def result_type : IrType
+      @pointer_type
+    end
+
+    def expression : String
+      "(alloc %v#{@initial_value_id})"
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      value_type = operand_types.first?
+      errors = [] of String
+      unless @pointer_type.valid_pointee_type?
+        errors << context.error("alloc pointer type #{@pointer_type.label} has an unsupported pointee")
+      end
+      if value_type && value_type != @pointer_type.pointee_type
+        errors << context.error("alloc value has type #{value_type.label}, expected #{@pointer_type.pointee_type.label}")
       end
       errors
     end
@@ -1305,6 +1509,24 @@ module Smalang
       end
     end
 
+    def emit_load(block_id : BlockId, address_id : ValueId, pointer_type : IrPointerType) : ValueId
+      append_result(block_id, pointer_type.pointee_type) do |instruction_id, result_id|
+        IrLoadInstruction.new(instruction_id, block_id, result_id, address_id, pointer_type)
+      end
+    end
+
+    def emit_store(block_id : BlockId, address_id : ValueId, value_id : ValueId, pointer_type : IrPointerType) : Nil
+      append_instruction(block_id) do |instruction_id|
+        IrStoreInstruction.new(instruction_id, block_id, address_id, value_id, pointer_type)
+      end
+    end
+
+    def emit_free(block_id : BlockId, address_id : ValueId, pointer_type : IrPointerType) : Nil
+      append_instruction(block_id) do |instruction_id|
+        IrFreeInstruction.new(instruction_id, block_id, address_id, pointer_type)
+      end
+    end
+
     def emit_add(block_id : BlockId, type : IrType, left : ValueId, right : ValueId) : ValueId
       append_result(block_id, type) do |instruction_id, result_id|
         IrAddInstruction.new(instruction_id, block_id, result_id, type, left, right)
@@ -1332,6 +1554,23 @@ module Smalang
       source_location : IrSourceLocation? = nil,
     ) : IrInvokeResults
       append_invoke(block_id, IrCallOperation.new(target, arguments), normal_successor, exception_successor, source_location)
+    end
+
+    def emit_invoke_allocate(
+      block_id : BlockId,
+      initial_value_id : ValueId,
+      pointer_type : IrPointerType,
+      normal_successor : BlockId,
+      exception_successor : BlockId,
+      source_location : IrSourceLocation? = nil,
+    ) : IrInvokeResults
+      append_invoke(
+        block_id,
+        IrAllocateOperation.new(initial_value_id, pointer_type),
+        normal_successor,
+        exception_successor,
+        source_location
+      )
     end
 
     def emit_invoke_divide(
@@ -1458,6 +1697,13 @@ module Smalang
       result_id
     end
 
+    private def append_instruction(block_id : BlockId, &build : InstructionId -> IrInstruction) : Nil
+      block = require_block(block_id)
+      instruction_id = @instructions.size
+      @instructions << build.call(instruction_id)
+      block.append_instruction(instruction_id)
+    end
+
     private def append_invoke(
       block_id : BlockId,
       operation : IrInvokeOperation,
@@ -1576,12 +1822,12 @@ module Smalang
       diagnostics = [] of String
       context = IrVerificationContext.new(ir_module, function)
       function.signature.parameter_types.each_with_index do |type, index|
-        if array_type = type.as?(IrArrayType)
-          diagnostics << context.error("parameter #{index} has an array type with unsupported elements") unless array_type.valid_element_type?
+        if error = type.signature_error("parameter #{index}")
+          diagnostics << context.error(error)
         end
       end
-      if array_type = function.signature.result_type.as?(IrArrayType)
-        diagnostics << context.error("result has an array type with unsupported elements") unless array_type.valid_element_type?
+      if error = function.signature.result_type.signature_error("result")
+        diagnostics << context.error(error)
       end
       definition_sites = {} of ValueId => IrValueDefinition
       value_types = {} of ValueId => IrType

@@ -76,6 +76,40 @@ describe Smalang::X86_64Backend do
     end
   end
 
+  it "allocates and accesses pointer pointees using each scalar's storage width" do
+    cases = [
+      {Smalang::IrType::Bool, 1_i128, 0_i128, 0_u64},
+      {Smalang::IrType::Int8, 42_i128, -1_i128, UInt64::MAX},
+      {Smalang::IrType::UInt8, 42_i128, 255_i128, 255_u64},
+      {Smalang::IrType::Int16, 42_i128, -2_i128, UInt64::MAX - 1_u64},
+      {Smalang::IrType::UInt16, 42_i128, 65_535_i128, 65_535_u64},
+      {Smalang::IrType::Int32, 42_i128, -3_i128, UInt64::MAX - 2_u64},
+      {Smalang::IrType::UInt32, 42_i128, 4_294_967_295_i128, 4_294_967_295_u64},
+      {Smalang::IrType::Int64, 42_i128, -4_i128, UInt64::MAX - 3_u64},
+      {Smalang::IrType::UInt64, 42_i128, UInt64::MAX.to_i128, UInt64::MAX},
+    ]
+
+    cases.each do |type, initial_value, stored_value, expected_value|
+      ir = Smalang::IrModule.new
+      main = ir.add_function("main", Array(Smalang::IrType).new, type)
+      entry = main.entry_block_id
+      allocated = main.add_block("allocated")
+      failed = main.add_block("failed")
+      pointer_type = Smalang::IrPointerType.new(type)
+      initial = main.emit_constant(entry, type, initial_value)
+      allocation = main.emit_invoke_allocate(entry, initial, pointer_type, allocated, failed)
+      replacement = main.emit_constant(allocated, type, stored_value)
+      main.emit_store(allocated, allocation.value_id, replacement, pointer_type)
+      loaded = main.emit_load(allocated, allocation.value_id, pointer_type)
+      main.emit_free(allocated, allocation.value_id, pointer_type)
+      main.emit_return(allocated, loaded)
+      main.emit_resume_exception(failed, allocation.exception_id)
+
+      ir.verify.should be_empty
+      BackendSpecHelpers.link_and_compare_full_width_result(ir, expected_value).should eq(0)
+    end
+  end
+
   it "emits 64-bit subtraction" do
     ir = Smalang::IrModule.new
     function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
