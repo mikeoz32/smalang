@@ -3,6 +3,26 @@ require "../src/smalang/ir"
 require "../src/smalang/x86_64_backend"
 require "./backend_spec_helpers"
 
+module BackendPointerOffsetSpecHelpers
+  def self.offset_function(pointee_type : Smalang::IrType) : Tuple(Smalang::IrModule, Smalang::IrFunction)
+    ir = Smalang::IrModule.new
+    pointer_type = Smalang::IrPointerType.new(pointee_type)
+    function = ir.add_function("offset", [pointer_type, Smalang::IrType::Usize], pointer_type)
+    entry = function.entry_block_id
+    result = function.emit_pointer_offset(entry, function.parameters[0].value_id, function.parameters[1].value_id, pointer_type)
+    function.emit_return(entry, result)
+    {ir, function}
+  end
+
+  def self.contains_bytes?(bytes : Array(UInt8), sequence : Array(UInt8)) : Bool
+    return false if bytes.size < sequence.size
+
+    (0..(bytes.size - sequence.size)).any? do |start|
+      sequence.each_with_index.all? { |byte, offset| bytes[start + offset] == byte }
+    end
+  end
+end
+
 describe Smalang::X86_64Backend do
   it "emits a linkable object for typed IR with an internal call" do
     ir = Smalang::IrModule.new
@@ -107,6 +127,25 @@ describe Smalang::X86_64Backend do
 
       ir.verify.should be_empty
       BackendSpecHelpers.link_and_compare_full_width_result(ir, expected_value).should eq(0)
+    end
+  end
+
+  it "scales raw pointer offsets by the pointee storage width" do
+    [
+      {Smalang::IrType::Bool, nil},
+      {Smalang::IrType::Int16, 2_u8},
+      {Smalang::IrType::Int32, 4_u8},
+      {Smalang::IrType::Int64, 8_u8},
+    ].each do |pointee_type, stride|
+      ir, function = BackendPointerOffsetSpecHelpers.offset_function(pointee_type)
+      ir.verify.should be_empty
+      bytes = Smalang::X86_64FunctionEmitter.new.emit(function).bytes
+      if stride
+        instruction = [0x4d_u8, 0x69_u8, 0xd2_u8, stride, 0_u8, 0_u8, 0_u8]
+        BackendPointerOffsetSpecHelpers.contains_bytes?(bytes, instruction).should be_true
+      else
+        BackendPointerOffsetSpecHelpers.contains_bytes?(bytes, [0x4d_u8, 0x69_u8, 0xd2_u8]).should be_false
+      end
     end
   end
 

@@ -470,7 +470,7 @@ module Smalang
     end
 
     private def unsafe_memory_operation_name?(name : String) : Bool
-      name == "alloc" || name == "load" || name == "store" || name == "free"
+      name == "alloc" || name == "alloc_stack" || name == "offset" || name == "load" || name == "store" || name == "free"
     end
   end
 
@@ -588,6 +588,12 @@ module Smalang
     end
 
     def visit(node : AllocateExpr) : Nil
+    end
+
+    def visit(node : StackAllocateExpr) : Nil
+    end
+
+    def visit(node : PointerOffsetExpr) : Nil
     end
 
     def visit(node : LoadExpr) : Nil
@@ -829,7 +835,40 @@ module Smalang
     end
 
     def visit(node : AllocateExpr) : Nil
-      analyze_allocation(node)
+      analyze_allocation(node.arguments, node.span, "alloc")
+    end
+
+    def visit(node : StackAllocateExpr) : Nil
+      analyze_allocation(node.arguments, node.span, "alloc_stack")
+    end
+
+    def visit(node : PointerOffsetExpr) : Nil
+      return unless require_unsafe_context(node.span, "offset")
+      unless node.arguments.count == 2
+        @context.report(node.span, "offset expects 2 arguments, got #{node.arguments.count}")
+        return
+      end
+
+      address_id = @context.arena.child(node.arguments, 0)
+      address_type_id = analyze_expression(address_id)
+      return if @context.diagnostic
+      pointer_type = address_type_id.try { |type_id| @context.type_table.pointer_type(type_id) }
+      unless pointer_type
+        actual_type = address_type_id.try { |type_id| type_label(type_id) } || "untyped expression"
+        @context.report(@context.arena.node(address_id).span, "offset requires ptr[T], got #{actual_type}")
+        return
+      end
+
+      index_id = @context.arena.child(node.arguments, 1)
+      index_type_id = analyze_expression(index_id, @context.type_table.uint_type_id)
+      return if @context.diagnostic
+      unless index_type_id == @context.type_table.uint_type_id
+        actual_type = index_type_id.try { |type_id| type_label(type_id) } || "untyped expression"
+        @context.report(@context.arena.node(index_id).span, "offset index has type #{actual_type}, expected uint")
+        return
+      end
+
+      @context.set_type(current_node_id, address_type_id.not_nil!)
     end
 
     def visit(node : LoadExpr) : Nil
@@ -1029,10 +1068,10 @@ module Smalang
       @context.set_type(current_node_id, function.result_type_id)
     end
 
-    private def analyze_allocation(node : AllocateExpr) : Nil
-      return unless require_unsafe_context(node.span, "alloc")
-      unless node.arguments.count == 1
-        @context.report(node.span, "alloc expects 1 argument, got #{node.arguments.count}")
+    private def analyze_allocation(arguments : NodeRange, span : SourceSpan, operation_name : String) : Nil
+      return unless require_unsafe_context(span, operation_name)
+      unless arguments.count == 1
+        @context.report(span, "#{operation_name} expects 1 argument, got #{arguments.count}")
         return
       end
 
@@ -1043,21 +1082,21 @@ module Smalang
         expected_value_type_id = expected_type_id
       end
 
-      value_id = @context.arena.child(node.arguments, 0)
+      value_id = @context.arena.child(arguments, 0)
       value_type_id = analyze_expression(value_id, expected_value_type_id)
       return if @context.diagnostic
       unless value_type_id
-        @context.report(@context.arena.node(value_id).span, "alloc value requires an explicit scalar type")
+        @context.report(@context.arena.node(value_id).span, "#{operation_name} value requires an explicit scalar type")
         return
       end
       unless @context.type_table.scalar_type(value_type_id)
-        @context.report(@context.arena.node(value_id).span, "alloc supports scalar values only")
+        @context.report(@context.arena.node(value_id).span, "#{operation_name} supports scalar values only")
         return
       end
       if expected_value_type_id && value_type_id != expected_value_type_id
         @context.report(
           @context.arena.node(value_id).span,
-          "alloc value has type #{type_label(value_type_id)}, expected #{type_label(expected_value_type_id)}"
+          "#{operation_name} value has type #{type_label(value_type_id)}, expected #{type_label(expected_value_type_id)}"
         )
         return
       end

@@ -208,6 +208,22 @@ module Smalang
     end
   end
 
+  struct StackAllocateExpr
+    getter span : SourceSpan
+    getter arguments : NodeRange
+
+    def initialize(@span : SourceSpan, @arguments : NodeRange)
+    end
+  end
+
+  struct PointerOffsetExpr
+    getter span : SourceSpan
+    getter arguments : NodeRange
+
+    def initialize(@span : SourceSpan, @arguments : NodeRange)
+    end
+  end
+
   struct LoadExpr
     getter span : SourceSpan
     getter arguments : NodeRange
@@ -332,7 +348,7 @@ module Smalang
     end
   end
 
-  alias AstNode = ModuleNode | FunctionNode | ParameterNode | VariableDeclarationNode | AssignmentNode | ReturnNode | UnsafeBlockNode | CallStatementNode | AllocateExpr | LoadExpr | StoreExpr | FreeExpr | StoreStatementNode | FreeStatementNode | MatchExpressionNode | MatchCaseNode | SourceMatchPatternNode | BinaryExpr | ArrayLiteralExpr | IndexExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
+  alias AstNode = ModuleNode | FunctionNode | ParameterNode | VariableDeclarationNode | AssignmentNode | ReturnNode | UnsafeBlockNode | CallStatementNode | AllocateExpr | StackAllocateExpr | PointerOffsetExpr | LoadExpr | StoreExpr | FreeExpr | StoreStatementNode | FreeStatementNode | MatchExpressionNode | MatchCaseNode | SourceMatchPatternNode | BinaryExpr | ArrayLiteralExpr | IndexExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
 
   abstract class AstVisitor
     abstract def visit(node : ModuleNode) : Nil
@@ -344,6 +360,8 @@ module Smalang
     abstract def visit(node : UnsafeBlockNode) : Nil
     abstract def visit(node : CallStatementNode) : Nil
     abstract def visit(node : AllocateExpr) : Nil
+    abstract def visit(node : StackAllocateExpr) : Nil
+    abstract def visit(node : PointerOffsetExpr) : Nil
     abstract def visit(node : LoadExpr) : Nil
     abstract def visit(node : StoreExpr) : Nil
     abstract def visit(node : FreeExpr) : Nil
@@ -412,6 +430,18 @@ module Smalang
   end
 
   struct AllocateExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct StackAllocateExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct PointerOffsetExpr
     def accept(visitor : AstVisitor) : Nil
       visitor.visit(self)
     end
@@ -1132,6 +1162,10 @@ module Smalang
       expression_id = case @tokens.source_file.slice(callee)
                       when "alloc"
                         arena.add(AllocateExpr.new(call_span, arguments))
+                      when "alloc_stack"
+                        arena.add(StackAllocateExpr.new(call_span, arguments))
+                      when "offset"
+                        arena.add(PointerOffsetExpr.new(call_span, arguments))
                       when "load"
                         arena.add(LoadExpr.new(call_span, arguments))
                       when "store"

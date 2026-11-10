@@ -62,6 +62,14 @@ class ParserSpecVisitor < Smalang::AstVisitor
     @visited << :allocate
   end
 
+  def visit(node : Smalang::StackAllocateExpr) : Nil
+    @visited << :stack_allocate
+  end
+
+  def visit(node : Smalang::PointerOffsetExpr) : Nil
+    @visited << :pointer_offset
+  end
+
   def visit(node : Smalang::LoadExpr) : Nil
     @visited << :load
   end
@@ -157,6 +165,32 @@ describe Smalang::Parser do
     load = parsed.arena.node(parsed.arena.child(unsafe_block.statements, 2)).as(Smalang::VariableDeclarationNode)
     parsed.arena.node(load.initializer).should be_a(Smalang::LoadExpr)
     parsed.arena.node(parsed.arena.child(unsafe_block.statements, 3)).should be_a(Smalang::FreeStatementNode)
+  end
+
+  it "parses alloc_stack as a dedicated memory operation" do
+    result = ParserSpecHelpers.parse(
+      "def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(42)\n    return 0\n"
+    )
+
+    result.success?.should eq(true)
+    parsed = result.parsed_module
+    function = ParserSpecHelpers.function_at(parsed, 0)
+    unsafe_block = parsed.arena.node(parsed.arena.child(function.statements, 0)).as(Smalang::UnsafeBlockNode)
+    declaration = parsed.arena.node(parsed.arena.child(unsafe_block.statements, 0)).as(Smalang::VariableDeclarationNode)
+    parsed.arena.node(declaration.initializer).should be_a(Smalang::StackAllocateExpr)
+  end
+
+  it "parses offset as a dedicated memory operation" do
+    result = ParserSpecHelpers.parse(
+      "def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(42)\n        shifted: ptr[int] = offset(address, 1)\n    return 0\n"
+    )
+
+    result.success?.should eq(true)
+    parsed = result.parsed_module
+    function = ParserSpecHelpers.function_at(parsed, 0)
+    unsafe_block = parsed.arena.node(parsed.arena.child(function.statements, 0)).as(Smalang::UnsafeBlockNode)
+    declaration = parsed.arena.node(parsed.arena.child(unsafe_block.statements, 1)).as(Smalang::VariableDeclarationNode)
+    parsed.arena.node(declaration.initializer).should be_a(Smalang::PointerOffsetExpr)
   end
 
   it "rejects nested, empty, and returning unsafe blocks" do

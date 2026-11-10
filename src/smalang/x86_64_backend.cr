@@ -280,6 +280,52 @@ module Smalang
     end
   end
 
+  class MachineStackAllocate < MachineInstruction
+    getter instruction_id : InstructionId
+    getter result_id : ValueId
+    getter initial_value_id : ValueId
+    getter pointer_type : IrPointerType
+
+    def initialize(position : Int32, @instruction_id : InstructionId, @result_id : ValueId, @initial_value_id : ValueId, @pointer_type : IrPointerType)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@initial_value_id]
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_stack_allocate(self)
+    end
+  end
+
+  class MachinePointerOffset < MachineInstruction
+    getter result_id : ValueId
+    getter address_id : ValueId
+    getter index_id : ValueId
+    getter pointer_type : IrPointerType
+
+    def initialize(position : Int32, @result_id : ValueId, @address_id : ValueId, @index_id : ValueId, @pointer_type : IrPointerType)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@address_id, @index_id]
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_pointer_offset(self)
+    end
+  end
+
   class MachinePointerLoad < MachineInstruction
     getter result_id : ValueId
     getter address_id : ValueId
@@ -977,6 +1023,30 @@ module Smalang
       @instructions << MachineArrayLiteral.new(@instructions.size, result_id, array_type, instruction.elements)
     end
 
+    def visit(instruction : IrStackAllocateInstruction) : Nil
+      result_id = instruction.result_id
+      raise X86_64BackendFailure.new("stack allocation is missing its result") unless result_id
+      @instructions << MachineStackAllocate.new(
+        @instructions.size,
+        instruction.id,
+        result_id,
+        instruction.initial_value_id,
+        instruction.pointer_type
+      )
+    end
+
+    def visit(instruction : IrPointerOffsetInstruction) : Nil
+      result_id = instruction.result_id
+      raise X86_64BackendFailure.new("pointer offset is missing its result") unless result_id
+      @instructions << MachinePointerOffset.new(
+        @instructions.size,
+        result_id,
+        instruction.address_id,
+        instruction.index_id,
+        instruction.pointer_type
+      )
+    end
+
     def visit(instruction : IrLoadInstruction) : Nil
       result_id = instruction.result_id
       raise X86_64BackendFailure.new("pointer load is missing its result") unless result_id
@@ -1383,6 +1453,7 @@ module Smalang
     @argument_stage_offsets : Array(Int32)
     @array_offsets : Hash(ValueId, Int32)
     @array_sizes : Hash(ValueId, Int32)
+    @stack_allocation_offsets : Hash(InstructionId, Int32)
     @outgoing_stack_argument_count : Int32
 
     def initialize(function : IrFunction, spill_slot_count : Int32, argument_stage_count : Int32, @outgoing_stack_argument_count : Int32)
@@ -1398,6 +1469,7 @@ module Smalang
 
       @array_offsets = {} of ValueId => Int32
       @array_sizes = {} of ValueId => Int32
+      @stack_allocation_offsets = {} of InstructionId => Int32
       cursor = FIXED_FRAME_BYTES + (spill_slot_count + argument_stage_count + @outgoing_stack_argument_count) * 8
       function.value_count.times do |value_id|
         array_type = function.value_type(value_id).as?(IrArrayType)
@@ -1415,6 +1487,26 @@ module Smalang
         @array_offsets[value_id] = -end_offset
         @array_sizes[value_id] = size.to_i32
         cursor = end_offset
+      end
+      function.each_block do |block|
+        block.instruction_ids.each do |instruction_id|
+          instruction = function.instruction(instruction_id)
+          stack_allocation = instruction.as?(IrStackAllocateInstruction)
+          next unless stack_allocation
+          type = stack_allocation.pointer_type.pointee_type
+          size = type.storage_size || raise X86_64BackendFailure.new("stack allocation %i#{instruction_id} has an unrepresentable size")
+          raise X86_64BackendFailure.new("stack allocation %i#{instruction_id} is too large for a stack frame") if size > Int32::MAX
+          allocated_size = {size.to_i32, 1}.max
+          alignment = type.alignment.to_i32
+          end_offset_64 = cursor.to_i64 + allocated_size.to_i64
+          end_offset_64 = ((end_offset_64 + alignment - 1) // alignment) * alignment
+          if end_offset_64 > Int32::MAX
+            raise X86_64BackendFailure.new("stack allocations exceed x86_64 frame limits")
+          end
+          end_offset = end_offset_64.to_i32
+          @stack_allocation_offsets[instruction_id] = -end_offset
+          cursor = end_offset
+        end
       end
       frame_size_64 = ((cursor.to_i64 + 15) // 16) * 16
       raise X86_64BackendFailure.new("array stack frame exceeds x86_64 frame limits") if frame_size_64 > Int32::MAX
@@ -1471,6 +1563,10 @@ module Smalang
 
     def array_size(value_id : ValueId) : Int32
       @array_sizes[value_id]? || raise X86_64BackendFailure.new("missing stack size for array %v#{value_id}")
+    end
+
+    def stack_allocation_offset(instruction_id : InstructionId) : Int32
+      @stack_allocation_offsets[instruction_id]? || raise X86_64BackendFailure.new("missing frame slot for stack allocation %i#{instruction_id}")
     end
 
     def hidden_return_pointer_offset : Int32
@@ -2187,6 +2283,26 @@ module Smalang
       )
       normalize_integer_register(X86_64Register::Rax, value_type)
       location(load.result_id).store_from(@code, X86_64Register::Rax, @frame)
+    end
+
+    def emit_stack_allocate(allocation : MachineStackAllocate) : Nil
+      value_type = allocation.pointer_type.pointee_type
+      location(allocation.initial_value_id).load_to(@code, X86_64Register::Rax, @frame)
+      @code.move_rbp_from_register_sized(
+        @frame.stack_allocation_offset(allocation.instruction_id),
+        X86_64Register::Rax,
+        storage_size(value_type) * 8
+      )
+      @code.lea_rbp_relative(X86_64Register::Rax, @frame.stack_allocation_offset(allocation.instruction_id))
+      location(allocation.result_id).store_from(@code, X86_64Register::Rax, @frame)
+    end
+
+    def emit_pointer_offset(offset : MachinePointerOffset) : Nil
+      location(offset.address_id).load_to(@code, X86_64Register::Rax, @frame)
+      location(offset.index_id).load_to(@code, X86_64Register::R10, @frame)
+      scale_index(offset.pointer_type.pointee_type, X86_64Register::R10)
+      @code.add_register(X86_64Register::Rax, X86_64Register::R10)
+      location(offset.result_id).store_from(@code, X86_64Register::Rax, @frame)
     end
 
     def emit_pointer_store(store : MachinePointerStore) : Nil

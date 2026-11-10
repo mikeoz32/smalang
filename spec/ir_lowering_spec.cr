@@ -35,6 +35,69 @@ module IrLoweringSpecHelpers
 end
 
 describe Smalang::IrLowerer do
+  it "allocates initialized scalar storage in the stack frame" do
+    source = File.read("#{__DIR__}/../examples/unsafe_stack_allocation.py")
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    Smalang::IrSExpressionDumper.new.dump(ir).should contain("(stack.alloc")
+    BackendSpecHelpers.link_and_run(ir).should eq(72)
+  end
+
+  it "runs stack allocation round trips for every supported scalar type" do
+    source = File.read("#{__DIR__}/../examples/unsafe_stack_allocation_scalars.py")
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    dump = Smalang::IrSExpressionDumper.new.dump(ir)
+    dump.lines.count(&.includes?("(stack.alloc")).should eq(11)
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "uses the declared memory width for stack-allocated scalar values" do
+    source = "def main() -> int:\n    unsafe:\n        flag_address: ptr[bool] = alloc_stack(True)\n        byte_address: ptr[int8] = alloc_stack(42)\n        store(flag_address, False)\n        flag: bool = load(flag_address)\n        value: int8 = load(byte_address)\n    return match flag:\n        case True: 0\n        case False: 42\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "evaluates a stack allocation initializer once" do
+    source = "def increment(address: ptr[int]) -> int:\n    unsafe:\n        value: int = load(address) + 1\n        store(address, value)\n    return value\n\ndef main() -> int:\n    unsafe:\n        counter: ptr[int] = alloc_stack(40)\n        copy: ptr[int] = alloc_stack(increment(counter))\n        counter_value: int = load(counter)\n        copy_value: int = load(copy)\n    return counter_value + copy_value\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(82)
+  end
+
+  it "computes typed pointer offsets and passes a one-past address without dereferencing it" do
+    source = File.read("#{__DIR__}/../examples/unsafe_pointer_offsets.py")
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "evaluates pointer offset arguments once in source order" do
+    source = "def mark_address(counter: ptr[uint], target: ptr[int]) -> ptr[int]:\n    unsafe:\n        current: uint = load(counter)\n        store(counter, current + 1)\n    return target\n\ndef mark_index(counter: ptr[uint]) -> uint:\n    unsafe:\n        current: uint = load(counter)\n        store(counter, current + 1)\n    return current\n\ndef main() -> int:\n    unsafe:\n        counter: ptr[uint] = alloc_stack(0)\n        first: ptr[int] = alloc_stack(41)\n        second: ptr[int] = alloc_stack(42)\n        third: ptr[int] = alloc_stack(43)\n        shifted: ptr[int] = offset(mark_address(counter, third), mark_index(counter))\n        value: int = load(shifted)\n    return value\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
   it "lowers and runs a scalar pointer allocation, store, load, and free" do
     source = "def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc(42)\n        store(address, 17)\n        result: int = load(address)\n        free(address)\n    return result\n"
     result = IrLoweringSpecHelpers.lower(source)

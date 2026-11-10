@@ -45,12 +45,60 @@ describe Smalang::SemanticAnalyzer do
     result.success?.should eq(true)
   end
 
+  it "checks stack allocation type, arity, and unsafe context" do
+    accepted = SemanticSpecHelpers.analyze(
+      "def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(42)\n        store(address, 17)\n        result: int = load(address)\n    return result\n"
+    )
+    accepted.success?.should eq(true)
+
+    invalid_programs = [
+      {"def shift(address: ptr[int], index: uint) -> ptr[int]:\n    return offset(address, index)\n\ndef main() -> int:\n    return 0\n", "unsafe operation 'offset' requires an unsafe block"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack()\n    return 0\n", "alloc_stack expects 1 argument, got 0"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(1, 2)\n    return 0\n", "alloc_stack expects 1 argument, got 2"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(True)\n    return 0\n", "alloc_stack value has type bool, expected int"},
+      {"def main() -> int:\n    value: int = 42\n    unsafe:\n        address: ptr[uint] = alloc_stack(value)\n    return 0\n", "alloc_stack value has type int, expected uint"},
+      {"def main() -> int:\n    unsafe:\n        source: ptr[int] = alloc(1)\n        address: ptr[int] = alloc_stack(source)\n    return 0\n", "alloc_stack supports scalar values only"},
+      {"def alloc_stack(value: int) -> int:\n    return value\n\ndef main() -> int:\n    return 0\n", "function name 'alloc_stack' is reserved for an unsafe memory operation"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.description.should eq(expected_message)
+    end
+  end
+
+  it "checks pointer offset types, arity, and unsafe context" do
+    accepted = SemanticSpecHelpers.analyze(
+      "def main() -> int:\n    unsafe:\n        address: ptr[int8] = alloc_stack(42)\n        shifted: ptr[int8] = offset(address, 1)\n    return 0\n"
+    )
+    accepted.success?.should eq(true)
+
+    invalid_programs = [
+      {"def main() -> int:\n    address: ptr[int] = alloc_stack(42)\n    return 0\n", "unsafe operation 'alloc_stack' requires an unsafe block"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(42)\n        shifted: ptr[int] = offset(address)\n    return 0\n", "offset expects 2 arguments, got 1"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(42)\n        shifted: ptr[int] = offset(address, 1, 2)\n    return 0\n", "offset expects 2 arguments, got 3"},
+      {"def main() -> int:\n    unsafe:\n        value: int = 42\n        shifted: ptr[int] = offset(value, 1)\n    return 0\n", "offset requires ptr[T], got int"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(42)\n        index: int = 1\n        shifted: ptr[int] = offset(address, index)\n    return 0\n", "offset index has type int, expected uint"},
+      {"def offset(address: ptr[int], index: uint) -> ptr[int]:\n    return address\n\ndef main() -> int:\n    return 0\n", "function name 'offset' is reserved for an unsafe memory operation"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.description.should eq(expected_message)
+    end
+  end
+
   it "rejects raw memory operations outside an unsafe block" do
     invalid_programs = [
       {"def main() -> int:\n    address: ptr[int] = alloc(42)\n    return 0\n", "alloc"},
       {"def read(address: ptr[int]) -> int:\n    value: int = load(address)\n    return value\n\ndef main() -> int:\n    return 0\n", "load"},
       {"def write(address: ptr[int]) -> int:\n    store(address, 1)\n    return 0\n\ndef main() -> int:\n    return 0\n", "store"},
       {"def release(address: ptr[int]) -> int:\n    free(address)\n    return 0\n\ndef main() -> int:\n    return 0\n", "free"},
+      {"def shift(address: ptr[int]) -> ptr[int]:\n    return offset(address, 1)\n\ndef main() -> int:\n    return 0\n", "offset"},
     ]
 
     invalid_programs.each do |source, operation|

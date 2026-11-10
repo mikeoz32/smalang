@@ -112,6 +112,82 @@ describe Smalang::IrModule do
     end
   end
 
+  it "rejects stack allocation with an initial value of the wrong scalar type" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("invalid", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    value = function.emit_constant(function.entry_block_id, Smalang::IrType::Isize, 7)
+    pointer_type = Smalang::IrPointerType.new(Smalang::IrType::Int8)
+    function.emit_stack_allocate(function.entry_block_id, value, pointer_type)
+    function.emit_return(function.entry_block_id, value)
+
+    ir.verify.join("\n").should contain("stack.alloc value has type isize, expected int8")
+  end
+
+  it "rejects stack allocation with a non-scalar pointee type" do
+    pointer_types = [
+      Smalang::IrPointerType.new(Smalang::IrType::Unit),
+      Smalang::IrPointerType.new(Smalang::IrArrayType.new(Smalang::IrType::Isize, 2_u128)),
+    ]
+
+    pointer_types.each do |pointer_type|
+      ir = Smalang::IrModule.new
+      function = ir.add_function("invalid", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+      value = function.emit_constant(function.entry_block_id, Smalang::IrType::Isize, 7)
+      function.emit_stack_allocate(function.entry_block_id, value, pointer_type)
+      function.emit_return(function.entry_block_id, value)
+
+      ir.verify.join("\n").should contain("stack.alloc pointer type #{pointer_type.label} has an unsupported pointee")
+    end
+  end
+
+  it "represents typed pointer offsets in s notation for each scalar storage width" do
+    ir = Smalang::IrModule.new
+    pointer_types = [
+      Smalang::IrPointerType.new(Smalang::IrType::Bool),
+      Smalang::IrPointerType.new(Smalang::IrType::Int16),
+      Smalang::IrPointerType.new(Smalang::IrType::Int32),
+      Smalang::IrPointerType.new(Smalang::IrType::Int64),
+    ] of Smalang::IrType
+    parameter_types = pointer_types.dup
+    parameter_types << Smalang::IrType::Usize
+    function = ir.add_function("offsets", parameter_types, pointer_types.last)
+    index = function.parameters.last.value_id
+    result = nil.as(Smalang::ValueId?)
+
+    pointer_types.each_with_index do |pointer_type, index_in_types|
+      result = function.emit_pointer_offset(
+        function.entry_block_id,
+        function.parameters[index_in_types].value_id,
+        index,
+        pointer_type.as(Smalang::IrPointerType)
+      )
+    end
+    function.emit_return(function.entry_block_id, result.not_nil!)
+
+    dump = Smalang::IrSExpressionDumper.new.dump(ir)
+    dump.should contain("(offset %v0 %v4)")
+    dump.should contain("(offset %v1 %v4)")
+    dump.should contain("(offset %v2 %v4)")
+    dump.should contain("(offset %v3 %v4)")
+    ir.verify.should be_empty
+  end
+
+  it "rejects pointer offsets with an integer address or a signed index" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("invalid", [Smalang::IrType::Isize, Smalang::IrType::Isize], Smalang::IrPointerType.new(Smalang::IrType::Isize))
+    result = function.emit_pointer_offset(
+      function.entry_block_id,
+      function.parameters[0].value_id,
+      function.parameters[1].value_id,
+      Smalang::IrPointerType.new(Smalang::IrType::Isize)
+    )
+    function.emit_return(function.entry_block_id, result)
+
+    diagnostics = ir.verify.join("\n")
+    diagnostics.should contain("offset address has type isize, expected ptr[isize]")
+    diagnostics.should contain("offset index has type isize, expected usize")
+  end
+
   it "represents and dumps the first-slice program as typed SSA" do
     ir = Smalang::IrModule.new
     increment = ir.add_function(

@@ -163,6 +163,12 @@ module Smalang
     def visit(node : AllocateExpr) : Nil
     end
 
+    def visit(node : StackAllocateExpr) : Nil
+    end
+
+    def visit(node : PointerOffsetExpr) : Nil
+    end
+
     def visit(node : LoadExpr) : Nil
     end
 
@@ -394,6 +400,14 @@ module Smalang
 
     def visit(node : AllocateExpr) : Nil
       lower_allocation(node)
+    end
+
+    def visit(node : StackAllocateExpr) : Nil
+      lower_stack_allocation(node)
+    end
+
+    def visit(node : PointerOffsetExpr) : Nil
+      lower_pointer_offset(node)
     end
 
     def visit(node : LoadExpr) : Nil
@@ -677,6 +691,48 @@ module Smalang
       function.emit_resume_exception(unwind_block, result.exception_id)
       @current_block_id = normal_block
       @expression_value_id = result.value_id
+    end
+
+    private def lower_stack_allocation(node : StackAllocateExpr) : Nil
+      value_node_id = @context.parsed_module.arena.child(node.arguments, 0)
+      value_id = lower_expression(value_node_id)
+      return unless value_id
+
+      result_type_id = @context.type_of(current_node_id)
+      return unless result_type_id
+      pointer_type = pointer_ir_type(result_type_id, node.span)
+      return unless pointer_type
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "alloc_stack is not inside a function")
+        return
+      end
+
+      @expression_value_id = function.emit_stack_allocate(current_block_id, value_id, pointer_type)
+    end
+
+    private def lower_pointer_offset(node : PointerOffsetExpr) : Nil
+      address_node_id = @context.parsed_module.arena.child(node.arguments, 0)
+      address_id = lower_expression(address_node_id)
+      return unless address_id
+
+      index_node_id = @context.parsed_module.arena.child(node.arguments, 1)
+      index_id = lower_expression(index_node_id)
+      return unless index_id
+
+      address_type_id = @context.type_of(address_node_id)
+      return unless address_type_id
+      pointer_type = pointer_ir_type(address_type_id, node.span)
+      return unless pointer_type
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "offset is not inside a function")
+        return
+      end
+
+      @expression_value_id = function.emit_pointer_offset(current_block_id, address_id, index_id, pointer_type)
     end
 
     private def lower_load(node : LoadExpr) : Nil
