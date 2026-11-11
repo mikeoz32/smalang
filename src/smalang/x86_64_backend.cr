@@ -1625,7 +1625,7 @@ module Smalang
       @stack_allocation_offsets = {} of InstructionId => Int32
       @stack_storage_offsets = {} of InstructionId => Int32
       @stack_storage_reserved_sizes = {} of InstructionId => Int32
-      cursor = FIXED_FRAME_BYTES + (spill_slot_count + argument_stage_count + @outgoing_stack_argument_count) * 8
+      cursor = FIXED_FRAME_BYTES + (spill_slot_count + argument_stage_count) * 8
       function.value_count.times do |value_id|
         array_type = function.value_type(value_id).as?(IrArrayType)
         next unless array_type
@@ -1685,7 +1685,7 @@ module Smalang
           cursor = end_offset
         end
       end
-      frame_size_64 = ((cursor.to_i64 + 15) // 16) * 16
+      frame_size_64 = ((cursor.to_i64 + @outgoing_stack_argument_count.to_i64 * 8 + 15) // 16) * 16
       raise X86_64BackendFailure.new("stack frame exceeds x86_64 frame limits") if frame_size_64 > Int32::MAX
       @frame_size = frame_size_64.to_i32
     end
@@ -2551,13 +2551,14 @@ module Smalang
     def emit_heap_free(release : MachineHeapFree) : Nil
       spills = @allocation.call_spills_at(release.position)
       save_call_spills(spills)
-      location(release.address_id).load_to(@code, X86_64Register::Rdi, @frame)
-      @code.move_register_from_memory(X86_64Register::R10, X86_64Register::Rdi, -HeapStorageLayout::MAPPING_HEADER_BYTES.to_i32)
-      location(release.byte_size_id).load_to(@code, X86_64Register::Rsi, @frame)
+
+      location(release.address_id).load_to(@code, X86_64Register::R10, @frame)
+      location(release.byte_size_id).load_to(@code, X86_64Register::Rax, @frame)
+      @code.move_register_from_memory(X86_64Register::Rdi, X86_64Register::R10, -HeapStorageLayout::MAPPING_HEADER_BYTES.to_i32)
       @code.move_immediate(X86_64Register::R11, release.alignment - 1_u64)
-      @code.add_register(X86_64Register::Rsi, X86_64Register::R11)
-      @code.add_immediate_register(X86_64Register::Rsi, HeapStorageLayout::MAPPING_HEADER_BYTES.to_i32)
-      @code.move_register(X86_64Register::Rdi, X86_64Register::R10)
+      @code.add_register(X86_64Register::Rax, X86_64Register::R11)
+      @code.add_immediate_register(X86_64Register::Rax, HeapStorageLayout::MAPPING_HEADER_BYTES.to_i32)
+      @code.move_register(X86_64Register::Rsi, X86_64Register::Rax)
       @code.move_immediate(X86_64Register::Rax, X86_64RuntimeEmitter::UNMAP_SYSCALL)
       @code.emit_syscall
       restore_call_spills(spills)

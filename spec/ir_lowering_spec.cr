@@ -268,6 +268,23 @@ describe Smalang::IrLowerer do
     runtime[:stderr].should contain("Uncaught exception: OutOfMemory")
   end
 
+  it "preserves stack storage across calls with outgoing stack arguments" do
+    source = "def sum8(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int) -> int:\n    return g + h\n\ndef main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(8, 8)\n        value: ptr[int] = cast[int](storage)\n        store(value, 42)\n        _sum: int = sum8(1, 2, 3, 4, 5, 6, 7, 8)\n        result: int = load(value)\n    return result\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    BackendSpecHelpers.link_and_run(result.ir_module.not_nil!).should eq(42)
+  end
+
+  it "releases heap storage when bytes and address use overlapping syscall registers" do
+    source = "def release(a: int, b: int, c: int, bytes: uint, address: ptr[uint8]) -> int:\n    unsafe:\n        heap_free(address, bytes, 8)\n    return 0\n\ndef main() -> int:\n    bytes: uint = 8388608\n    unsafe:\n        first: ptr[uint8] = heap_storage(bytes, 8)\n        _released: int = release(1, 2, 3, bytes, first)\n        second: ptr[uint8] = heap_storage(bytes, 8)\n        heap_free(second, bytes, 8)\n    return 42\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    runtime = BackendSpecHelpers.link_and_capture(result.ir_module.not_nil!, 12 * 1024)
+    runtime[:exit_code].should eq(42)
+  end
+
   it "passes allocated pointers through function parameters and results" do
     source = "def allocate(value: int) -> ptr[int]:\n    unsafe:\n        address: ptr[int] = alloc(value)\n    return address\n\ndef read_and_free(address: ptr[int]) -> int:\n    unsafe:\n        result: int = load(address)\n        free(address)\n    return result\n\ndef main() -> int:\n    address: ptr[int] = allocate(42)\n    return read_and_free(address)\n"
     result = IrLoweringSpecHelpers.lower(source)

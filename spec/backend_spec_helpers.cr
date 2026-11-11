@@ -6,6 +6,69 @@ module BackendSpecHelpers
     link_and_capture(ir)[:exit_code]
   end
 
+  def self.link_and_check_heap_pointer_alignment(ir : Smalang::IrModule, alignment : UInt64) : Int32
+    base_path = File.join(Dir.tempdir, "smalang-heap-alignment-#{Process.pid}")
+    object_path = "#{base_path}.o"
+    assembly_path = "#{base_path}.s"
+    harness_path = "#{base_path}-harness.o"
+    executable_path = "#{base_path}-harness"
+    assembly = <<-ASM
+      .section .text
+      .global _check_alignment
+      .type _check_alignment, @function
+      .extern __smalang_user_main
+    _check_alignment:
+      xor %r15, %r15
+      call __smalang_user_main
+      test %rdx, %rdx
+      jne .Lalignment_failure
+      movabs $#{alignment - 1_u64}, %r10
+      test %r10, %rax
+      jne .Lalignment_failure
+      xor %rdi, %rdi
+      jmp .Lalignment_exit
+    .Lalignment_failure:
+      mov $1, %rdi
+    .Lalignment_exit:
+      mov $60, %rax
+      syscall
+    ASM
+
+    begin
+      object_bytes = Smalang::X86_64Backend.new.emit(ir)
+      File.write(object_path, String.new(object_bytes.to_unsafe, object_bytes.size))
+      File.write(assembly_path, assembly)
+
+      assembler_error = IO::Memory.new
+      assembler_status = Process.run(
+        "as",
+        ["--64", "-o", harness_path, assembly_path],
+        output: Process::Redirect::Close,
+        error: assembler_error
+      )
+      raise "assembler failed for heap alignment check: #{assembler_error}" unless assembler_status.success?
+
+      linker_error = IO::Memory.new
+      linker_status = Process.run(
+        "ld",
+        ["-e", "_check_alignment", object_path, harness_path, "-o", executable_path],
+        output: Process::Redirect::Close,
+        error: linker_error
+      )
+      raise "ld failed for heap alignment check: #{linker_error}" unless linker_status.success?
+
+      Process.run(
+        executable_path,
+        output: Process::Redirect::Close,
+        error: Process::Redirect::Close
+      ).exit_code
+    ensure
+      [object_path, assembly_path, harness_path, executable_path].each do |path|
+        File.delete(path) if File.exists?(path)
+      end
+    end
+  end
+
   def self.link_and_capture(
     ir : Smalang::IrModule,
     virtual_memory_limit_kib : Int32? = nil,

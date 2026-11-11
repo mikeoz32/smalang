@@ -96,6 +96,23 @@ describe "Smalang generated exception runtime" do
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
 
+  it "returns heap storage addresses aligned to the requested boundary" do
+    [1_u64, 2_u64, 8_u64, 16_u64, 64_u64, 4096_u64, 8192_u64].each do |alignment|
+      ir = Smalang::IrModule.new
+      main = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrPointerType.new(Smalang::IrType::UInt8))
+      entry = main.entry_block_id
+      normal = main.add_block("normal")
+      failed = main.add_block("failed")
+      bytes = main.emit_constant(entry, Smalang::IrType::Usize, 13)
+      allocation = main.emit_invoke_heap_storage(entry, bytes, alignment, normal, failed)
+      main.emit_return(normal, allocation.value_id)
+      main.emit_resume_exception(failed, allocation.exception_id)
+
+      ir.verify.should be_empty
+      BackendSpecHelpers.link_and_check_heap_pointer_alignment(ir, alignment).should eq(0)
+    end
+  end
+
   it "keeps a user function named _start local to the generated entry point" do
     ir = Smalang::IrModule.new
     user_function = ir.add_function("_start", Array(Smalang::IrType).new, Smalang::IrType::Isize)
