@@ -1,3 +1,5 @@
+require "./heap_storage_layout"
+
 module Smalang
   module X86_64RuntimeSymbols
     ENTRY               = -1
@@ -6,6 +8,7 @@ module Smalang
     REPORT_UNCAUGHT     = -4
     INDEX_OUT_OF_BOUNDS = -5
     OUT_OF_MEMORY       = -6
+    INVALID_ARGUMENT    = -7
   end
 
   class X86_64BackendFailure < Exception
@@ -439,6 +442,33 @@ module Smalang
     end
   end
 
+  class MachineHeapFree < MachineInstruction
+    getter result_id : ValueId
+    getter address_id : ValueId
+    getter byte_size_id : ValueId
+    getter alignment : UInt64
+
+    def initialize(position : Int32, @result_id : ValueId, @address_id : ValueId, @byte_size_id : ValueId, @alignment : UInt64)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@address_id, @byte_size_id]
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def call_boundary? : Bool
+      true
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_heap_free(self)
+    end
+  end
+
   class MachineAllocate < MachineInstruction
     getter result_id : ValueId
     getter exception_id : ValueId
@@ -477,6 +507,47 @@ module Smalang
 
     def emit(context : X86_64EmissionContext) : Nil
       context.emit_allocate(self)
+    end
+  end
+
+  class MachineHeapStorage < MachineInstruction
+    getter result_id : ValueId
+    getter exception_id : ValueId
+    getter byte_size_id : ValueId
+    getter alignment : UInt64
+    getter normal_successor_label : Int32
+    getter exception_successor_label : Int32
+
+    def initialize(
+      position : Int32,
+      @result_id : ValueId,
+      @exception_id : ValueId,
+      @byte_size_id : ValueId,
+      @alignment : UInt64,
+      @normal_successor_label : Int32,
+      @exception_successor_label : Int32,
+    )
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@byte_size_id]
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def defined_value_ids : Array(ValueId)
+      [@result_id, @exception_id]
+    end
+
+    def call_boundary? : Bool
+      true
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_heap_storage(self)
     end
   end
 
@@ -1128,6 +1199,12 @@ module Smalang
       @instructions << MachinePointerFree.new(@instructions.size, instruction.address_id, instruction.pointer_type)
     end
 
+    def visit(instruction : IrHeapFreeInstruction) : Nil
+      result_id = instruction.result_id
+      raise X86_64BackendFailure.new("heap.free is missing its unit result") unless result_id
+      @instructions << MachineHeapFree.new(@instructions.size, result_id, instruction.address_id, instruction.byte_size_id, instruction.alignment)
+    end
+
     def visit(instruction : IrAddInstruction) : Nil
       append_binary(instruction, MachineAddOperation.new)
     end
@@ -1193,6 +1270,18 @@ module Smalang
         instruction.exception_result_id,
         operation.initial_value_id,
         operation.pointer_type,
+        target_label(instruction.block_id, instruction.normal_successor),
+        target_label(instruction.block_id, instruction.exception_successor)
+      )
+    end
+
+    def visit(operation : IrHeapStorageOperation, instruction : IrInvokeInstruction) : Nil
+      @instructions << MachineHeapStorage.new(
+        @instructions.size,
+        instruction.normal_result_id,
+        instruction.exception_result_id,
+        operation.byte_size_id,
+        operation.alignment,
         target_label(instruction.block_id, instruction.normal_successor),
         target_label(instruction.block_id, instruction.exception_successor)
       )
@@ -1854,6 +1943,18 @@ module Smalang
       write_modrm(0b11_u8, source, destination)
     end
 
+    def and_register(destination : X86_64Register, source : X86_64Register) : Nil
+      write_rex(true, source, destination)
+      @buffer.write_u8(0x21_u8)
+      write_modrm(0b11_u8, source, destination)
+    end
+
+    def not_register(register : X86_64Register) : Nil
+      write_rex(true, X86_64Register::Rax, register)
+      @buffer.write_u8(0xf7_u8)
+      @buffer.write_u8(0xd0_u8 | register.code)
+    end
+
     def add_immediate_register(register : X86_64Register, value : Int32) : Nil
       write_rex(true, X86_64Register::Rax, register)
       @buffer.write_u8(0x81_u8)
@@ -2004,6 +2105,11 @@ module Smalang
 
     def jump_if_above_or_equal_to(label : Int32) : Nil
       @buffer.write_bytes([0x0f_u8, 0x83_u8])
+      record_branch_fixup(label)
+    end
+
+    def jump_if_below_to(label : Int32) : Nil
+      @buffer.write_bytes([0x0f_u8, 0x82_u8])
       record_branch_fixup(label)
     end
 
@@ -2442,6 +2548,21 @@ module Smalang
       restore_call_spills(spills)
     end
 
+    def emit_heap_free(release : MachineHeapFree) : Nil
+      spills = @allocation.call_spills_at(release.position)
+      save_call_spills(spills)
+      location(release.address_id).load_to(@code, X86_64Register::Rdi, @frame)
+      @code.move_register_from_memory(X86_64Register::R10, X86_64Register::Rdi, -HeapStorageLayout::MAPPING_HEADER_BYTES.to_i32)
+      location(release.byte_size_id).load_to(@code, X86_64Register::Rsi, @frame)
+      @code.move_immediate(X86_64Register::R11, release.alignment - 1_u64)
+      @code.add_register(X86_64Register::Rsi, X86_64Register::R11)
+      @code.add_immediate_register(X86_64Register::Rsi, HeapStorageLayout::MAPPING_HEADER_BYTES.to_i32)
+      @code.move_register(X86_64Register::Rdi, X86_64Register::R10)
+      @code.move_immediate(X86_64Register::Rax, X86_64RuntimeEmitter::UNMAP_SYSCALL)
+      @code.emit_syscall
+      restore_call_spills(spills)
+    end
+
     def emit_allocate(allocation : MachineAllocate) : Nil
       spills = @allocation.call_spills_at(allocation.position)
       save_call_spills(spills)
@@ -2476,6 +2597,76 @@ module Smalang
       @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_exception_offset)
       location(allocation.exception_id).store_from(@code, X86_64Register::Rax, @frame)
       @code.jump_to(allocation.normal_successor_label)
+
+      @code.mark_label(allocation_failed)
+      call_runtime(X86_64RuntimeSymbols::OUT_OF_MEMORY)
+      @code.move_rbp_from_register(@frame.invoke_exception_offset, X86_64Register::Rax)
+      restore_call_spills(spills)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_exception_offset)
+      location(allocation.exception_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.jump_to(allocation.exception_successor_label)
+    end
+
+    def emit_heap_storage(allocation : MachineHeapStorage) : Nil
+      spills = @allocation.call_spills_at(allocation.position)
+      save_call_spills(spills)
+
+      invalid_argument = @code.new_label
+      allocation_failed = @code.new_label
+
+      location(allocation.byte_size_id).load_to(@code, X86_64Register::Rsi, @frame)
+      @code.test_register(X86_64Register::Rsi)
+      @code.jump_if_zero_to(invalid_argument)
+
+      @code.move_register(X86_64Register::R10, X86_64Register::Rsi)
+      @code.move_immediate(X86_64Register::R11, allocation.alignment - 1_u64)
+      @code.add_register(X86_64Register::Rsi, X86_64Register::R11)
+      @code.compare_registers(X86_64Register::Rsi, X86_64Register::R10)
+      @code.jump_if_below_to(invalid_argument)
+
+      @code.move_register(X86_64Register::R10, X86_64Register::Rsi)
+      @code.add_immediate_register(X86_64Register::Rsi, HeapStorageLayout::MAPPING_HEADER_BYTES.to_i32)
+      @code.compare_registers(X86_64Register::Rsi, X86_64Register::R10)
+      @code.jump_if_below_to(invalid_argument)
+
+      @code.move_immediate(X86_64Register::Rax, X86_64RuntimeEmitter::MAP_SYSCALL)
+      @code.xor_register(X86_64Register::Rdi)
+      @code.move_immediate(X86_64Register::Rdx, 3_u64)
+      @code.move_immediate(X86_64Register::R10, 0x22_u64)
+      @code.move_immediate(X86_64Register::R8, UInt64::MAX)
+      @code.xor_register(X86_64Register::R9)
+      @code.emit_syscall
+      @code.test_register(X86_64Register::Rax)
+      @code.jump_if_sign_to(allocation_failed)
+
+      @code.move_register(X86_64Register::R10, X86_64Register::Rax)
+      @code.add_immediate_register(X86_64Register::Rax, HeapStorageLayout::MAPPING_HEADER_BYTES.to_i32)
+      @code.move_immediate(X86_64Register::R11, allocation.alignment - 1_u64)
+      @code.add_register(X86_64Register::Rax, X86_64Register::R11)
+      @code.not_register(X86_64Register::R11)
+      @code.and_register(X86_64Register::Rax, X86_64Register::R11)
+      @code.move_memory_from_register(
+        X86_64Register::Rax,
+        -HeapStorageLayout::MAPPING_HEADER_BYTES.to_i32,
+        X86_64Register::R10
+      )
+      @code.move_rbp_from_register(@frame.invoke_normal_result_offset, X86_64Register::Rax)
+      @code.xor_register(X86_64Register::Rax)
+      @code.move_rbp_from_register(@frame.invoke_exception_offset, X86_64Register::Rax)
+      restore_call_spills(spills)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_normal_result_offset)
+      location(allocation.result_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_exception_offset)
+      location(allocation.exception_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.jump_to(allocation.normal_successor_label)
+
+      @code.mark_label(invalid_argument)
+      call_runtime(X86_64RuntimeSymbols::INVALID_ARGUMENT)
+      @code.move_rbp_from_register(@frame.invoke_exception_offset, X86_64Register::Rax)
+      restore_call_spills(spills)
+      @code.move_register_from_rbp(X86_64Register::Rax, @frame.invoke_exception_offset)
+      location(allocation.exception_id).store_from(@code, X86_64Register::Rax, @frame)
+      @code.jump_to(allocation.exception_successor_label)
 
       @code.mark_label(allocation_failed)
       call_runtime(X86_64RuntimeSymbols::OUT_OF_MEMORY)
@@ -2667,6 +2858,8 @@ module Smalang
         2
       when IrExceptionKind::OutOfMemory
         3
+      when IrExceptionKind::InvalidArgument
+        4
       else
         raise X86_64BackendFailure.new("unsupported exception kind #{kind}")
       end
@@ -2805,6 +2998,7 @@ module Smalang
     EXCEPTION_KIND_DIVISION_BY_ZERO     =        1
     EXCEPTION_KIND_INDEX_OUT_OF_BOUNDS  =        2
     EXCEPTION_KIND_OUT_OF_MEMORY        =        3
+    EXCEPTION_KIND_INVALID_ARGUMENT     =        4
     EXCEPTION_RECORD_KIND_OFFSET        =        0
     EXCEPTION_RECORD_SUPPRESSED_OFFSET  =        8
     EXCEPTION_RECORD_FRAME_COUNT_OFFSET =       16
@@ -2813,7 +3007,14 @@ module Smalang
     MAX_EXCEPTION_FRAMES                =       64
 
     def emit : Array(EmittedFunction)
-      [emit_division_by_zero, emit_index_out_of_bounds, emit_out_of_memory, emit_release, emit_report_uncaught]
+      [
+        emit_division_by_zero,
+        emit_index_out_of_bounds,
+        emit_out_of_memory,
+        emit_invalid_argument,
+        emit_release,
+        emit_report_uncaught,
+      ]
     end
 
     private def emit_division_by_zero : EmittedFunction
@@ -2837,6 +3038,14 @@ module Smalang
         X86_64RuntimeSymbols::OUT_OF_MEMORY,
         "__smalang_new_out_of_memory",
         EXCEPTION_KIND_OUT_OF_MEMORY
+      )
+    end
+
+    private def emit_invalid_argument : EmittedFunction
+      emit_exception_constructor(
+        X86_64RuntimeSymbols::INVALID_ARGUMENT,
+        "__smalang_new_invalid_argument",
+        EXCEPTION_KIND_INVALID_ARGUMENT
       )
     end
 
@@ -3014,6 +3223,7 @@ module Smalang
       unknown_kind = code.new_label
       index_out_of_bounds = code.new_label
       out_of_memory = code.new_label
+      invalid_argument = code.new_label
       done = code.new_label
       code.move_register_from_memory(X86_64Register::Rcx, X86_64Register::R12, EXCEPTION_RECORD_KIND_OFFSET)
       code.compare_register_immediate(X86_64Register::Rcx, EXCEPTION_KIND_DIVISION_BY_ZERO)
@@ -3027,8 +3237,13 @@ module Smalang
       code.jump_to(done)
       code.mark_label(out_of_memory)
       code.compare_register_immediate(X86_64Register::Rcx, EXCEPTION_KIND_OUT_OF_MEMORY)
-      code.jump_if_not_equal_to(unknown_kind)
+      code.jump_if_not_equal_to(invalid_argument)
       strings.write("OutOfMemory\n")
+      code.jump_to(done)
+      code.mark_label(invalid_argument)
+      code.compare_register_immediate(X86_64Register::Rcx, EXCEPTION_KIND_INVALID_ARGUMENT)
+      code.jump_if_not_equal_to(unknown_kind)
+      strings.write("InvalidArgument\n")
       code.jump_to(done)
       code.mark_label(unknown_kind)
       strings.write("Unknown\n")

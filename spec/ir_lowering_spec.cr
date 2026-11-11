@@ -217,6 +217,57 @@ describe Smalang::IrLowerer do
     BackendSpecHelpers.link_and_run(ir).should eq(17)
   end
 
+  it "allocates, frees, and reallocates aligned raw heap storage" do
+    source = File.read("#{__DIR__}/../examples/unsafe_heap_storage.py")
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    instructions = IrLoweringSpecHelpers.instructions(ir.function(0).not_nil!)
+    allocation = instructions.find { |instruction| instruction.is_a?(Smalang::IrInvokeInstruction) && instruction.operation.is_a?(Smalang::IrHeapStorageOperation) }.as(Smalang::IrInvokeInstruction)
+    allocation.operation.memory_effects.allocates.should eq(true)
+    release = instructions.find(&.is_a?(Smalang::IrHeapFreeInstruction)).as(Smalang::IrHeapFreeInstruction)
+    release.result_type.should eq(Smalang::IrType::Unit)
+    release.memory_effects.frees.should eq(true)
+    dump = Smalang::IrSExpressionDumper.new.dump(ir)
+    dump.should contain("(heap.storage")
+    dump.should contain("(heap.free")
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "raises InvalidArgument for a runtime zero heap storage size" do
+    source = "def allocate(bytes: uint) -> ptr[uint8]:\n    unsafe:\n        address: ptr[uint8] = heap_storage(bytes, 16)\n    return address\n\ndef main() -> int:\n    address: ptr[uint8] = allocate(0)\n    return 0\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    runtime = BackendSpecHelpers.link_and_capture(result.ir_module.not_nil!)
+    runtime[:exit_code].should eq(1)
+    runtime[:stderr].should contain("Uncaught exception: InvalidArgument")
+    runtime[:stderr].should contain("at allocate (ir_lowering_spec.py:")
+  end
+
+  it "raises InvalidArgument when heap storage padding overflows at runtime" do
+    source = "def allocate(bytes: uint) -> ptr[uint8]:\n    unsafe:\n        address: ptr[uint8] = heap_storage(bytes, 8)\n    return address\n\ndef main() -> int:\n    address: ptr[uint8] = allocate(18446744073709551608)\n    return 0\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    runtime = BackendSpecHelpers.link_and_capture(result.ir_module.not_nil!)
+    runtime[:exit_code].should eq(1)
+    runtime[:stderr].should contain("Uncaught exception: InvalidArgument")
+    runtime[:stderr].should contain("at allocate (ir_lowering_spec.py:")
+  end
+
+  it "raises OutOfMemory when a heap storage mapping fails" do
+    source = "def main() -> int:\n    bytes: uint = 67108864\n    unsafe:\n        address: ptr[uint8] = heap_storage(bytes, 8)\n    return 0\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    runtime = BackendSpecHelpers.link_and_capture(result.ir_module.not_nil!, 12 * 1024)
+    runtime[:exit_code].should eq(1)
+    runtime[:stderr].should contain("Uncaught exception: OutOfMemory")
+  end
+
   it "passes allocated pointers through function parameters and results" do
     source = "def allocate(value: int) -> ptr[int]:\n    unsafe:\n        address: ptr[int] = alloc(value)\n    return address\n\ndef read_and_free(address: ptr[int]) -> int:\n    unsafe:\n        result: int = load(address)\n        free(address)\n    return result\n\ndef main() -> int:\n    address: ptr[int] = allocate(42)\n    return read_and_free(address)\n"
     result = IrLoweringSpecHelpers.lower(source)

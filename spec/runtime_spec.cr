@@ -72,6 +72,30 @@ describe "Smalang generated exception runtime" do
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
 
+  it "dispatches and releases a caught invalid heap storage argument" do
+    ir = Smalang::IrModule.new
+    main = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    entry = main.entry_block_id
+    normal = main.add_block("normal")
+    dispatch = main.add_block("dispatch")
+    caught = main.add_block("caught")
+    resume = main.add_block("resume")
+    zero = main.emit_constant(entry, Smalang::IrType::Usize, 0)
+    allocation = main.emit_invoke_heap_storage(entry, zero, 16, normal, dispatch)
+    success = main.emit_constant(normal, Smalang::IrType::Isize, 0)
+    main.emit_return(normal, success)
+    main.emit_exception_dispatch(dispatch, allocation.exception_id, [
+      Smalang::IrExceptionCase.new(Smalang::IrExceptionKind::InvalidArgument, caught),
+    ], resume)
+    main.emit_exception_release(caught, allocation.exception_id)
+    recovered = main.emit_constant(caught, Smalang::IrType::Isize, 42)
+    main.emit_return(caught, recovered)
+    main.emit_resume_exception(resume, allocation.exception_id)
+
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
   it "keeps a user function named _start local to the generated entry point" do
     ir = Smalang::IrModule.new
     user_function = ir.add_function("_start", Array(Smalang::IrType).new, Smalang::IrType::Isize)

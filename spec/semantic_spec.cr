@@ -31,7 +31,6 @@ describe Smalang::SemanticAnalyzer do
 
     invalid_programs.each do |source, expected_message|
       result = SemanticSpecHelpers.analyze(source)
-
       result.success?.should eq(false)
       result.diagnostic.not_nil!.description.should eq(expected_message)
     end
@@ -63,7 +62,6 @@ describe Smalang::SemanticAnalyzer do
 
     invalid_programs.each do |source, expected_message|
       result = SemanticSpecHelpers.analyze(source)
-
       result.success?.should eq(false)
       result.diagnostic.not_nil!.description.should eq(expected_message)
     end
@@ -99,6 +97,44 @@ describe Smalang::SemanticAnalyzer do
     invalid_programs.each do |source, expected_message|
       result = SemanticSpecHelpers.analyze(source)
 
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.description.should eq(expected_message)
+    end
+  end
+
+  it "checks heap storage and release contracts" do
+    accepted = SemanticSpecHelpers.analyze(
+      "def release(address: ptr[uint8], bytes: uint) -> int:\n    unsafe:\n        heap_free(address, bytes, 64)\n    return 0\n\ndef main() -> int:\n    bytes: uint = 24\n    unsafe:\n        address: ptr[uint8] = heap_storage(bytes, 64)\n        heap_free(address, bytes, 64)\n    return 0\n"
+    )
+    accepted.success?.should eq(true)
+
+    invalid_programs = [
+      {"def main() -> int:\n    address: ptr[uint8] = heap_storage(8, 8)\n    return 0\n", "unsafe operation 'heap_storage' requires an unsafe block"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8)\n    return 0\n", "heap_storage expects 2 arguments, got 1"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8, 8, 8)\n    return 0\n", "heap_storage expects 2 arguments, got 3"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(True, 8)\n    return 0\n", "heap_storage byte size has type bool, expected uint"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8, True)\n    return 0\n", "heap_storage alignment has type bool, expected uint"},
+      {"def main() -> int:\n    unsafe:\n        alignment: uint = 8\n        address: ptr[uint8] = heap_storage(8, alignment)\n    return 0\n", "heap_storage alignment must be a compile-time constant"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(0, 8)\n    return 0\n", "heap_storage byte size must be greater than zero"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(18446744073709551608, 8)\n    return 0\n", "heap_storage size and alignment overflow uint"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8, 0)\n    return 0\n", "heap_storage alignment must be greater than zero"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8, 3)\n    return 0\n", "heap_storage alignment must be a power of two"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = heap_storage(8, 8)\n    return 0\n", "initializer has type ptr[uint8], expected ptr[int]"},
+      {"def main() -> int:\n    unsafe:\n        heap_free()\n    return 0\n", "heap_free expects 3 arguments, got 0"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8, 8)\n        heap_free(address, 8)\n    return 0\n", "heap_free expects 3 arguments, got 2"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8, 8)\n        heap_free(address, 8, 8, 8)\n    return 0\n", "heap_free expects 3 arguments, got 4"},
+      {"def main() -> int:\n    unsafe:\n        value: ptr[int] = alloc_stack(1)\n        heap_free(value, 1, 1)\n    return 0\n", "heap_free requires ptr[uint8], got ptr[int]"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8, 8)\n        heap_free(address, True, 8)\n    return 0\n", "heap_free byte size has type bool, expected uint"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8, 8)\n        heap_free(address, 8, True)\n    return 0\n", "heap_free alignment has type bool, expected uint"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8, 8)\n        alignment: uint = 8\n        heap_free(address, 8, alignment)\n    return 0\n", "heap_free alignment must be a compile-time constant"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8, 8)\n        heap_free(address, 8, 0)\n    return 0\n", "heap_free alignment must be greater than zero"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[uint8] = heap_storage(8, 8)\n        result: int = heap_free(address, 8, 8)\n    return result\n", "heap_free must be a standalone statement"},
+      {"def heap_storage(bytes: uint, alignment: uint) -> ptr[uint8]:\n    return alloc(0)\n\ndef main() -> int:\n    return 0\n", "function name 'heap_storage' is reserved for an unsafe memory operation"},
+      {"def heap_free(address: ptr[uint8], bytes: uint, alignment: uint) -> int:\n    return 0\n\ndef main() -> int:\n    return 0\n", "function name 'heap_free' is reserved for an unsafe memory operation"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
       result.success?.should eq(false)
       result.diagnostic.not_nil!.description.should eq(expected_message)
     end

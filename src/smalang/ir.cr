@@ -252,6 +252,7 @@ module Smalang
     DivisionByZero
     IndexOutOfBounds
     OutOfMemory
+    InvalidArgument
   end
 
   struct IrSourceLocation
@@ -417,6 +418,7 @@ module Smalang
   abstract class IrInvokeOperationVisitor
     abstract def visit(operation : IrCallOperation, instruction : IrInvokeInstruction) : Nil
     abstract def visit(operation : IrAllocateOperation, instruction : IrInvokeInstruction) : Nil
+    abstract def visit(operation : IrHeapStorageOperation, instruction : IrInvokeInstruction) : Nil
     abstract def visit(operation : IrDivideOperation, instruction : IrInvokeInstruction) : Nil
     abstract def visit(operation : IrRemainderOperation, instruction : IrInvokeInstruction) : Nil
     abstract def visit(operation : IrArrayGetOperation, instruction : IrInvokeInstruction) : Nil
@@ -892,6 +894,55 @@ module Smalang
     end
   end
 
+  class IrHeapFreeInstruction < IrInstruction
+    getter address_id : ValueId
+    getter byte_size_id : ValueId
+    getter alignment : UInt64
+
+    def initialize(id : InstructionId, block_id : BlockId, result_id : ValueId, @address_id : ValueId, @byte_size_id : ValueId, @alignment : UInt64)
+      super(id, block_id, result_id, IrType::Unit)
+    end
+
+    def used_values : Array(ValueId)
+      [@address_id, @byte_size_id]
+    end
+
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::FREE
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      address_type = operand_types[0]?
+      expected_address_type = IrPointerType.new(IrType::UInt8)
+      if address_type && address_type != expected_address_type
+        errors << context.error("heap.free address has type #{address_type.label}, expected #{expected_address_type.label}")
+      end
+      byte_size_type = operand_types[1]?
+      if byte_size_type && byte_size_type != IrType::Usize
+        errors << context.error("heap.free byte size has type #{byte_size_type.label}, expected usize")
+      end
+      if @alignment == 0
+        errors << context.error("heap.free alignment must be greater than zero")
+      elsif (@alignment & (@alignment - 1_u64)) != 0
+        errors << context.error("heap.free alignment must be a power of two")
+      end
+      errors
+    end
+
+    def expression : String
+      "(%v#{@result_id.not_nil!} unit (heap.free %v#{@address_id} %v#{@byte_size_id} #{@alignment}))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
   abstract class IrBinaryInstruction < IrInstruction
     getter left : ValueId
     getter right : ValueId
@@ -1099,6 +1150,48 @@ module Smalang
       end
       if value_type && value_type != @pointer_type.pointee_type
         errors << context.error("alloc value has type #{value_type.label}, expected #{@pointer_type.pointee_type.label}")
+      end
+      errors
+    end
+
+    def accept(visitor : IrInvokeOperationVisitor, instruction : IrInvokeInstruction) : Nil
+      visitor.visit(self, instruction)
+    end
+  end
+
+  class IrHeapStorageOperation < IrInvokeOperation
+    getter byte_size_id : ValueId
+    getter alignment : UInt64
+
+    def initialize(@byte_size_id : ValueId, @alignment : UInt64)
+    end
+
+    def used_values : Array(ValueId)
+      [@byte_size_id]
+    end
+
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::ALLOCATE
+    end
+
+    def result_type : IrType
+      IrPointerType.new(IrType::UInt8)
+    end
+
+    def expression : String
+      "(heap.storage %v#{@byte_size_id} #{@alignment})"
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      byte_size_type = operand_types.first?
+      if byte_size_type && byte_size_type != IrType::Usize
+        errors << context.error("heap.storage byte size has type #{byte_size_type.label}, expected usize")
+      end
+      if @alignment == 0
+        errors << context.error("heap.storage alignment must be greater than zero")
+      elsif (@alignment & (@alignment - 1_u64)) != 0
+        errors << context.error("heap.storage alignment must be a power of two")
       end
       errors
     end
@@ -1794,6 +1887,12 @@ module Smalang
       end
     end
 
+    def emit_heap_free(block_id : BlockId, address_id : ValueId, byte_size_id : ValueId, alignment : UInt64) : ValueId
+      append_result(block_id, IrType::Unit) do |instruction_id, result_id|
+        IrHeapFreeInstruction.new(instruction_id, block_id, result_id, address_id, byte_size_id, alignment)
+      end
+    end
+
     def emit_add(block_id : BlockId, type : IrType, left : ValueId, right : ValueId) : ValueId
       append_result(block_id, type) do |instruction_id, result_id|
         IrAddInstruction.new(instruction_id, block_id, result_id, type, left, right)
@@ -1834,6 +1933,23 @@ module Smalang
       append_invoke(
         block_id,
         IrAllocateOperation.new(initial_value_id, pointer_type),
+        normal_successor,
+        exception_successor,
+        source_location
+      )
+    end
+
+    def emit_invoke_heap_storage(
+      block_id : BlockId,
+      byte_size_id : ValueId,
+      alignment : UInt64,
+      normal_successor : BlockId,
+      exception_successor : BlockId,
+      source_location : IrSourceLocation? = nil,
+    ) : IrInvokeResults
+      append_invoke(
+        block_id,
+        IrHeapStorageOperation.new(byte_size_id, alignment),
         normal_successor,
         exception_successor,
         source_location

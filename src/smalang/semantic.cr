@@ -1,5 +1,6 @@
 require "./lexer"
 require "./parser"
+require "./heap_storage_layout"
 
 module Smalang
   alias SymbolId = Int32
@@ -529,7 +530,7 @@ module Smalang
     end
 
     private def unsafe_memory_operation_name?(name : String) : Bool
-      name == "alloc" || name == "alloc_stack" || name == "offset" || name == "cast" || name == "stack_storage" || name == "size_of" || name == "align_of" || name == "address_of" || name == "load" || name == "store" || name == "free"
+      name == "alloc" || name == "alloc_stack" || name == "offset" || name == "cast" || name == "stack_storage" || name == "heap_storage" || name == "heap_free" || name == "size_of" || name == "align_of" || name == "address_of" || name == "load" || name == "store" || name == "free"
     end
   end
 
@@ -890,7 +891,13 @@ module Smalang
     end
 
     def visit(node : CallStatementNode) : Nil
-      @context.report(node.span, "expression statements are not supported")
+      call = @context.arena.node(node.call).as?(CallExpr)
+      name = call.try { |expression| @context.parsed_module.source_file.slice(expression.callee) }
+      if call && name == "heap_free"
+        analyze_heap_free(call)
+      else
+        @context.report(node.span, "expression statements are not supported")
+      end
     end
 
     def visit(node : AllocateExpr) : Nil
@@ -1115,6 +1122,120 @@ module Smalang
       @context.set_type(current_node_id, @context.type_table.pointer_type_id(byte_type_id))
     end
 
+    private def analyze_heap_storage(node : CallExpr) : Nil
+      return unless require_unsafe_context(node.span, "heap_storage")
+      if node.type_argument
+        @context.report(node.span, "heap_storage does not accept a type argument")
+        return
+      end
+      unless node.arguments.count == 2
+        @context.report(node.span, "heap_storage expects 2 arguments, got #{node.arguments.count}")
+        return
+      end
+
+      byte_size_id = @context.arena.child(node.arguments, 0)
+      byte_size_type_id = analyze_expression(byte_size_id, @context.type_table.uint_type_id)
+      return if @context.diagnostic
+      unless byte_size_type_id == @context.type_table.uint_type_id
+        actual_type = byte_size_type_id.try { |id| type_label(id) } || "unknown"
+        @context.report(@context.arena.node(byte_size_id).span, "heap_storage byte size has type #{actual_type}, expected uint")
+        return
+      end
+
+      alignment_id = @context.arena.child(node.arguments, 1)
+      alignment = checked_heap_storage_alignment(alignment_id, "heap_storage")
+      return unless alignment
+
+      if compile_time_constant_expression?(byte_size_id)
+        byte_size = checked_constant_uint_value(byte_size_id)
+        unless byte_size
+          @context.report(@context.arena.node(byte_size_id).span, "heap_storage byte size constant expression overflows uint")
+          return
+        end
+        if byte_size.zero?
+          @context.report(@context.arena.node(byte_size_id).span, "heap_storage byte size must be greater than zero")
+          return
+        end
+
+        overhead = alignment - 1_u64 + HeapStorageLayout::MAPPING_HEADER_BYTES
+        if byte_size > UInt64::MAX - overhead
+          @context.report(@context.arena.node(byte_size_id).span, "heap_storage size and alignment overflow uint")
+          return
+        end
+        @context.set_constant_uint_value(byte_size_id, byte_size)
+      end
+
+      @context.set_constant_uint_value(alignment_id, alignment)
+      byte_type_id = @context.type_table.id_for(AstType::UInt8)
+      @context.set_type(current_node_id, @context.type_table.pointer_type_id(byte_type_id))
+    end
+
+    private def analyze_heap_free(node : CallExpr) : Nil
+      return unless require_unsafe_context(node.span, "heap_free")
+      if node.type_argument
+        @context.report(node.span, "heap_free does not accept a type argument")
+        return
+      end
+      unless node.arguments.count == 3
+        @context.report(node.span, "heap_free expects 3 arguments, got #{node.arguments.count}")
+        return
+      end
+
+      address_id = @context.arena.child(node.arguments, 0)
+      address_type_id = analyze_expression(address_id)
+      return if @context.diagnostic
+      byte_type_id = @context.type_table.id_for(AstType::UInt8)
+      expected_address_type_id = @context.type_table.pointer_type_id(byte_type_id)
+      unless address_type_id == expected_address_type_id
+        actual_type = address_type_id.try { |id| type_label(id) } || "unknown"
+        @context.report(@context.arena.node(address_id).span, "heap_free requires ptr[uint8], got #{actual_type}")
+        return
+      end
+
+      byte_size_id = @context.arena.child(node.arguments, 1)
+      byte_size_type_id = analyze_expression(byte_size_id, @context.type_table.uint_type_id)
+      return if @context.diagnostic
+      unless byte_size_type_id == @context.type_table.uint_type_id
+        actual_type = byte_size_type_id.try { |id| type_label(id) } || "unknown"
+        @context.report(@context.arena.node(byte_size_id).span, "heap_free byte size has type #{actual_type}, expected uint")
+        return
+      end
+
+      alignment_id = @context.arena.child(node.arguments, 2)
+      checked_heap_storage_alignment(alignment_id, "heap_free")
+    end
+
+    private def checked_heap_storage_alignment(alignment_id : NodeId, operation_name : String) : UInt64?
+      alignment_type_id = analyze_expression(alignment_id, @context.type_table.uint_type_id)
+      return nil if @context.diagnostic
+      unless alignment_type_id == @context.type_table.uint_type_id
+        actual_type = alignment_type_id.try { |id| type_label(id) } || "unknown"
+        @context.report(@context.arena.node(alignment_id).span, "#{operation_name} alignment has type #{actual_type}, expected uint")
+        return nil
+      end
+      unless compile_time_constant_expression?(alignment_id)
+        @context.report(@context.arena.node(alignment_id).span, "#{operation_name} alignment must be a compile-time constant")
+        return nil
+      end
+
+      alignment = checked_constant_uint_value(alignment_id)
+      unless alignment
+        @context.report(@context.arena.node(alignment_id).span, "#{operation_name} alignment constant expression overflows uint")
+        return nil
+      end
+      if alignment.zero?
+        @context.report(@context.arena.node(alignment_id).span, "#{operation_name} alignment must be greater than zero")
+        return nil
+      end
+      unless (alignment & (alignment - 1_u64)) == 0
+        @context.report(@context.arena.node(alignment_id).span, "#{operation_name} alignment must be a power of two")
+        return nil
+      end
+
+      @context.set_constant_uint_value(alignment_id, alignment)
+      alignment
+    end
+
     private def checked_constant_uint_value(node_id : NodeId) : UInt64?
       if known_value = @context.constant_uint_value(node_id)
         return known_value
@@ -1303,6 +1424,14 @@ module Smalang
 
     def visit(node : CallExpr) : Nil
       name = @context.parsed_module.source_file.slice(node.callee)
+      if name == "heap_storage"
+        analyze_heap_storage(node)
+        return
+      end
+      if name == "heap_free"
+        @context.report(node.span, "heap_free must be a standalone statement")
+        return
+      end
       if name == "size_of" || name == "align_of"
         analyze_type_layout_query(node, name)
         return

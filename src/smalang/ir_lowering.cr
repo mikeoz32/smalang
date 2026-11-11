@@ -405,7 +405,13 @@ module Smalang
     end
 
     def visit(node : CallStatementNode) : Nil
-      @context.report(node.span, "expression statements are not supported")
+      call = @context.parsed_module.arena.node(node.call).as?(CallExpr)
+      name = call.try { |expression| @context.parsed_module.source_file.slice(expression.callee) }
+      if call && name == "heap_free"
+        lower_heap_free(call)
+      else
+        @context.report(node.span, "expression statements are not supported")
+      end
     end
 
     def visit(node : AllocateExpr) : Nil
@@ -649,6 +655,10 @@ module Smalang
 
     def visit(node : CallExpr) : Nil
       name = @context.parsed_module.source_file.slice(node.callee)
+      if name == "heap_storage"
+        lower_heap_storage(node)
+        return
+      end
       if name == "stack_storage"
         lower_stack_storage(node)
         return
@@ -822,6 +832,64 @@ module Smalang
       end
 
       @expression_value_id = function.emit_stack_storage(current_block_id, byte_size, alignment)
+    end
+
+    private def lower_heap_storage(node : CallExpr) : Nil
+      byte_size_node_id = @context.parsed_module.arena.child(node.arguments, 0)
+      byte_size_id = lower_expression(byte_size_node_id)
+      return unless byte_size_id
+
+      alignment_node_id = @context.parsed_module.arena.child(node.arguments, 1)
+      alignment = @context.semantic_module.constant_uint_value(alignment_node_id)
+      unless alignment
+        @context.report(node.span, "missing compile-time heap_storage alignment")
+        return
+      end
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "heap_storage is not inside a function")
+        return
+      end
+
+      normal_block = function.add_block("heap_storage_normal_#{function.block_count}")
+      unwind_block = function.add_block("heap_storage_unwind_#{function.block_count}")
+      result = function.emit_invoke_heap_storage(
+        current_block_id,
+        byte_size_id,
+        alignment,
+        normal_block,
+        unwind_block,
+        @context.source_location(node.span)
+      )
+      function.emit_resume_exception(unwind_block, result.exception_id)
+      @current_block_id = normal_block
+      @expression_value_id = result.value_id
+    end
+
+    private def lower_heap_free(node : CallExpr) : Nil
+      address_node_id = @context.parsed_module.arena.child(node.arguments, 0)
+      address_id = lower_expression(address_node_id)
+      return unless address_id
+
+      byte_size_node_id = @context.parsed_module.arena.child(node.arguments, 1)
+      byte_size_id = lower_expression(byte_size_node_id)
+      return unless byte_size_id
+
+      alignment_node_id = @context.parsed_module.arena.child(node.arguments, 2)
+      alignment = @context.semantic_module.constant_uint_value(alignment_node_id)
+      unless alignment
+        @context.report(node.span, "missing compile-time heap_free alignment")
+        return
+      end
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "heap_free is not inside a function")
+        return
+      end
+
+      function.emit_heap_free(current_block_id, address_id, byte_size_id, alignment)
     end
 
     private def lower_type_layout_query(node : CallExpr) : Nil
