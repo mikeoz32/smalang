@@ -326,6 +326,27 @@ module Smalang
     end
   end
 
+  class MachinePointerCast < MachineInstruction
+    getter result_id : ValueId
+    getter address_id : ValueId
+
+    def initialize(position : Int32, @result_id : ValueId, @address_id : ValueId)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@address_id]
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_pointer_cast(self)
+    end
+  end
+
   class MachinePointerLoad < MachineInstruction
     getter result_id : ValueId
     getter address_id : ValueId
@@ -1045,6 +1066,12 @@ module Smalang
         instruction.index_id,
         instruction.pointer_type
       )
+    end
+
+    def visit(instruction : IrPointerCastInstruction) : Nil
+      result_id = instruction.result_id
+      raise X86_64BackendFailure.new("pointer cast is missing its result") unless result_id
+      @instructions << MachinePointerCast.new(@instructions.size, result_id, instruction.address_id)
     end
 
     def visit(instruction : IrLoadInstruction) : Nil
@@ -2303,6 +2330,11 @@ module Smalang
       scale_index(offset.pointer_type.pointee_type, X86_64Register::R10)
       @code.add_register(X86_64Register::Rax, X86_64Register::R10)
       location(offset.result_id).store_from(@code, X86_64Register::Rax, @frame)
+    end
+
+    def emit_pointer_cast(pointer_cast : MachinePointerCast) : Nil
+      location(pointer_cast.address_id).load_to(@code, X86_64Register::Rax, @frame)
+      location(pointer_cast.result_id).store_from(@code, X86_64Register::Rax, @frame)
     end
 
     def emit_pointer_store(store : MachinePointerStore) : Nil

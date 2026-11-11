@@ -88,6 +88,73 @@ describe Smalang::IrLowerer do
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
 
+  it "casts a pointer without changing the address" do
+    source = File.read("#{__DIR__}/../examples/unsafe_pointer_cast.py")
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    Smalang::IrSExpressionDumper.new.dump(ir).should contain("(ptr.cast")
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "compiles and executes every scalar pointer cast pair" do
+    scalar_types = ["int", "uint", "bool", "int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"]
+    source = String.build do |program|
+      program << "def main() -> int:\n    unsafe:\n        storage: ptr[int] = alloc_stack(0)\n"
+      scalar_types.each_with_index do |source_type, source_index|
+        source_name = "source_#{source_index}"
+        program << "        #{source_name}: ptr[#{source_type}] = cast[#{source_type}](storage)\n"
+        scalar_types.each_with_index do |target_type, target_index|
+          target_name = "target_#{source_index}_#{target_index}"
+          value = target_type == "bool" ? "True" : "1"
+          program << "        #{target_name}: ptr[#{target_type}] = cast[#{target_type}](#{source_name})\n"
+          program << "        store(#{target_name}, #{value})\n"
+        end
+      end
+      program << "        result: int = load(storage)\n    return result\n"
+    end
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    function = ir.function(0).not_nil!
+    IrLoweringSpecHelpers.instructions(function).count { |instruction| instruction.is_a?(Smalang::IrPointerCastInstruction) }.should eq(132)
+    BackendSpecHelpers.link_and_run(ir).should eq(1)
+  end
+
+  it "evaluates a pointer cast address operand once" do
+    source = "def mark_address(counter: ptr[int], target: ptr[int]) -> ptr[int]:\n    unsafe:\n        current: int = load(counter)\n        store(counter, current + 1)\n    return target\n\ndef main() -> int:\n    unsafe:\n        counter: ptr[int] = alloc_stack(0)\n        target: ptr[int] = alloc_stack(42)\n        converted: ptr[uint] = cast[uint](mark_address(counter, target))\n        store(converted, 7)\n        result: int = load(target) + load(counter)\n    return result\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(8)
+  end
+
+  it "allows casting a misaligned address without dereferencing it" do
+    source = "def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(0)\n        bytes: ptr[uint8] = cast[uint8](address)\n        shifted: ptr[uint8] = offset(bytes, 1)\n        misaligned: ptr[int] = cast[int](shifted)\n    return 42\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "indexes a local array named cast" do
+    source = "def main() -> int:\n    cast: array[int, 1] = [42]\n    return cast[0]\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
   it "evaluates pointer offset arguments once in source order" do
     source = "def mark_address(counter: ptr[uint], target: ptr[int]) -> ptr[int]:\n    unsafe:\n        current: uint = load(counter)\n        store(counter, current + 1)\n    return target\n\ndef mark_index(counter: ptr[uint]) -> uint:\n    unsafe:\n        current: uint = load(counter)\n        store(counter, current + 1)\n    return current\n\ndef main() -> int:\n    unsafe:\n        counter: ptr[uint] = alloc_stack(0)\n        first: ptr[int] = alloc_stack(41)\n        second: ptr[int] = alloc_stack(42)\n        third: ptr[int] = alloc_stack(43)\n        shifted: ptr[int] = offset(mark_address(counter, third), mark_index(counter))\n        value: int = load(shifted)\n    return value\n"
     result = IrLoweringSpecHelpers.lower(source)

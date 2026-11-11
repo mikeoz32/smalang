@@ -92,6 +92,31 @@ describe Smalang::SemanticAnalyzer do
     end
   end
 
+  it "checks pointer cast types, arity, unsafe context, and reserved names" do
+    accepted = SemanticSpecHelpers.analyze(
+      "def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(1)\n        converted: ptr[uint] = cast[uint](address)\n    return 0\n"
+    )
+    accepted.success?.should eq(true)
+
+    invalid_programs = [
+      {"def cast(value: int) -> int:\n    return value\n\ndef main() -> int:\n    return 0\n", "function name 'cast' is reserved for an unsafe memory operation"},
+      {"def convert(address: ptr[int]) -> ptr[uint]:\n    return cast[uint](address)\n\ndef main() -> int:\n    return 0\n", "unsafe operation 'cast' requires an unsafe block"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(1)\n        converted: ptr[uint] = cast(address)\n    return 0\n", "cast requires an explicit target type: cast[U](address)"},
+      {"def main() -> int:\n    unsafe:\n        value: int = 1\n        converted: ptr[uint] = cast[uint](value)\n    return 0\n", "cast requires ptr[T], got int"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(1)\n        converted: ptr[uint] = cast[array[int, 1]](address)\n    return 0\n", "cast target type must be scalar, got array[int, 1]"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(1)\n        converted: ptr[int] = cast[ptr[uint]](address)\n    return 0\n", "cast target type must be scalar, got ptr[uint]"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(1)\n        converted: ptr[uint] = cast[uint]()\n    return 0\n", "cast expects 1 argument, got 0"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(1)\n        converted: ptr[uint] = cast[uint](address, address)\n    return 0\n", "cast expects 1 argument, got 2"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.description.should eq(expected_message)
+    end
+  end
+
   it "rejects raw memory operations outside an unsafe block" do
     invalid_programs = [
       {"def main() -> int:\n    address: ptr[int] = alloc(42)\n    return 0\n", "alloc"},

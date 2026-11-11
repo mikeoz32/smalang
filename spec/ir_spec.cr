@@ -188,6 +188,47 @@ describe Smalang::IrModule do
     diagnostics.should contain("offset index has type isize, expected usize")
   end
 
+  it "verifies and dumps scalar pointer casts in s notation" do
+    ir = Smalang::IrModule.new
+    source_type = Smalang::IrPointerType.new(Smalang::IrType::Int64)
+    target_type = Smalang::IrPointerType.new(Smalang::IrType::UInt64)
+    parameter_types = [] of Smalang::IrType
+    parameter_types << source_type
+    function = ir.add_function("cast", parameter_types, target_type)
+    result = function.emit_pointer_cast(function.entry_block_id, function.parameters.first.value_id, target_type)
+    function.emit_return(function.entry_block_id, result)
+
+    ir.verify.should be_empty
+    Smalang::IrSExpressionDumper.new.dump(ir).should contain("(ptr.cast %v0)")
+  end
+
+  it "rejects pointer casts with a non-pointer source or target" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("invalid_source", [Smalang::IrType::Isize], Smalang::IrType::Unit)
+    invalid_target = Smalang::IrPointerType.new(Smalang::IrType::Unit)
+    function.emit_pointer_cast(function.entry_block_id, function.parameters.first.value_id, invalid_target)
+    unit = function.emit_unit_constant(function.entry_block_id)
+    function.emit_return(function.entry_block_id, unit)
+
+    diagnostics = ir.verify.join("\n")
+    diagnostics.should contain("pointer cast target type ptr[unit] has an unsupported pointee")
+    diagnostics.should contain("pointer cast address has type isize, expected ptr[T]")
+
+    invalid_pointer_type = Smalang::IrPointerType.new(Smalang::IrType::Unit)
+    valid_pointer_type = Smalang::IrPointerType.new(Smalang::IrType::Int64)
+    invalid_pointer_parameters = [] of Smalang::IrType
+    invalid_pointer_parameters << invalid_pointer_type
+    invalid_pointer_function = ir.add_function("invalid_pointer_source", invalid_pointer_parameters, valid_pointer_type)
+    cast_result = invalid_pointer_function.emit_pointer_cast(
+      invalid_pointer_function.entry_block_id,
+      invalid_pointer_function.parameters.first.value_id,
+      valid_pointer_type
+    )
+    invalid_pointer_function.emit_return(invalid_pointer_function.entry_block_id, cast_result)
+
+    ir.verify.join("\n").should contain("pointer cast source type ptr[unit] has an unsupported pointee")
+  end
+
   it "represents and dumps the first-slice program as typed SSA" do
     ir = Smalang::IrModule.new
     increment = ir.add_function(

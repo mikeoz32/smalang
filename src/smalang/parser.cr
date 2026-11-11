@@ -313,8 +313,9 @@ module Smalang
     getter span : SourceSpan
     getter callee : SourceSpan
     getter arguments : NodeRange
+    getter type_argument : AstTypeId?
 
-    def initialize(@span : SourceSpan, @callee : SourceSpan, @arguments : NodeRange)
+    def initialize(@span : SourceSpan, @callee : SourceSpan, @arguments : NodeRange, @type_argument : AstTypeId? = nil)
     end
   end
 
@@ -622,10 +623,13 @@ module Smalang
   class Parser
     PRECEDENCE = 1
 
+    @type_arena : AstTypeArena?
+
     def initialize(@tokens : TokenStream)
       @cursor = 0
       @indent_depth = 0
       @diagnostics = Array(ParseDiagnostic).new
+      @type_arena = nil
     end
 
     def parse : ParseResult
@@ -634,6 +638,7 @@ module Smalang
       @diagnostics.clear
       arena = AstArena.new(@tokens.source_file.source.bytesize)
       type_arena = AstTypeArena.new(@tokens.source_file.source.bytesize)
+      @type_arena = type_arena
       function_ids = Array(NodeId).new
 
       until current_token.kind == TokenKind::Eof
@@ -1038,7 +1043,9 @@ module Smalang
         parse_match_expression(arena)
       when TokenKind::Identifier
         name = advance.span
-        if current_token.kind == TokenKind::LeftParen
+        if @tokens.source_file.slice(name) == "cast" && generic_type_call_follows?
+          parse_cast_call(arena, name)
+        elsif current_token.kind == TokenKind::LeftParen
           parse_call(arena, name)
         else
           arena.add(IdentifierExpr.new(name))
@@ -1064,6 +1071,39 @@ module Smalang
       else
         fail("expected an expression")
       end
+    end
+
+    private def parse_cast_call(arena : AstArena, callee : SourceSpan) : NodeId
+      expect(TokenKind::LeftBracket, "expected '[' after 'cast'")
+      target_type = parse_type(@type_arena.not_nil!)
+      expect(TokenKind::RightBracket, "expected ']' after cast target type")
+      arguments, call_span, closed = parse_call_arguments(arena, callee)
+      call_id = arena.add(CallExpr.new(call_span, callee, arguments, target_type))
+      closed ? call_id : arena.add(ErrorNode.new(call_span, call_id))
+    end
+
+    private def generic_type_call_follows? : Bool
+      return false unless current_token.kind == TokenKind::LeftBracket
+
+      depth = 0
+      index = @cursor
+      while index < @tokens.tokens.size
+        case @tokens.tokens[index].kind
+        when TokenKind::LeftBracket
+          depth += 1
+        when TokenKind::RightBracket
+          depth -= 1
+          if depth == 0
+            next_index = index + 1
+            return next_index < @tokens.tokens.size && @tokens.tokens[next_index].kind == TokenKind::LeftParen
+          end
+        when TokenKind::Eof
+          return false
+        end
+        index += 1
+      end
+
+      false
     end
 
     private def parse_array_literal(arena : AstArena) : NodeId

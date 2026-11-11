@@ -193,6 +193,23 @@ describe Smalang::Parser do
     parsed.arena.node(declaration.initializer).should be_a(Smalang::PointerOffsetExpr)
   end
 
+  it "parses a generic pointer cast with a target scalar type" do
+    result = ParserSpecHelpers.parse(
+      "def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(1)\n        converted: ptr[uint] = cast[uint](address)\n    return 0\n"
+    )
+
+    result.success?.should eq(true)
+    result.diagnostics.should be_empty
+    parsed = result.parsed_module
+    function = ParserSpecHelpers.function_at(parsed, 0)
+    unsafe_block = parsed.arena.node(parsed.arena.child(function.statements, 0)).as(Smalang::UnsafeBlockNode)
+    declaration = parsed.arena.node(parsed.arena.child(unsafe_block.statements, 1)).as(Smalang::VariableDeclarationNode)
+    expression = parsed.arena.node(declaration.initializer).as(Smalang::CallExpr)
+    expression.type_argument.should_not be_nil
+    ParserSpecHelpers.scalar_type(parsed, expression.type_argument.not_nil!).should eq(Smalang::AstType::UInt)
+    expression.arguments.count.should eq(1)
+  end
+
   it "rejects nested, empty, and returning unsafe blocks" do
     invalid_programs = [
       {"def main() -> int:\n    unsafe:\n        return 1\n    return 0\n", "return cannot appear inside an unsafe block"},

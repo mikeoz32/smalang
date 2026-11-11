@@ -470,7 +470,7 @@ module Smalang
     end
 
     private def unsafe_memory_operation_name?(name : String) : Bool
-      name == "alloc" || name == "alloc_stack" || name == "offset" || name == "load" || name == "store" || name == "free"
+      name == "alloc" || name == "alloc_stack" || name == "offset" || name == "cast" || name == "load" || name == "store" || name == "free"
     end
   end
 
@@ -871,6 +871,43 @@ module Smalang
       @context.set_type(current_node_id, address_type_id.not_nil!)
     end
 
+    private def analyze_pointer_cast(node : CallExpr) : Nil
+      return unless require_unsafe_context(node.span, "cast")
+      unless node.type_argument
+        @context.report(node.span, "cast requires an explicit target type: cast[U](address)")
+        return
+      end
+      unless node.arguments.count == 1
+        @context.report(node.span, "cast expects 1 argument, got #{node.arguments.count}")
+        return
+      end
+
+      address_id = @context.arena.child(node.arguments, 0)
+      address_type_id = analyze_expression(address_id)
+      return if @context.diagnostic
+
+      pointer_type = address_type_id.try { |type_id| @context.type_table.pointer_type(type_id) }
+      unless pointer_type
+        actual_type = address_type_id.try { |type_id| type_label(type_id) } || "untyped expression"
+        @context.report(@context.arena.node(address_id).span, "cast requires ptr[T], got #{actual_type}")
+        return
+      end
+      unless @context.type_table.scalar_type(pointer_type.pointee_type_id)
+        @context.report(@context.arena.node(address_id).span, "cast supports scalar pointer types only")
+        return
+      end
+
+      target_type_id = @context.type_table.id_for(node.type_argument.not_nil!, @context.parsed_module.type_arena)
+      unless @context.type_table.scalar_type(target_type_id)
+        target_type = @context.type_table.label(target_type_id)
+        target_span = @context.parsed_module.type_arena.type(node.type_argument.not_nil!).span
+        @context.report(target_span, "cast target type must be scalar, got #{target_type}")
+        return
+      end
+
+      @context.set_type(current_node_id, @context.type_table.pointer_type_id(target_type_id))
+    end
+
     def visit(node : LoadExpr) : Nil
       analyze_load(node)
     end
@@ -1034,6 +1071,15 @@ module Smalang
 
     def visit(node : CallExpr) : Nil
       name = @context.parsed_module.source_file.slice(node.callee)
+      if name == "cast"
+        analyze_pointer_cast(node)
+        return
+      end
+      if node.type_argument
+        @context.report(node.span, "type arguments are not supported for function '#{name}'")
+        return
+      end
+
       function = @context.module_scope.resolve(name)
       unless function
         @context.report(node.callee, "unknown function '#{name}'")

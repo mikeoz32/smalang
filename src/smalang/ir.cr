@@ -410,6 +410,7 @@ module Smalang
     abstract def visit(instruction : IrArrayLiteralInstruction) : Nil
     abstract def visit(instruction : IrStackAllocateInstruction) : Nil
     abstract def visit(instruction : IrPointerOffsetInstruction) : Nil
+    abstract def visit(instruction : IrPointerCastInstruction) : Nil
     abstract def visit(instruction : IrLoadInstruction) : Nil
     abstract def visit(instruction : IrStoreInstruction) : Nil
     abstract def visit(instruction : IrFreeInstruction) : Nil
@@ -678,6 +679,51 @@ module Smalang
 
     def expression : String
       "(%v#{@result_id.not_nil!} #{@pointer_type.label} (offset %v#{@address_id} %v#{@index_id}))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrPointerCastInstruction < IrInstruction
+    getter address_id : ValueId
+    getter target_pointer_type : IrPointerType
+
+    def initialize(id : InstructionId, block_id : BlockId, result_id : ValueId, @address_id : ValueId, @target_pointer_type : IrPointerType)
+      super(id, block_id, result_id, @target_pointer_type)
+    end
+
+    def used_values : Array(ValueId)
+      [@address_id]
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      unless @target_pointer_type.valid_pointee_type?
+        errors << context.error("pointer cast target type #{@target_pointer_type.label} has an unsupported pointee")
+      end
+
+      address_type = operand_types.first?
+      if address_type
+        source_pointer_type = address_type.as?(IrPointerType)
+        unless source_pointer_type
+          errors << context.error("pointer cast address has type #{address_type.label}, expected ptr[T]")
+        else
+          unless source_pointer_type.valid_pointee_type?
+            errors << context.error("pointer cast source type #{source_pointer_type.label} has an unsupported pointee")
+          end
+        end
+      end
+      errors
+    end
+
+    def expression : String
+      "(%v#{@result_id.not_nil!} #{@target_pointer_type.label} (ptr.cast %v#{@address_id}))"
     end
 
     def accept(visitor : IrInstructionVisitor) : Nil
@@ -1601,6 +1647,12 @@ module Smalang
     def emit_pointer_offset(block_id : BlockId, address_id : ValueId, index_id : ValueId, pointer_type : IrPointerType) : ValueId
       append_result(block_id, pointer_type) do |instruction_id, result_id|
         IrPointerOffsetInstruction.new(instruction_id, block_id, result_id, address_id, index_id, pointer_type)
+      end
+    end
+
+    def emit_pointer_cast(block_id : BlockId, address_id : ValueId, target_pointer_type : IrPointerType) : ValueId
+      append_result(block_id, target_pointer_type) do |instruction_id, result_id|
+        IrPointerCastInstruction.new(instruction_id, block_id, result_id, address_id, target_pointer_type)
       end
     end
 

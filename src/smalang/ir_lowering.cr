@@ -615,6 +615,11 @@ module Smalang
     end
 
     def visit(node : CallExpr) : Nil
+      if @context.parsed_module.source_file.slice(node.callee) == "cast"
+        lower_pointer_cast(node)
+        return
+      end
+
       symbol_id = @context.semantic_module.symbol_for(current_node_id)
       unless symbol_id
         @context.report(node.callee, "missing semantic function binding for call")
@@ -733,6 +738,25 @@ module Smalang
       end
 
       @expression_value_id = function.emit_pointer_offset(current_block_id, address_id, index_id, pointer_type)
+    end
+
+    private def lower_pointer_cast(node : CallExpr) : Nil
+      address_node_id = @context.parsed_module.arena.child(node.arguments, 0)
+      address_id = lower_expression(address_node_id)
+      return unless address_id
+
+      result_type_id = @context.type_of(current_node_id)
+      return unless result_type_id
+      pointer_type = pointer_ir_type(result_type_id, node.span)
+      return unless pointer_type
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "cast is not inside a function")
+        return
+      end
+
+      @expression_value_id = function.emit_pointer_cast(current_block_id, address_id, pointer_type)
     end
 
     private def lower_load(node : LoadExpr) : Nil
