@@ -292,11 +292,13 @@ module Smalang
 
     @node_types : Array(TypeId?)
     @node_symbols : Array(SymbolId?)
+    @constant_uint_values : Array(UInt64?)
     @symbols : Array(SemanticSymbol)
 
-    def initialize(@parsed_module : ParsedModule, @type_table : SemanticTypeTable, node_types : Array(TypeId?), node_symbols : Array(SymbolId?), symbols : Array(SemanticSymbol))
+    def initialize(@parsed_module : ParsedModule, @type_table : SemanticTypeTable, node_types : Array(TypeId?), node_symbols : Array(SymbolId?), constant_uint_values : Array(UInt64?), symbols : Array(SemanticSymbol))
       @node_types = node_types.dup
       @node_symbols = node_symbols.dup
+      @constant_uint_values = constant_uint_values.dup
       @symbols = symbols.dup
     end
 
@@ -306,6 +308,10 @@ module Smalang
 
     def symbol_for(node_id : NodeId) : SymbolId?
       @node_symbols[node_id]?
+    end
+
+    def constant_uint_value(node_id : NodeId) : UInt64?
+      @constant_uint_values[node_id]?
     end
 
     def symbol(id : SymbolId) : SemanticSymbol
@@ -348,6 +354,7 @@ module Smalang
 
     @node_types : Array(TypeId?)
     @node_symbols : Array(SymbolId?)
+    @constant_uint_values : Array(UInt64?)
     @symbols : Array(SemanticSymbol)
     @functions_by_declaration : Hash(NodeId, SemanticFunctionSymbol)
 
@@ -357,6 +364,7 @@ module Smalang
       @module_scope = ModuleFunctionScope.new
       @node_types = Array(TypeId?).new(@arena.size) { nil }
       @node_symbols = Array(SymbolId?).new(@arena.size) { nil }
+      @constant_uint_values = Array(UInt64?).new(@arena.size) { nil }
       @symbols = Array(SemanticSymbol).new
       @functions_by_declaration = Hash(NodeId, SemanticFunctionSymbol).new
       @diagnostic = nil
@@ -446,6 +454,10 @@ module Smalang
       @node_symbols[node_id] = symbol_id
     end
 
+    def set_constant_uint_value(node_id : NodeId, value : UInt64) : Nil
+      @constant_uint_values[node_id] = value
+    end
+
     def type_of(node_id : NodeId) : TypeId?
       @node_types[node_id]?
     end
@@ -456,7 +468,7 @@ module Smalang
     end
 
     def finish : SemanticModule
-      SemanticModule.new(@parsed_module, @type_table, @node_types, @node_symbols, @symbols)
+      SemanticModule.new(@parsed_module, @type_table, @node_types, @node_symbols, @constant_uint_values, @symbols)
     end
 
     private def parameter_type_ids(parameters : NodeRange) : Array(TypeId)
@@ -470,7 +482,7 @@ module Smalang
     end
 
     private def unsafe_memory_operation_name?(name : String) : Bool
-      name == "alloc" || name == "alloc_stack" || name == "offset" || name == "cast" || name == "load" || name == "store" || name == "free"
+      name == "alloc" || name == "alloc_stack" || name == "offset" || name == "cast" || name == "stack_storage" || name == "load" || name == "store" || name == "free"
     end
   end
 
@@ -908,6 +920,101 @@ module Smalang
       @context.set_type(current_node_id, @context.type_table.pointer_type_id(target_type_id))
     end
 
+    private def analyze_stack_storage(node : CallExpr) : Nil
+      return unless require_unsafe_context(node.span, "stack_storage")
+      unless node.arguments.count == 2
+        @context.report(node.span, "stack_storage expects 2 arguments, got #{node.arguments.count}")
+        return
+      end
+
+      byte_size_id = @context.arena.child(node.arguments, 0)
+      alignment_id = @context.arena.child(node.arguments, 1)
+      uint_type_id = @context.type_table.uint_type_id
+      byte_size_type_id = analyze_expression(byte_size_id, uint_type_id)
+      return if @context.diagnostic
+      unless byte_size_type_id == uint_type_id
+        actual_type = byte_size_type_id.try { |type_id| type_label(type_id) } || "unknown"
+        @context.report(@context.arena.node(byte_size_id).span, "stack_storage byte size has type #{actual_type}, expected uint")
+        return
+      end
+
+      alignment_type_id = analyze_expression(alignment_id, uint_type_id)
+      return if @context.diagnostic
+      unless alignment_type_id == uint_type_id
+        actual_type = alignment_type_id.try { |type_id| type_label(type_id) } || "unknown"
+        @context.report(@context.arena.node(alignment_id).span, "stack_storage alignment has type #{actual_type}, expected uint")
+        return
+      end
+
+      unless compile_time_constant_expression?(byte_size_id)
+        @context.report(@context.arena.node(byte_size_id).span, "stack_storage byte size must be a compile-time constant")
+        return
+      end
+      byte_size = checked_constant_uint_value(byte_size_id)
+      unless byte_size
+        @context.report(@context.arena.node(byte_size_id).span, "stack_storage byte size constant expression overflows uint")
+        return
+      end
+      unless compile_time_constant_expression?(alignment_id)
+        @context.report(@context.arena.node(alignment_id).span, "stack_storage alignment must be a compile-time constant")
+        return
+      end
+      alignment = checked_constant_uint_value(alignment_id)
+      unless alignment
+        @context.report(@context.arena.node(alignment_id).span, "stack_storage alignment constant expression overflows uint")
+        return
+      end
+
+      if byte_size == 0
+        @context.report(@context.arena.node(byte_size_id).span, "stack_storage byte size must be greater than zero")
+        return
+      end
+      if alignment == 0
+        @context.report(@context.arena.node(alignment_id).span, "stack_storage alignment must be greater than zero")
+        return
+      end
+      if (alignment & (alignment - 1_u64)) != 0
+        @context.report(@context.arena.node(alignment_id).span, "stack_storage alignment must be a power of two")
+        return
+      end
+
+      padding = alignment - 1_u64
+      if byte_size > UInt64::MAX - padding
+        @context.report(node.span, "stack_storage size and alignment overflow uint")
+        return
+      end
+      if byte_size + padding > Int32::MAX.to_u64
+        @context.report(node.span, "stack_storage region exceeds x86_64 frame limits")
+        return
+      end
+
+      byte_type_id = @context.type_table.id_for(AstType::UInt8)
+      @context.set_constant_uint_value(byte_size_id, byte_size)
+      @context.set_constant_uint_value(alignment_id, alignment)
+      @context.set_type(current_node_id, @context.type_table.pointer_type_id(byte_type_id))
+    end
+
+    private def checked_constant_uint_value(node_id : NodeId) : UInt64?
+      case node = @context.arena.node(node_id)
+      when IntegerLiteralExpr
+        @context.parsed_module.source_file.slice(node.span).to_u64?
+      when BinaryExpr
+        left = checked_constant_uint_value(node.left)
+        right = checked_constant_uint_value(node.right)
+        return nil unless left && right
+        case node.operator
+        when BinaryOperator::Add
+          return nil if left > UInt64::MAX - right
+          left + right
+        when BinaryOperator::Subtract
+          return nil if left < right
+          left - right
+        end
+      else
+        nil
+      end
+    end
+
     def visit(node : LoadExpr) : Nil
       analyze_load(node)
     end
@@ -1071,6 +1178,10 @@ module Smalang
 
     def visit(node : CallExpr) : Nil
       name = @context.parsed_module.source_file.slice(node.callee)
+      if name == "stack_storage"
+        analyze_stack_storage(node)
+        return
+      end
       if name == "cast"
         analyze_pointer_cast(node)
         return

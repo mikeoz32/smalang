@@ -58,6 +58,27 @@ describe Smalang::IrLowerer do
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
 
+  it "uses aligned uninitialized byte storage in the stack frame" do
+    source = File.read("#{__DIR__}/../examples/unsafe_stack_storage.py")
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    Smalang::IrSExpressionDumper.new.dump(ir).should contain("(stack.storage 8 64)")
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "keeps separate stack storage regions independent" do
+    source = "def main() -> int:\n    unsafe:\n        first_storage: ptr[uint8] = stack_storage(8, 8)\n        second_storage: ptr[uint8] = stack_storage(8, 8)\n        first: ptr[int] = cast[int](first_storage)\n        second: ptr[int] = cast[int](second_storage)\n        store(first, 11)\n        store(second, 22)\n        store(first, 42)\n        result: int = load(second)\n    return result\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(22)
+  end
+
   it "uses the declared memory width for stack-allocated scalar values" do
     source = "def main() -> int:\n    unsafe:\n        flag_address: ptr[bool] = alloc_stack(True)\n        byte_address: ptr[int8] = alloc_stack(42)\n        store(flag_address, False)\n        flag: bool = load(flag_address)\n        value: int8 = load(byte_address)\n    return match flag:\n        case True: 0\n        case False: 42\n"
     result = IrLoweringSpecHelpers.lower(source)

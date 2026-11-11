@@ -2,7 +2,7 @@
 
 ## Статус
 
-Прийнято. `alloc_stack` і скалярний `offset` реалізовані за [ADR 0003](0003-unsafe-memory-operations.md); `cast` з Memory API нижче реалізований. Решта Memory API та AST desugaring масивів ще не реалізовані.
+Прийнято. `alloc_stack` і скалярний `offset` реалізовані за [ADR 0003](0003-unsafe-memory-operations.md); `cast` і `stack_storage` з Memory API нижче реалізовані. Решта Memory API та AST desugaring масивів ще не реалізовані.
 
 ## Контекст
 

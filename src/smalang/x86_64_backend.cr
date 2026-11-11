@@ -303,6 +303,29 @@ module Smalang
     end
   end
 
+  class MachineStackStorage < MachineInstruction
+    getter instruction_id : InstructionId
+    getter result_id : ValueId
+    getter byte_size : UInt64
+    getter alignment : UInt64
+
+    def initialize(position : Int32, @instruction_id : InstructionId, @result_id : ValueId, @byte_size : UInt64, @alignment : UInt64)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [] of ValueId
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_stack_storage(self)
+    end
+  end
+
   class MachinePointerOffset < MachineInstruction
     getter result_id : ValueId
     getter address_id : ValueId
@@ -1056,6 +1079,18 @@ module Smalang
       )
     end
 
+    def visit(instruction : IrStackStorageInstruction) : Nil
+      result_id = instruction.result_id
+      raise X86_64BackendFailure.new("stack storage is missing its result") unless result_id
+      @instructions << MachineStackStorage.new(
+        @instructions.size,
+        instruction.id,
+        result_id,
+        instruction.byte_size,
+        instruction.alignment
+      )
+    end
+
     def visit(instruction : IrPointerOffsetInstruction) : Nil
       result_id = instruction.result_id
       raise X86_64BackendFailure.new("pointer offset is missing its result") unless result_id
@@ -1481,6 +1516,8 @@ module Smalang
     @array_offsets : Hash(ValueId, Int32)
     @array_sizes : Hash(ValueId, Int32)
     @stack_allocation_offsets : Hash(InstructionId, Int32)
+    @stack_storage_offsets : Hash(InstructionId, Int32)
+    @stack_storage_reserved_sizes : Hash(InstructionId, Int32)
     @outgoing_stack_argument_count : Int32
 
     def initialize(function : IrFunction, spill_slot_count : Int32, argument_stage_count : Int32, @outgoing_stack_argument_count : Int32)
@@ -1497,6 +1534,8 @@ module Smalang
       @array_offsets = {} of ValueId => Int32
       @array_sizes = {} of ValueId => Int32
       @stack_allocation_offsets = {} of InstructionId => Int32
+      @stack_storage_offsets = {} of InstructionId => Int32
+      @stack_storage_reserved_sizes = {} of InstructionId => Int32
       cursor = FIXED_FRAME_BYTES + (spill_slot_count + argument_stage_count + @outgoing_stack_argument_count) * 8
       function.value_count.times do |value_id|
         array_type = function.value_type(value_id).as?(IrArrayType)
@@ -1535,8 +1574,30 @@ module Smalang
           cursor = end_offset
         end
       end
+      function.each_block do |block|
+        block.instruction_ids.each do |instruction_id|
+          instruction = function.instruction(instruction_id)
+          storage = instruction.as?(IrStackStorageInstruction)
+          next unless storage
+          unless storage.byte_size > 0 && storage.alignment > 0 && (storage.alignment & (storage.alignment - 1_u64)) == 0
+            raise X86_64BackendFailure.new("stack storage %i#{instruction_id} has an invalid size or alignment")
+          end
+          reserved_size = storage.byte_size.to_u128 + storage.alignment.to_u128 - 1_u128
+          if reserved_size > Int32::MAX
+            raise X86_64BackendFailure.new("stack storage %i#{instruction_id} exceeds x86_64 frame limits")
+          end
+          end_offset_64 = cursor.to_i64 + reserved_size.to_i64
+          if end_offset_64 > Int32::MAX
+            raise X86_64BackendFailure.new("stack storages exceed x86_64 frame limits")
+          end
+          end_offset = end_offset_64.to_i32
+          @stack_storage_offsets[instruction_id] = -end_offset
+          @stack_storage_reserved_sizes[instruction_id] = reserved_size.to_i32
+          cursor = end_offset
+        end
+      end
       frame_size_64 = ((cursor.to_i64 + 15) // 16) * 16
-      raise X86_64BackendFailure.new("array stack frame exceeds x86_64 frame limits") if frame_size_64 > Int32::MAX
+      raise X86_64BackendFailure.new("stack frame exceeds x86_64 frame limits") if frame_size_64 > Int32::MAX
       @frame_size = frame_size_64.to_i32
     end
 
@@ -1594,6 +1655,14 @@ module Smalang
 
     def stack_allocation_offset(instruction_id : InstructionId) : Int32
       @stack_allocation_offsets[instruction_id]? || raise X86_64BackendFailure.new("missing frame slot for stack allocation %i#{instruction_id}")
+    end
+
+    def stack_storage_offset(instruction_id : InstructionId) : Int32
+      @stack_storage_offsets[instruction_id]? || raise X86_64BackendFailure.new("missing frame storage for stack storage %i#{instruction_id}")
+    end
+
+    def stack_storage_reserved_size(instruction_id : InstructionId) : Int32
+      @stack_storage_reserved_sizes[instruction_id]? || raise X86_64BackendFailure.new("missing frame size for stack storage %i#{instruction_id}")
     end
 
     def hidden_return_pointer_offset : Int32
@@ -1789,6 +1858,13 @@ module Smalang
       write_rex(true, X86_64Register::Rax, register)
       @buffer.write_u8(0x81_u8)
       @buffer.write_u8(0xc0_u8 | register.code)
+      @buffer.write_i32(value)
+    end
+
+    def and_immediate_register(register : X86_64Register, value : Int32) : Nil
+      write_rex(true, X86_64Register::Rax, register)
+      @buffer.write_u8(0x81_u8)
+      @buffer.write_u8(0xe0_u8 | register.code)
       @buffer.write_i32(value)
     end
 
@@ -2322,6 +2398,14 @@ module Smalang
       )
       @code.lea_rbp_relative(X86_64Register::Rax, @frame.stack_allocation_offset(allocation.instruction_id))
       location(allocation.result_id).store_from(@code, X86_64Register::Rax, @frame)
+    end
+
+    def emit_stack_storage(storage : MachineStackStorage) : Nil
+      @code.lea_rbp_relative(X86_64Register::Rax, @frame.stack_storage_offset(storage.instruction_id))
+      alignment = storage.alignment.to_i32
+      @code.add_immediate_register(X86_64Register::Rax, alignment - 1)
+      @code.and_immediate_register(X86_64Register::Rax, -alignment)
+      location(storage.result_id).store_from(@code, X86_64Register::Rax, @frame)
     end
 
     def emit_pointer_offset(offset : MachinePointerOffset) : Nil

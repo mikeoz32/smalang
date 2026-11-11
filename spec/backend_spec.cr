@@ -50,6 +50,56 @@ describe Smalang::X86_64Backend do
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
 
+  it "reserves padding and emits dynamic alignment for stack storage" do
+    ir = Smalang::IrModule.new
+    main = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    entry = main.entry_block_id
+    storage = main.emit_stack_storage(entry, 8_u64, 64_u64)
+    value_pointer_type = Smalang::IrPointerType.new(Smalang::IrType::Isize)
+    typed_storage = main.emit_pointer_cast(entry, storage, value_pointer_type)
+    value = main.emit_constant(entry, Smalang::IrType::Isize, 42)
+    main.emit_store(entry, typed_storage, value, value_pointer_type)
+    result = main.emit_load(entry, typed_storage, value_pointer_type)
+    main.emit_return(entry, result)
+
+    instruction = main.instruction(0).not_nil!.as(Smalang::IrStackStorageInstruction)
+    frame = Smalang::X86_64FrameLayout.new(main, 0, 0, 0)
+    frame.stack_storage_reserved_size(instruction.id).should eq(71)
+    ir.verify.should be_empty
+
+    object = Smalang::X86_64Backend.new.emit(ir)
+    BackendPointerOffsetSpecHelpers.contains_bytes?(object, [0x48_u8, 0x81_u8, 0xc0_u8, 0x3f_u8, 0x00_u8, 0x00_u8, 0x00_u8]).should eq(true)
+    BackendPointerOffsetSpecHelpers.contains_bytes?(object, [0x48_u8, 0x81_u8, 0xe0_u8, 0xc0_u8, 0xff_u8, 0xff_u8, 0xff_u8]).should eq(true)
+    BackendSpecHelpers.link_and_run(ir).should eq(42)
+  end
+
+  it "returns a runtime-aligned stack storage address" do
+    ir = Smalang::IrModule.new
+    pointer_type = Smalang::IrPointerType.new(Smalang::IrType::UInt8)
+    main = ir.add_function("main", Array(Smalang::IrType).new, pointer_type)
+    storage = main.emit_stack_storage(main.entry_block_id, 1_u64, 256_u64)
+    main.emit_return(main.entry_block_id, storage)
+
+    BackendSpecHelpers.link_and_run(ir).should eq(0)
+  end
+
+  it "rejects combined stack storage regions beyond frame displacement limits" do
+    ir = Smalang::IrModule.new
+    main = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    entry = main.entry_block_id
+    first = main.emit_stack_storage(entry, 2_147_483_547_u64, 1_u64)
+    second = main.emit_stack_storage(entry, 100_u64, 1_u64)
+    pointer_type = Smalang::IrPointerType.new(Smalang::IrType::UInt8)
+    main.emit_store(entry, first, main.emit_constant(entry, Smalang::IrType::UInt8, 1), pointer_type)
+    main.emit_store(entry, second, main.emit_constant(entry, Smalang::IrType::UInt8, 2), pointer_type)
+    result = main.emit_constant(entry, Smalang::IrType::Isize, 0)
+    main.emit_return(entry, result)
+
+    expect_raises(Smalang::X86_64BackendFailure, "stack storages exceed x86_64 frame limits") do
+      Smalang::X86_64Backend.new.emit(ir)
+    end
+  end
+
   it "passes bool values through calls, phi nodes, and true and false branches" do
     [0_i128, 1_i128].each do |input|
       ir = Smalang::IrModule.new

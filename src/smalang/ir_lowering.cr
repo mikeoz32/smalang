@@ -615,7 +615,12 @@ module Smalang
     end
 
     def visit(node : CallExpr) : Nil
-      if @context.parsed_module.source_file.slice(node.callee) == "cast"
+      name = @context.parsed_module.source_file.slice(node.callee)
+      if name == "stack_storage"
+        lower_stack_storage(node)
+        return
+      end
+      if name == "cast"
         lower_pointer_cast(node)
         return
       end
@@ -757,6 +762,25 @@ module Smalang
       end
 
       @expression_value_id = function.emit_pointer_cast(current_block_id, address_id, pointer_type)
+    end
+
+    private def lower_stack_storage(node : CallExpr) : Nil
+      byte_size_id = @context.parsed_module.arena.child(node.arguments, 0)
+      alignment_id = @context.parsed_module.arena.child(node.arguments, 1)
+      byte_size = @context.semantic_module.constant_uint_value(byte_size_id)
+      alignment = @context.semantic_module.constant_uint_value(alignment_id)
+      unless byte_size && alignment
+        @context.report(node.span, "missing compile-time stack_storage layout")
+        return
+      end
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "stack_storage is not inside a function")
+        return
+      end
+
+      @expression_value_id = function.emit_stack_storage(current_block_id, byte_size, alignment)
     end
 
     private def lower_load(node : LoadExpr) : Nil

@@ -202,6 +202,43 @@ describe Smalang::IrModule do
     Smalang::IrSExpressionDumper.new.dump(ir).should contain("(ptr.cast %v0)")
   end
 
+  it "verifies and dumps stack storage layout in s notation" do
+    ir = Smalang::IrModule.new
+    pointer_type = Smalang::IrPointerType.new(Smalang::IrType::UInt8)
+    function = ir.add_function("storage", Array(Smalang::IrType).new, pointer_type)
+    result = function.emit_stack_storage(function.entry_block_id, 24_u64, 64_u64)
+    function.emit_return(function.entry_block_id, result)
+
+    ir.verify.should be_empty
+    Smalang::IrSExpressionDumper.new.dump(ir).should contain("(stack.storage 24 64)")
+    effects = function.instruction(0).not_nil!.memory_effects
+    effects.allocates.should eq(true)
+    effects.reads.should eq(false)
+    effects.writes.should eq(false)
+    effects.frees.should eq(false)
+  end
+
+  it "rejects stack storage with zero size, zero or non-power-of-two alignment, and overflow" do
+    ir = Smalang::IrModule.new
+    pointer_type = Smalang::IrPointerType.new(Smalang::IrType::UInt8)
+    [
+      {0_u64, 8_u64},
+      {8_u64, 0_u64},
+      {8_u64, 3_u64},
+      {UInt64::MAX, 8_u64},
+    ].each_with_index do |(byte_size, alignment), index|
+      function = ir.add_function("invalid_storage_#{index}", Array(Smalang::IrType).new, pointer_type)
+      result = function.emit_stack_storage(function.entry_block_id, byte_size, alignment)
+      function.emit_return(function.entry_block_id, result)
+    end
+
+    diagnostics = ir.verify.join("\n")
+    diagnostics.should contain("stack.storage byte size must be greater than zero")
+    diagnostics.should contain("stack.storage alignment must be greater than zero")
+    diagnostics.should contain("stack.storage alignment must be a power of two")
+    diagnostics.should contain("stack.storage size and alignment overflow uint")
+  end
+
   it "rejects pointer casts with a non-pointer source or target" do
     ir = Smalang::IrModule.new
     function = ir.add_function("invalid_source", [Smalang::IrType::Isize], Smalang::IrType::Unit)

@@ -4,6 +4,25 @@ module Smalang
   alias InstructionId = Int32
   alias BlockId = Int32
 
+  struct IrMemoryEffects
+    getter reads : Bool
+    getter writes : Bool
+    getter allocates : Bool
+    getter frees : Bool
+    getter unknown : Bool
+
+    def initialize(@reads : Bool = false, @writes : Bool = false, @allocates : Bool = false, @frees : Bool = false, @unknown : Bool = false)
+    end
+
+    NONE           = new
+    READ           = new(reads: true)
+    WRITE          = new(writes: true)
+    ALLOCATE       = new(allocates: true)
+    ALLOCATE_WRITE = new(writes: true, allocates: true)
+    FREE           = new(frees: true)
+    UNKNOWN        = new(reads: true, writes: true, allocates: true, frees: true, unknown: true)
+  end
+
   class IrType
     enum Kind : UInt8
       Isize
@@ -409,6 +428,7 @@ module Smalang
     abstract def visit(instruction : IrUnitConstantInstruction) : Nil
     abstract def visit(instruction : IrArrayLiteralInstruction) : Nil
     abstract def visit(instruction : IrStackAllocateInstruction) : Nil
+    abstract def visit(instruction : IrStackStorageInstruction) : Nil
     abstract def visit(instruction : IrPointerOffsetInstruction) : Nil
     abstract def visit(instruction : IrPointerCastInstruction) : Nil
     abstract def visit(instruction : IrLoadInstruction) : Nil
@@ -442,6 +462,10 @@ module Smalang
     abstract def terminator? : Bool
     abstract def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
     abstract def accept(visitor : IrInstructionVisitor) : Nil
+
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::NONE
+    end
 
     def successor_block_ids : Array(BlockId)
       [] of BlockId
@@ -539,6 +563,10 @@ module Smalang
       @elements.dup
     end
 
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::ALLOCATE_WRITE
+    end
+
     def terminator? : Bool
       false
     end
@@ -582,6 +610,10 @@ module Smalang
       [@address_id]
     end
 
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::READ
+    end
+
     def terminator? : Bool
       false
     end
@@ -617,6 +649,10 @@ module Smalang
       [@initial_value_id]
     end
 
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::ALLOCATE_WRITE
+    end
+
     def terminator? : Bool
       false
     end
@@ -635,6 +671,51 @@ module Smalang
 
     def expression : String
       "(%v#{@result_id.not_nil!} #{@pointer_type.label} (stack.alloc %v#{@initial_value_id}))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrStackStorageInstruction < IrInstruction
+    getter byte_size : UInt64
+    getter alignment : UInt64
+    getter pointer_type : IrPointerType
+
+    def initialize(id : InstructionId, block_id : BlockId, result_id : ValueId, @byte_size : UInt64, @alignment : UInt64)
+      @pointer_type = IrPointerType.new(IrType::UInt8)
+      super(id, block_id, result_id, @pointer_type)
+    end
+
+    def used_values : Array(ValueId)
+      [] of ValueId
+    end
+
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::ALLOCATE
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      errors << context.error("stack.storage byte size must be greater than zero") if @byte_size == 0
+      if @alignment == 0
+        errors << context.error("stack.storage alignment must be greater than zero")
+      elsif (@alignment & (@alignment - 1_u64)) != 0
+        errors << context.error("stack.storage alignment must be a power of two")
+      end
+      if @byte_size > UInt64::MAX - (@alignment > 0 ? @alignment - 1_u64 : 0_u64)
+        errors << context.error("stack.storage size and alignment overflow uint")
+      end
+      errors
+    end
+
+    def expression : String
+      "(%v#{@result_id.not_nil!} #{@pointer_type.label} (stack.storage #{@byte_size} #{@alignment}))"
     end
 
     def accept(visitor : IrInstructionVisitor) : Nil
@@ -744,6 +825,10 @@ module Smalang
       [@address_id, @value_id]
     end
 
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::WRITE
+    end
+
     def terminator? : Bool
       false
     end
@@ -781,6 +866,10 @@ module Smalang
 
     def used_values : Array(ValueId)
       [@address_id]
+    end
+
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::FREE
     end
 
     def terminator? : Bool
@@ -917,6 +1006,10 @@ module Smalang
     abstract def expression : String
     abstract def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
     abstract def accept(visitor : IrInvokeOperationVisitor, instruction : IrInvokeInstruction) : Nil
+
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::NONE
+    end
   end
 
   class IrCallOperation < IrInvokeOperation
@@ -934,6 +1027,10 @@ module Smalang
 
     def used_values : Array(ValueId)
       @arguments.dup
+    end
+
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::UNKNOWN
     end
 
     def result_type : IrType
@@ -982,6 +1079,10 @@ module Smalang
       [@initial_value_id]
     end
 
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::ALLOCATE_WRITE
+    end
+
     def result_type : IrType
       @pointer_type
     end
@@ -1017,6 +1118,10 @@ module Smalang
 
     def used_values : Array(ValueId)
       [@array_id, @index_id]
+    end
+
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::READ
     end
 
     def result_type : IrType
@@ -1057,6 +1162,10 @@ module Smalang
 
     def used_values : Array(ValueId)
       [@array_id, @index_id, @value_id]
+    end
+
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::WRITE
     end
 
     def result_type : IrType
@@ -1309,6 +1418,10 @@ module Smalang
 
     def used_values : Array(ValueId)
       @operation.used_values
+    end
+
+    def memory_effects : IrMemoryEffects
+      @operation.memory_effects
     end
 
     def successor_block_ids : Array(BlockId)
@@ -1641,6 +1754,13 @@ module Smalang
     def emit_stack_allocate(block_id : BlockId, initial_value_id : ValueId, pointer_type : IrPointerType) : ValueId
       append_result(block_id, pointer_type) do |instruction_id, result_id|
         IrStackAllocateInstruction.new(instruction_id, block_id, result_id, initial_value_id, pointer_type)
+      end
+    end
+
+    def emit_stack_storage(block_id : BlockId, byte_size : UInt64, alignment : UInt64) : ValueId
+      pointer_type = IrPointerType.new(IrType::UInt8)
+      append_result(block_id, pointer_type) do |instruction_id, result_id|
+        IrStackStorageInstruction.new(instruction_id, block_id, result_id, byte_size, alignment)
       end
     end
 

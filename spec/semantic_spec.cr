@@ -69,6 +69,41 @@ describe Smalang::SemanticAnalyzer do
     end
   end
 
+  it "checks stack storage size, alignment, constants, arity, and unsafe context" do
+    accepted = SemanticSpecHelpers.analyze(
+      "def main() -> int:\n    unsafe:\n        bytes: ptr[uint8] = stack_storage(4 + 4, 4 + 4)\n    return 0\n"
+    )
+    accepted.success?.should eq(true)
+
+    invalid_programs = [
+      {"def stack_storage(bytes: uint, alignment: uint) -> uint:\n    return bytes\n\ndef main() -> int:\n    return 0\n", "function name 'stack_storage' is reserved for an unsafe memory operation"},
+      {"def reserve() -> ptr[uint8]:\n    return stack_storage(8, 8)\n\ndef main() -> int:\n    return 0\n", "unsafe operation 'stack_storage' requires an unsafe block"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage()\n    return 0\n", "stack_storage expects 2 arguments, got 0"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(8)\n    return 0\n", "stack_storage expects 2 arguments, got 1"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(8, 8, 8)\n    return 0\n", "stack_storage expects 2 arguments, got 3"},
+      {"def main() -> int:\n    unsafe:\n        size: int = 8\n        storage: ptr[uint8] = stack_storage(size, 8)\n    return 0\n", "stack_storage byte size has type int, expected uint"},
+      {"def main() -> int:\n    unsafe:\n        alignment: int = 8\n        storage: ptr[uint8] = stack_storage(8, alignment)\n    return 0\n", "stack_storage alignment has type int, expected uint"},
+      {"def main() -> int:\n    unsafe:\n        size: uint = 8\n        storage: ptr[uint8] = stack_storage(size, 8)\n    return 0\n", "stack_storage byte size must be a compile-time constant"},
+      {"def size() -> uint:\n    return 8\n\ndef main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(size(), 8)\n    return 0\n", "stack_storage byte size must be a compile-time constant"},
+      {"def main() -> int:\n    unsafe:\n        alignment: uint = 8\n        storage: ptr[uint8] = stack_storage(8, alignment)\n    return 0\n", "stack_storage alignment must be a compile-time constant"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(0, 8)\n    return 0\n", "stack_storage byte size must be greater than zero"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(8, 0)\n    return 0\n", "stack_storage alignment must be greater than zero"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(8, 3)\n    return 0\n", "stack_storage alignment must be a power of two"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(18446744073709551615 + 1, 8)\n    return 0\n", "stack_storage byte size constant expression overflows uint"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(0 - 1, 8)\n    return 0\n", "stack_storage byte size constant expression overflows uint"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(8, 18446744073709551615 + 2)\n    return 0\n", "stack_storage alignment constant expression overflows uint"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(18446744073709551615, 2)\n    return 0\n", "stack_storage size and alignment overflow uint"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(2147483648, 1)\n    return 0\n", "stack_storage region exceeds x86_64 frame limits"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.description.should eq(expected_message)
+    end
+  end
+
   it "checks pointer offset types, arity, and unsafe context" do
     accepted = SemanticSpecHelpers.analyze(
       "def main() -> int:\n    unsafe:\n        address: ptr[int8] = alloc_stack(42)\n        shifted: ptr[int8] = offset(address, 1)\n    return 0\n"
