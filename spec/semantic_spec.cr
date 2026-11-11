@@ -104,6 +104,95 @@ describe Smalang::SemanticAnalyzer do
     end
   end
 
+  it "accepts scalar and pointer layout queries as compile-time uint values" do
+    layouts = [
+      {"bool", 1_u64, 1_u64},
+      {"int", 8_u64, 8_u64},
+      {"uint", 8_u64, 8_u64},
+      {"int8", 1_u64, 1_u64},
+      {"uint8", 1_u64, 1_u64},
+      {"int16", 2_u64, 2_u64},
+      {"uint16", 2_u64, 2_u64},
+      {"int32", 4_u64, 4_u64},
+      {"uint32", 4_u64, 4_u64},
+      {"int64", 8_u64, 8_u64},
+      {"uint64", 8_u64, 8_u64},
+    ]
+    source_lines = ["def main() -> int:", "    unsafe:"]
+    expected_values = [] of UInt64
+    layouts.each do |type_name, size, alignment|
+      source_lines << "        size_#{type_name}: uint = size_of(#{type_name})"
+      source_lines << "        alignment_#{type_name}: uint = align_of(#{type_name})"
+      expected_values << size << alignment
+    end
+    source_lines << "        pointer_size: uint = size_of(ptr[int])"
+    source_lines << "        pointer_alignment: uint = align_of(ptr[bool])"
+    source_lines << "        bool_pointer_size: uint = size_of(ptr[bool])"
+    source_lines << "        int_pointer_alignment: uint = align_of(ptr[int])"
+    source_lines << "        storage: ptr[uint8] = stack_storage(size_of(uint64), align_of(uint64))"
+    source_lines << "        storage_sum: ptr[uint8] = stack_storage(size_of(uint64) + align_of(uint64), align_of(uint64))"
+    source_lines << "        storage_difference: ptr[uint8] = stack_storage(size_of(uint64) - align_of(uint32), align_of(uint64))"
+    expected_values.concat([8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 4_u64, 8_u64])
+    source_lines << "    return 0"
+    source = source_lines.join("\n") + "\n"
+
+    tokens = Smalang::Lexer.new.tokenize(source, "layout_queries.py")
+    parsed = Smalang::Parser.new(tokens).parse
+    parsed.success?.should eq(true)
+    result = Smalang::SemanticAnalyzer.new(parsed.parsed_module).analyze
+    result.success?.should eq(true)
+
+    semantic_module = result.semantic_module.not_nil!
+    query_values = [] of UInt64?
+    parsed.parsed_module.arena.size.times do |node_id|
+      call = parsed.parsed_module.arena.node(node_id).as?(Smalang::CallExpr)
+      next unless call
+      name = parsed.parsed_module.source_file.slice(call.callee)
+      next unless name == "size_of" || name == "align_of"
+      query_values << semantic_module.constant_uint_value(node_id)
+    end
+    query_values.should eq(expected_values.map { |value| value.as(UInt64?) })
+  end
+
+  it "checks layout query unsafe context, type arguments, and arity" do
+    invalid_programs = [
+      {"def main() -> int:\n    return size_of(int)\n", "unsafe operation 'size_of' requires an unsafe block"},
+      {"def main() -> int:\n    unsafe:\n        value: uint = size_of()\n    return 0\n", "size_of expects 1 type argument, got 0"},
+      {"def main() -> int:\n    unsafe:\n        value: uint = align_of(int, uint)\n    return 0\n", "align_of expects 1 type argument, got 2"},
+      {"def main() -> int:\n    unsafe:\n        value: uint = size_of(missing_type)\n    return 0\n", "size_of expects a supported type name"},
+      {"def main() -> int:\n    unsafe:\n        value: uint = size_of(42)\n    return 0\n", "size_of expects a supported type name"},
+      {"def main() -> int:\n    unsafe:\n        value: uint = size_of(ptr[ptr[int]])\n    return 0\n", "size_of expects a supported type name"},
+      {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(size_of(int) + 18446744073709551615, 8)\n    return 0\n", "stack_storage byte size constant expression overflows uint"},
+      {"def size_of(type_name: int) -> uint:\n    return 1\n\ndef main() -> int:\n    return 0\n", "function name 'size_of' is reserved for an unsafe memory operation"},
+      {"def align_of(type_name: int) -> uint:\n    return 1\n\ndef main() -> int:\n    return 0\n", "function name 'align_of' is reserved for an unsafe memory operation"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.description.should eq(expected_message)
+    end
+  end
+
+  it "checks address_of unsafe context, arity, and place arguments" do
+    invalid_programs = [
+      {"def main() -> int:\n    value: int = 42\n    address: ptr[int] = address_of(value)\n    return 0\n", "unsafe operation 'address_of' requires an unsafe block"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = address_of()\n    return 0\n", "address_of expects 1 argument, got 0"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = address_of(42)\n    return 0\n", "address_of requires a scalar local binding or parameter"},
+      {"def main() -> int:\n    unsafe:\n        address: ptr[int] = alloc_stack(42)\n        pointer: ptr[uint8] = address_of(address)\n    return 0\n", "address_of supports scalar local bindings and parameters only"},
+      {"def main() -> int:\n    values: array[int, 1] = [42]\n    unsafe:\n        address: ptr[int] = address_of(values)\n    return 0\n", "address_of supports scalar local bindings and parameters only"},
+      {"def address_of(value: int) -> ptr[int]:\n    return value\n\ndef main() -> int:\n    return 0\n", "function name 'address_of' is reserved for an unsafe memory operation"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
+
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.description.should eq(expected_message)
+    end
+  end
+
   it "checks pointer offset types, arity, and unsafe context" do
     accepted = SemanticSpecHelpers.analyze(
       "def main() -> int:\n    unsafe:\n        address: ptr[int8] = alloc_stack(42)\n        shifted: ptr[int8] = offset(address, 1)\n    return 0\n"

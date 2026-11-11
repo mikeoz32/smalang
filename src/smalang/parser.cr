@@ -1002,9 +1002,9 @@ module Smalang
       end
     end
 
-    private def parse_expression(arena : AstArena, minimum_precedence : Int32 = PRECEDENCE) : NodeId
+    private def parse_expression(arena : AstArena, minimum_precedence : Int32 = PRECEDENCE, allow_type_names : Bool = false) : NodeId
       left = begin
-        parse_postfix(arena, parse_primary(arena))
+        parse_postfix(arena, parse_primary(arena, allow_type_names), allow_type_names)
       rescue failure : ParseFailure
         raise failure if @indent_depth > 1
         @diagnostics << failure.diagnostic
@@ -1016,7 +1016,7 @@ module Smalang
         break if PRECEDENCE < minimum_precedence
 
         advance
-        right = parse_expression(arena, PRECEDENCE + 1)
+        right = parse_expression(arena, PRECEDENCE + 1, allow_type_names)
         left_span = arena.node(left).span
         right_span = arena.node(right).span
         span = SourceSpan.new(left_span.start, right_span.end_offset - left_span.start)
@@ -1026,7 +1026,7 @@ module Smalang
       left
     end
 
-    private def parse_primary(arena : AstArena) : NodeId
+    private def parse_primary(arena : AstArena, allow_type_names : Bool = false) : NodeId
       case current_token.kind
       when TokenKind::IntegerLiteral
         token = advance
@@ -1050,9 +1050,12 @@ module Smalang
         else
           arena.add(IdentifierExpr.new(name))
         end
+      when TokenKind::IntType, TokenKind::UIntType, TokenKind::BoolType, TokenKind::Int8Type, TokenKind::UInt8Type, TokenKind::Int16Type, TokenKind::UInt16Type, TokenKind::Int32Type, TokenKind::UInt32Type, TokenKind::Int64Type, TokenKind::UInt64Type
+        fail("expected an expression, found #{current_token.kind}") unless allow_type_names
+        arena.add(IdentifierExpr.new(advance.span))
       when TokenKind::LeftParen
         open_paren = advance
-        expression = parse_expression(arena)
+        expression = parse_expression(arena, allow_type_names: allow_type_names)
         if current_token.kind == TokenKind::RightParen
           advance
           expression
@@ -1126,11 +1129,11 @@ module Smalang
       arena.add(ArrayLiteralExpr.new(span_between(start, finish), elements))
     end
 
-    private def parse_postfix(arena : AstArena, expression_id : NodeId) : NodeId
+    private def parse_postfix(arena : AstArena, expression_id : NodeId, allow_type_names : Bool = false) : NodeId
       current = expression_id
       while current_token.kind == TokenKind::LeftBracket
         advance
-        index_id = parse_expression(arena)
+        index_id = parse_expression(arena, allow_type_names: allow_type_names)
         finish = expect(TokenKind::RightBracket, "expected ']' after the index").span.end_offset
         expression_span = arena.node(current).span
         current = arena.add(IndexExpr.new(span_between(expression_span.start, finish), current, index_id))
@@ -1198,7 +1201,9 @@ module Smalang
     end
 
     private def parse_call(arena : AstArena, callee : SourceSpan) : NodeId
-      arguments, call_span, closed = parse_call_arguments(arena, callee)
+      name = @tokens.source_file.slice(callee)
+      allow_type_names = name == "size_of" || name == "align_of"
+      arguments, call_span, closed = parse_call_arguments(arena, callee, allow_type_names)
       expression_id = case @tokens.source_file.slice(callee)
                       when "alloc"
                         arena.add(AllocateExpr.new(call_span, arguments))
@@ -1234,9 +1239,9 @@ module Smalang
       closed ? statement_id : arena.add(ErrorNode.new(span, statement_id))
     end
 
-    private def parse_call_arguments(arena : AstArena, callee : SourceSpan) : Tuple(NodeRange, SourceSpan, Bool)
+    private def parse_call_arguments(arena : AstArena, callee : SourceSpan, allow_type_names : Bool = false) : Tuple(NodeRange, SourceSpan, Bool)
       expect(TokenKind::LeftParen, "expected '(' after the function name")
-      arguments = parse_delimited_list(arena, "argument") { parse_expression(arena) }
+      arguments = parse_delimited_list(arena, "argument") { parse_expression(arena, allow_type_names: allow_type_names) }
       close_paren = if current_token.kind == TokenKind::RightParen
                       advance
                     else

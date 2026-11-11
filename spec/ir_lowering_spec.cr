@@ -79,6 +79,27 @@ describe Smalang::IrLowerer do
     BackendSpecHelpers.link_and_run(ir).should eq(22)
   end
 
+  it "keeps address-taken scalar bindings coherent across pointers and calls" do
+    source = "def mutate(address: ptr[int]) -> int:\n    unsafe:\n        store(address, 73)\n        value: int = load(address)\n    return value\n\ndef update_parameter(value: int) -> int:\n    unsafe:\n        address: ptr[int] = address_of(value)\n        store(address, value + 1)\n        updated: int = value\n    return updated\n\ndef main() -> int:\n    value: mut[int] = 40\n    unsafe:\n        address: ptr[int] = address_of(value)\n        store(address, 41)\n        after_pointer_write: int = value\n        value = 42\n        after_binding_write: int = load(address)\n        updated: int = mutate(address)\n        parameter_value: int = update_parameter(value)\n        result: int = after_pointer_write + after_binding_write + parameter_value\n    return result\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(157)
+  end
+
+  it "uses scalar and pointer type layouts in executable memory operations" do
+    source = File.read("#{__DIR__}/../examples/unsafe_type_layout_address.py")
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    Smalang::IrSExpressionDumper.new.dump(ir).should contain("(stack.storage 8 8)")
+    BackendSpecHelpers.link_and_run(ir).should eq(230)
+  end
+
   it "uses the declared memory width for stack-allocated scalar values" do
     source = "def main() -> int:\n    unsafe:\n        flag_address: ptr[bool] = alloc_stack(True)\n        byte_address: ptr[int8] = alloc_stack(42)\n        store(flag_address, False)\n        flag: bool = load(flag_address)\n        value: int8 = load(byte_address)\n    return match flag:\n        case True: 0\n        case False: 42\n"
     result = IrLoweringSpecHelpers.lower(source)

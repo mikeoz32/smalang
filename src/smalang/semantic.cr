@@ -144,6 +144,37 @@ module Smalang
       @types[type_id].as?(PointerTypeInfo)
     end
 
+    def scalar_type_id(name : String) : TypeId?
+      case name
+      when "int"    then @type_ids_by_ast_type[AstType::Int]?
+      when "uint"   then @type_ids_by_ast_type[AstType::UInt]?
+      when "bool"   then @type_ids_by_ast_type[AstType::Bool]?
+      when "int8"   then @type_ids_by_ast_type[AstType::Int8]?
+      when "uint8"  then @type_ids_by_ast_type[AstType::UInt8]?
+      when "int16"  then @type_ids_by_ast_type[AstType::Int16]?
+      when "uint16" then @type_ids_by_ast_type[AstType::UInt16]?
+      when "int32"  then @type_ids_by_ast_type[AstType::Int32]?
+      when "uint32" then @type_ids_by_ast_type[AstType::UInt32]?
+      when "int64"  then @type_ids_by_ast_type[AstType::Int64]?
+      when "uint64" then @type_ids_by_ast_type[AstType::UInt64]?
+      else
+        nil
+      end
+    end
+
+    def storage_alignment(type_id : TypeId) : UInt128?
+      case type_info = @types[type_id]
+      when IntegerTypeInfo
+        type_info.bit_width == 0 ? 1_u128 : (type_info.bit_width // 8).to_u128
+      when PointerTypeInfo
+        (POINTER_WIDTH // 8).to_u128
+      when ArrayTypeInfo
+        storage_alignment(type_info.element_type_id)
+      else
+        nil
+      end
+    end
+
     def pointer_type_id(pointee_type_id : TypeId) : TypeId
       @pointer_type_ids[pointee_type_id]? || register_pointer_type(pointee_type_id)
     end
@@ -293,12 +324,14 @@ module Smalang
     @node_types : Array(TypeId?)
     @node_symbols : Array(SymbolId?)
     @constant_uint_values : Array(UInt64?)
+    @address_taken_symbols : Array(SymbolId)
     @symbols : Array(SemanticSymbol)
 
-    def initialize(@parsed_module : ParsedModule, @type_table : SemanticTypeTable, node_types : Array(TypeId?), node_symbols : Array(SymbolId?), constant_uint_values : Array(UInt64?), symbols : Array(SemanticSymbol))
+    def initialize(@parsed_module : ParsedModule, @type_table : SemanticTypeTable, node_types : Array(TypeId?), node_symbols : Array(SymbolId?), constant_uint_values : Array(UInt64?), address_taken_symbols : Array(SymbolId), symbols : Array(SemanticSymbol))
       @node_types = node_types.dup
       @node_symbols = node_symbols.dup
       @constant_uint_values = constant_uint_values.dup
+      @address_taken_symbols = address_taken_symbols.dup
       @symbols = symbols.dup
     end
 
@@ -312,6 +345,10 @@ module Smalang
 
     def constant_uint_value(node_id : NodeId) : UInt64?
       @constant_uint_values[node_id]?
+    end
+
+    def address_taken?(symbol_id : SymbolId) : Bool
+      @address_taken_symbols.includes?(symbol_id)
     end
 
     def symbol(id : SymbolId) : SemanticSymbol
@@ -355,6 +392,7 @@ module Smalang
     @node_types : Array(TypeId?)
     @node_symbols : Array(SymbolId?)
     @constant_uint_values : Array(UInt64?)
+    @address_taken_symbols : Array(SymbolId)
     @symbols : Array(SemanticSymbol)
     @functions_by_declaration : Hash(NodeId, SemanticFunctionSymbol)
 
@@ -365,6 +403,7 @@ module Smalang
       @node_types = Array(TypeId?).new(@arena.size) { nil }
       @node_symbols = Array(SymbolId?).new(@arena.size) { nil }
       @constant_uint_values = Array(UInt64?).new(@arena.size) { nil }
+      @address_taken_symbols = Array(SymbolId).new
       @symbols = Array(SemanticSymbol).new
       @functions_by_declaration = Hash(NodeId, SemanticFunctionSymbol).new
       @diagnostic = nil
@@ -458,6 +497,14 @@ module Smalang
       @constant_uint_values[node_id] = value
     end
 
+    def set_address_taken(symbol_id : SymbolId) : Nil
+      @address_taken_symbols << symbol_id unless @address_taken_symbols.includes?(symbol_id)
+    end
+
+    def constant_uint_value(node_id : NodeId) : UInt64?
+      @constant_uint_values[node_id]?
+    end
+
     def type_of(node_id : NodeId) : TypeId?
       @node_types[node_id]?
     end
@@ -468,7 +515,7 @@ module Smalang
     end
 
     def finish : SemanticModule
-      SemanticModule.new(@parsed_module, @type_table, @node_types, @node_symbols, @constant_uint_values, @symbols)
+      SemanticModule.new(@parsed_module, @type_table, @node_types, @node_symbols, @constant_uint_values, @address_taken_symbols, @symbols)
     end
 
     private def parameter_type_ids(parameters : NodeRange) : Array(TypeId)
@@ -482,7 +529,7 @@ module Smalang
     end
 
     private def unsafe_memory_operation_name?(name : String) : Bool
-      name == "alloc" || name == "alloc_stack" || name == "offset" || name == "cast" || name == "stack_storage" || name == "load" || name == "store" || name == "free"
+      name == "alloc" || name == "alloc_stack" || name == "offset" || name == "cast" || name == "stack_storage" || name == "size_of" || name == "align_of" || name == "address_of" || name == "load" || name == "store" || name == "free"
     end
   end
 
@@ -920,6 +967,80 @@ module Smalang
       @context.set_type(current_node_id, @context.type_table.pointer_type_id(target_type_id))
     end
 
+    private def analyze_type_layout_query(node : CallExpr, operation_name : String) : Nil
+      return unless require_unsafe_context(node.span, operation_name)
+      unless node.arguments.count == 1
+        @context.report(node.span, "#{operation_name} expects 1 type argument, got #{node.arguments.count}")
+        return
+      end
+
+      argument_id = @context.arena.child(node.arguments, 0)
+      type_id = type_operand_id(argument_id)
+      unless type_id
+        @context.report(@context.arena.node(argument_id).span, "#{operation_name} expects a supported type name")
+        return
+      end
+
+      layout = if operation_name == "size_of"
+                 @context.type_table.storage_size(type_id)
+               else
+                 @context.type_table.storage_alignment(type_id)
+               end
+      unless layout && layout <= UInt64::MAX
+        @context.report(@context.arena.node(argument_id).span, "#{operation_name} layout is not representable as uint")
+        return
+      end
+
+      @context.set_type(current_node_id, @context.type_table.uint_type_id)
+      @context.set_constant_uint_value(current_node_id, layout.to_u64)
+    end
+
+    private def type_operand_id(node_id : NodeId) : TypeId?
+      case node = @context.arena.node(node_id)
+      when IdentifierExpr
+        name = @context.parsed_module.source_file.slice(node.span)
+        @context.type_table.scalar_type_id(name)
+      when IndexExpr
+        pointer_name = @context.arena.node(node.array).as?(IdentifierExpr)
+        return nil unless pointer_name && @context.parsed_module.source_file.slice(pointer_name.span) == "ptr"
+        pointee_type_id = type_operand_id(node.index)
+        return nil unless pointee_type_id && @context.type_table.scalar_type(pointee_type_id)
+        @context.type_table.pointer_type_id(pointee_type_id)
+      else
+        nil
+      end
+    end
+
+    private def analyze_address_of(node : CallExpr) : Nil
+      return unless require_unsafe_context(node.span, "address_of")
+      unless node.arguments.count == 1
+        @context.report(node.span, "address_of expects 1 argument, got #{node.arguments.count}")
+        return
+      end
+
+      place_id = @context.arena.child(node.arguments, 0)
+      identifier = @context.arena.node(place_id).as?(IdentifierExpr)
+      unless identifier
+        @context.report(@context.arena.node(place_id).span, "address_of requires a scalar local binding or parameter")
+        return
+      end
+
+      name = @context.parsed_module.source_file.slice(identifier.span)
+      binding = @current_binding_scope.try(&.resolve(name))
+      unless binding
+        @context.report(identifier.span, "unknown name '#{name}'")
+        return
+      end
+      unless @context.type_table.scalar_type(binding.type_id)
+        @context.report(identifier.span, "address_of supports scalar local bindings and parameters only")
+        return
+      end
+
+      @context.set_address_taken(binding.id)
+      @context.set_symbol(current_node_id, binding.id)
+      @context.set_type(current_node_id, @context.type_table.pointer_type_id(binding.type_id))
+    end
+
     private def analyze_stack_storage(node : CallExpr) : Nil
       return unless require_unsafe_context(node.span, "stack_storage")
       unless node.arguments.count == 2
@@ -995,6 +1116,10 @@ module Smalang
     end
 
     private def checked_constant_uint_value(node_id : NodeId) : UInt64?
+      if known_value = @context.constant_uint_value(node_id)
+        return known_value
+      end
+
       case node = @context.arena.node(node_id)
       when IntegerLiteralExpr
         @context.parsed_module.source_file.slice(node.span).to_u64?
@@ -1178,6 +1303,14 @@ module Smalang
 
     def visit(node : CallExpr) : Nil
       name = @context.parsed_module.source_file.slice(node.callee)
+      if name == "size_of" || name == "align_of"
+        analyze_type_layout_query(node, name)
+        return
+      end
+      if name == "address_of"
+        analyze_address_of(node)
+        return
+      end
       if name == "stack_storage"
         analyze_stack_storage(node)
         return
@@ -1380,6 +1513,8 @@ module Smalang
     end
 
     private def compile_time_constant_expression?(node_id : NodeId) : Bool
+      return true if @context.constant_uint_value(node_id)
+
       case node = @context.arena.node(node_id)
       when IntegerLiteralExpr, BooleanLiteralExpr
         true

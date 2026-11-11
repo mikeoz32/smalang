@@ -210,6 +210,18 @@ describe Smalang::Parser do
     expression.arguments.count.should eq(1)
   end
 
+  it "accepts type spellings only in layout query arguments" do
+    layout_query = ParserSpecHelpers.parse(
+      "def main() -> int:\n    unsafe:\n        size: uint = size_of(ptr[int])\n    return 0\n"
+    )
+    layout_query.success?.should eq(true)
+
+    ordinary_call = ParserSpecHelpers.parse(
+      "def consume(value: int) -> int:\n    return value\n\ndef main() -> int:\n    unsafe:\n        value: int = consume(int)\n    return 0\n"
+    )
+    ordinary_call.success?.should eq(false)
+  end
+
   it "rejects nested, empty, and returning unsafe blocks" do
     invalid_programs = [
       {"def main() -> int:\n    unsafe:\n        return 1\n    return 0\n", "return cannot appear inside an unsafe block"},

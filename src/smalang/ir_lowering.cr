@@ -295,6 +295,7 @@ module Smalang
 
   class IrFunctionBodyPass < IrLoweringAstVisitor
     @binding_values_by_symbol : Hash(SymbolId, ValueId)
+    @binding_addresses_by_symbol : Hash(SymbolId, ValueId)
     @current_function : IrFunction?
     @current_block_id : BlockId?
     @expression_value_id : ValueId?
@@ -302,6 +303,7 @@ module Smalang
     def initialize(context : IrLoweringContext)
       super(context)
       @binding_values_by_symbol = Hash(SymbolId, ValueId).new
+      @binding_addresses_by_symbol = Hash(SymbolId, ValueId).new
       @current_function = nil
       @current_block_id = nil
       @expression_value_id = nil
@@ -344,23 +346,31 @@ module Smalang
       end
 
       @binding_values_by_symbol.clear
+      @binding_addresses_by_symbol.clear
       node.parameters.count.times do |index|
         parameter_node_id = @context.parsed_module.arena.child(node.parameters, index)
+        parameter_node = @context.parsed_module.arena.node(parameter_node_id).as(ParameterNode)
         parameter_symbol_id = @context.semantic_module.symbol_for(parameter_node_id)
         unless parameter_symbol_id
-          parameter_node = @context.parsed_module.arena.node(parameter_node_id).as(ParameterNode)
           @context.report(parameter_node.name, "missing semantic symbol for parameter")
           return
         end
 
         parameter_symbol = @context.semantic_module.symbol(parameter_symbol_id).as?(SemanticParameterSymbol)
         unless parameter_symbol
-          parameter_node = @context.parsed_module.arena.node(parameter_node_id).as(ParameterNode)
           @context.report(parameter_node.name, "semantic symbol is not a parameter")
           return
         end
 
-        @binding_values_by_symbol[parameter_symbol_id] = parameters[index].value_id
+        parameter_value_id = parameters[index].value_id
+        if @context.semantic_module.address_taken?(parameter_symbol_id)
+          pointer_type = binding_pointer_type(parameter_symbol_id, parameter_node.name)
+          return unless pointer_type
+          address_id = function.emit_stack_allocate(function.entry_block_id, parameter_value_id, pointer_type)
+          @binding_addresses_by_symbol[parameter_symbol_id] = address_id
+        else
+          @binding_values_by_symbol[parameter_symbol_id] = parameter_value_id
+        end
       end
 
       @current_function = function
@@ -471,7 +481,19 @@ module Smalang
         return
       end
 
-      @binding_values_by_symbol[symbol_id] = value_id
+      if @context.semantic_module.address_taken?(symbol_id)
+        pointer_type = binding_pointer_type(symbol_id, node.name)
+        return unless pointer_type
+        function = @current_function
+        unless function
+          @context.report(node.name, "address-taken binding is not inside a function")
+          return
+        end
+        address_id = function.emit_stack_allocate(current_block_id, value_id, pointer_type)
+        @binding_addresses_by_symbol[symbol_id] = address_id
+      else
+        @binding_values_by_symbol[symbol_id] = value_id
+      end
     end
 
     def visit(node : AssignmentNode) : Nil
@@ -484,7 +506,18 @@ module Smalang
           @context.report(target.span, "missing semantic binding for assignment")
           return
         end
-        @binding_values_by_symbol[symbol_id] = value_id
+        if address_id = @binding_addresses_by_symbol[symbol_id]?
+          pointer_type = binding_pointer_type(symbol_id, target.span)
+          return unless pointer_type
+          function = @current_function
+          unless function
+            @context.report(target.span, "address-taken assignment is not inside a function")
+            return
+          end
+          function.emit_store(current_block_id, address_id, value_id, pointer_type)
+        else
+          @binding_values_by_symbol[symbol_id] = value_id
+        end
       elsif index = target.as?(IndexExpr)
         value_id = lower_expression(node.value)
         return unless value_id
@@ -618,6 +651,14 @@ module Smalang
       name = @context.parsed_module.source_file.slice(node.callee)
       if name == "stack_storage"
         lower_stack_storage(node)
+        return
+      end
+      if name == "size_of" || name == "align_of"
+        lower_type_layout_query(node)
+        return
+      end
+      if name == "address_of"
+        lower_address_of(node)
         return
       end
       if name == "cast"
@@ -783,6 +824,38 @@ module Smalang
       @expression_value_id = function.emit_stack_storage(current_block_id, byte_size, alignment)
     end
 
+    private def lower_type_layout_query(node : CallExpr) : Nil
+      value = @context.semantic_module.constant_uint_value(current_node_id)
+      unless value
+        @context.report(node.span, "missing compile-time type layout")
+        return
+      end
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "type layout query is not inside a function")
+        return
+      end
+
+      @expression_value_id = function.emit_constant(current_block_id, IrType::Usize, value.to_i128)
+    end
+
+    private def lower_address_of(node : CallExpr) : Nil
+      symbol_id = @context.semantic_module.symbol_for(current_node_id)
+      unless symbol_id
+        @context.report(node.span, "missing semantic binding for address_of")
+        return
+      end
+
+      address_id = @binding_addresses_by_symbol[symbol_id]?
+      unless address_id
+        @context.report(node.span, "address_of binding has no stack storage")
+        return
+      end
+
+      @expression_value_id = address_id
+    end
+
     private def lower_load(node : LoadExpr) : Nil
       address_node_id = @context.parsed_module.arena.child(node.arguments, 0)
       address_id = lower_expression(address_node_id)
@@ -807,6 +880,18 @@ module Smalang
       end
     end
 
+    private def binding_pointer_type(symbol_id : SymbolId, span : SourceSpan) : IrPointerType?
+      binding = @context.semantic_module.symbol(symbol_id).as?(SemanticBindingSymbol)
+      unless binding
+        @context.report(span, "address-taken symbol is not a binding")
+        return nil
+      end
+
+      pointee_type = @context.ir_type_for(binding.type_id, span)
+      return nil unless pointee_type
+      IrPointerType.new(pointee_type)
+    end
+
     def visit(node : IdentifierExpr) : Nil
       symbol_id = @context.semantic_module.symbol_for(current_node_id)
       unless symbol_id
@@ -814,13 +899,24 @@ module Smalang
         return
       end
 
-      value_id = @binding_values_by_symbol[symbol_id]?
-      unless value_id
-        @context.report(node.span, "identifier has no corresponding IR binding value")
-        return
-      end
+      if address_id = @binding_addresses_by_symbol[symbol_id]?
+        pointer_type = binding_pointer_type(symbol_id, node.span)
+        return unless pointer_type
+        function = @current_function
+        unless function
+          @context.report(node.span, "address-taken binding read is not inside a function")
+          return
+        end
+        @expression_value_id = function.emit_load(current_block_id, address_id, pointer_type)
+      else
+        value_id = @binding_values_by_symbol[symbol_id]?
+        unless value_id
+          @context.report(node.span, "identifier has no corresponding IR binding value")
+          return
+        end
 
-      @expression_value_id = value_id
+        @expression_value_id = value_id
+      end
     end
 
     def visit(node : IntegerLiteralExpr) : Nil
