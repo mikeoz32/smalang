@@ -409,6 +409,8 @@ module Smalang
       name = call.try { |expression| @context.parsed_module.source_file.slice(expression.callee) }
       if call && name == "heap_free"
         lower_heap_free(call)
+      elsif call && name == "copy_memory"
+        lower_copy_memory(call)
       else
         @context.report(node.span, "expression statements are not supported")
       end
@@ -890,6 +892,25 @@ module Smalang
       end
 
       function.emit_heap_free(current_block_id, address_id, byte_size_id, alignment)
+    end
+
+    private def lower_copy_memory(node : CallExpr) : Nil
+      destination_id = lower_expression(@context.parsed_module.arena.child(node.arguments, 0))
+      return unless destination_id
+
+      source_id = lower_expression(@context.parsed_module.arena.child(node.arguments, 1))
+      return unless source_id
+
+      byte_count_id = lower_expression(@context.parsed_module.arena.child(node.arguments, 2))
+      return unless byte_count_id
+
+      function = @current_function
+      unless function
+        @context.report(node.span, "copy_memory is not inside a function")
+        return
+      end
+
+      function.emit_copy_memory(current_block_id, destination_id, source_id, byte_count_id)
     end
 
     private def lower_type_layout_query(node : CallExpr) : Nil

@@ -17,6 +17,7 @@ module Smalang
     NONE           = new
     READ           = new(reads: true)
     WRITE          = new(writes: true)
+    READ_WRITE     = new(reads: true, writes: true)
     ALLOCATE       = new(allocates: true)
     ALLOCATE_WRITE = new(writes: true, allocates: true)
     FREE           = new(frees: true)
@@ -436,6 +437,7 @@ module Smalang
     abstract def visit(instruction : IrLoadInstruction) : Nil
     abstract def visit(instruction : IrStoreInstruction) : Nil
     abstract def visit(instruction : IrFreeInstruction) : Nil
+    abstract def visit(instruction : IrCopyMemoryInstruction) : Nil
     abstract def visit(instruction : IrAddInstruction) : Nil
     abstract def visit(instruction : IrSubtractInstruction) : Nil
     abstract def visit(instruction : IrMultiplyInstruction) : Nil
@@ -936,6 +938,54 @@ module Smalang
 
     def expression : String
       "(%v#{@result_id.not_nil!} unit (heap.free %v#{@address_id} %v#{@byte_size_id} #{@alignment}))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrCopyMemoryInstruction < IrInstruction
+    getter destination_id : ValueId
+    getter source_id : ValueId
+    getter byte_count_id : ValueId
+
+    def initialize(id : InstructionId, block_id : BlockId, result_id : ValueId, @destination_id : ValueId, @source_id : ValueId, @byte_count_id : ValueId)
+      super(id, block_id, result_id, IrType::Unit)
+    end
+
+    def used_values : Array(ValueId)
+      [@destination_id, @source_id, @byte_count_id]
+    end
+
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::READ_WRITE
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      expected_pointer_type = IrPointerType.new(IrType::UInt8)
+      destination_type = operand_types[0]?
+      if destination_type && destination_type != expected_pointer_type
+        errors << context.error("copy.memory destination has type #{destination_type.label}, expected #{expected_pointer_type.label}")
+      end
+      source_type = operand_types[1]?
+      if source_type && source_type != expected_pointer_type
+        errors << context.error("copy.memory source has type #{source_type.label}, expected #{expected_pointer_type.label}")
+      end
+      byte_count_type = operand_types[2]?
+      if byte_count_type && byte_count_type != IrType::Usize
+        errors << context.error("copy.memory byte count has type #{byte_count_type.label}, expected usize")
+      end
+      errors
+    end
+
+    def expression : String
+      "(%v#{@result_id.not_nil!} unit (copy.memory %v#{@destination_id} %v#{@source_id} %v#{@byte_count_id}))"
     end
 
     def accept(visitor : IrInstructionVisitor) : Nil
@@ -1890,6 +1940,12 @@ module Smalang
     def emit_heap_free(block_id : BlockId, address_id : ValueId, byte_size_id : ValueId, alignment : UInt64) : ValueId
       append_result(block_id, IrType::Unit) do |instruction_id, result_id|
         IrHeapFreeInstruction.new(instruction_id, block_id, result_id, address_id, byte_size_id, alignment)
+      end
+    end
+
+    def emit_copy_memory(block_id : BlockId, destination_id : ValueId, source_id : ValueId, byte_count_id : ValueId) : ValueId
+      append_result(block_id, IrType::Unit) do |instruction_id, result_id|
+        IrCopyMemoryInstruction.new(instruction_id, block_id, result_id, destination_id, source_id, byte_count_id)
       end
     end
 

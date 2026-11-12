@@ -236,6 +236,79 @@ describe Smalang::IrLowerer do
     BackendSpecHelpers.link_and_run(ir).should eq(42)
   end
 
+  it "lowers copy_memory as a unit operation with read and write effects" do
+    source = "def main() -> int:\n    unsafe:\n        source: ptr[uint8] = alloc_stack(17)\n        destination: ptr[uint8] = alloc_stack(0)\n        copy_memory(destination, source, 1)\n    return 0\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    dump = Smalang::IrSExpressionDumper.new.dump(ir)
+    dump.should contain("(copy.memory")
+    copy = IrLoweringSpecHelpers.instructions(ir.function(0).not_nil!).find do |instruction|
+      instruction.expression.includes?("(copy.memory")
+    end.not_nil!
+    copy.result_type.should eq(Smalang::IrType::Unit)
+    copy.memory_effects.reads.should be_true
+    copy.memory_effects.writes.should be_true
+  end
+
+  it "copies overlapping bytes toward a higher destination address" do
+    source = "def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(8, 8)\n        store(offset(storage, 0), 1)\n        store(offset(storage, 1), 2)\n        store(offset(storage, 2), 3)\n        store(offset(storage, 3), 4)\n        store(offset(storage, 4), 5)\n        store(offset(storage, 5), 6)\n        store(offset(storage, 6), 7)\n        store(offset(storage, 7), 8)\n        copy_memory(offset(storage, 1), storage, 7)\n        result: int = load(cast[int](storage))\n    return result\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    BackendSpecHelpers.link_and_compare_full_width_result(result.ir_module.not_nil!, 0x0706050403020101_u64).should eq(0)
+  end
+
+  it "copies overlapping bytes toward a lower destination address" do
+    source = "def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(8, 8)\n        store(offset(storage, 0), 1)\n        store(offset(storage, 1), 2)\n        store(offset(storage, 2), 3)\n        store(offset(storage, 3), 4)\n        store(offset(storage, 4), 5)\n        store(offset(storage, 5), 6)\n        store(offset(storage, 6), 7)\n        store(offset(storage, 7), 8)\n        copy_memory(storage, offset(storage, 1), 7)\n        result: int = load(cast[int](storage))\n    return result\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    BackendSpecHelpers.link_and_compare_full_width_result(result.ir_module.not_nil!, 0x0808070605040302_u64).should eq(0)
+  end
+
+  it "evaluates copy_memory operands once in source order" do
+    source = "def mark_destination(counter: ptr[uint], target: ptr[uint8]) -> ptr[uint8]:\n    unsafe:\n        current: uint = load(counter)\n        store(counter, current + 1)\n    return target\n\ndef mark_source(counter: ptr[uint], target: ptr[uint8]) -> ptr[uint8]:\n    unsafe:\n        current: uint = load(counter)\n        store(counter, current + 3)\n        result: ptr[uint8] = offset(target, current)\n    return result\n\ndef mark_size(counter: ptr[uint]) -> uint:\n    unsafe:\n        current: uint = load(counter)\n        store(counter, current + 3)\n    return 1\n\ndef main() -> int:\n    unsafe:\n        counter: ptr[uint] = alloc_stack(0)\n        source: ptr[uint8] = stack_storage(2, 1)\n        store(source, 11)\n        store(offset(source, 1), 42)\n        destination: ptr[int] = alloc_stack(0)\n        destination_bytes: ptr[uint8] = cast[uint8](destination)\n        copy_memory(mark_destination(counter, destination_bytes), mark_source(counter, source), mark_size(counter))\n        result: int = load(destination)\n    return result\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    BackendSpecHelpers.link_and_compare_full_width_result(result.ir_module.not_nil!, 42_u64).should eq(0)
+  end
+
+  it "copies between disjoint byte ranges" do
+    source = "def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(16, 8)\n        store(offset(storage, 0), 1)\n        store(offset(storage, 1), 2)\n        store(offset(storage, 2), 3)\n        store(offset(storage, 3), 4)\n        store(offset(storage, 4), 5)\n        store(offset(storage, 5), 6)\n        store(offset(storage, 6), 7)\n        store(offset(storage, 7), 8)\n        copy_memory(offset(storage, 8), storage, 8)\n        result: int = load(cast[int](offset(storage, 8)))\n    return result\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    BackendSpecHelpers.link_and_compare_full_width_result(result.ir_module.not_nil!, 0x0807060504030201_u64).should eq(0)
+  end
+
+  it "supports copying a byte range onto itself" do
+    source = "def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(8, 8)\n        store(offset(storage, 0), 1)\n        store(offset(storage, 1), 2)\n        store(offset(storage, 2), 3)\n        store(offset(storage, 3), 4)\n        store(offset(storage, 4), 5)\n        store(offset(storage, 5), 6)\n        store(offset(storage, 6), 7)\n        store(offset(storage, 7), 8)\n        copy_memory(storage, storage, 8)\n        result: int = load(cast[int](storage))\n    return result\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    BackendSpecHelpers.link_and_compare_full_width_result(result.ir_module.not_nil!, 0x0807060504030201_u64).should eq(0)
+  end
+
+  it "leaves the destination unchanged for a zero-length copy" do
+    source = "def main() -> int:\n    unsafe:\n        destination: ptr[uint8] = stack_storage(8, 8)\n        source: ptr[uint8] = stack_storage(8, 8)\n        store(offset(destination, 0), 11)\n        store(offset(destination, 1), 12)\n        store(offset(destination, 2), 13)\n        store(offset(destination, 3), 14)\n        store(offset(destination, 4), 15)\n        store(offset(destination, 5), 16)\n        store(offset(destination, 6), 17)\n        store(offset(destination, 7), 18)\n        store(offset(source, 0), 21)\n        copy_memory(destination, source, 0)\n        result: int = load(cast[int](destination))\n    return result\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    BackendSpecHelpers.link_and_compare_full_width_result(result.ir_module.not_nil!, 0x1211100f0e0d0c0b_u64).should eq(0)
+  end
+
+  it "runs the checked-in raw memory copy example" do
+    source = File.read("#{__DIR__}/../examples/unsafe_copy_memory.py")
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    BackendSpecHelpers.link_and_run(result.ir_module.not_nil!).should eq(42)
+  end
+
   it "raises InvalidArgument for a runtime zero heap storage size" do
     source = "def allocate(bytes: uint) -> ptr[uint8]:\n    unsafe:\n        address: ptr[uint8] = heap_storage(bytes, 16)\n    return address\n\ndef main() -> int:\n    address: ptr[uint8] = allocate(0)\n    return 0\n"
     result = IrLoweringSpecHelpers.lower(source)

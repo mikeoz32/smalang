@@ -218,6 +218,45 @@ describe Smalang::IrModule do
     effects.frees.should eq(false)
   end
 
+  it "verifies and dumps byte copying with explicit read and write effects" do
+    byte_pointer = Smalang::IrPointerType.new(Smalang::IrType::UInt8)
+    ir = Smalang::IrModule.new
+    function = ir.add_function("copy", [byte_pointer, byte_pointer, Smalang::IrType::Usize], Smalang::IrType::Unit)
+    destination = function.parameters[0].value_id
+    source = function.parameters[1].value_id
+    byte_count = function.parameters[2].value_id
+    result = function.emit_copy_memory(function.entry_block_id, destination, source, byte_count)
+    function.emit_return(function.entry_block_id, result)
+
+    ir.verify.should be_empty
+    dump = Smalang::IrSExpressionDumper.new.dump(ir)
+    dump.should contain("(%v3 unit (copy.memory %v0 %v1 %v2))")
+    copy = function.instruction(0).not_nil!
+    copy.result_type.should eq(Smalang::IrType::Unit)
+    copy.memory_effects.reads.should be_true
+    copy.memory_effects.writes.should be_true
+    copy.memory_effects.allocates.should be_false
+    copy.memory_effects.frees.should be_false
+  end
+
+  it "rejects copy instructions with non-byte pointers or non-uint sizes" do
+    ir = Smalang::IrModule.new
+    typed_pointer = Smalang::IrPointerType.new(Smalang::IrType::Int64)
+    function = ir.add_function("invalid_copy", [typed_pointer, typed_pointer, Smalang::IrType::Isize], Smalang::IrType::Unit)
+    result = function.emit_copy_memory(
+      function.entry_block_id,
+      function.parameters[0].value_id,
+      function.parameters[1].value_id,
+      function.parameters[2].value_id
+    )
+    function.emit_return(function.entry_block_id, result)
+
+    diagnostics = ir.verify.join("\n")
+    diagnostics.should contain("copy.memory destination has type ptr[int64], expected ptr[uint8]")
+    diagnostics.should contain("copy.memory source has type ptr[int64], expected ptr[uint8]")
+    diagnostics.should contain("copy.memory byte count has type isize, expected usize")
+  end
+
   it "rejects stack storage with zero size, zero or non-power-of-two alignment, and overflow" do
     ir = Smalang::IrModule.new
     pointer_type = Smalang::IrPointerType.new(Smalang::IrType::UInt8)

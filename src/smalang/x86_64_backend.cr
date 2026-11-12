@@ -469,6 +469,33 @@ module Smalang
     end
   end
 
+  class MachineCopyMemory < MachineInstruction
+    getter result_id : ValueId
+    getter destination_id : ValueId
+    getter source_id : ValueId
+    getter byte_count_id : ValueId
+
+    def initialize(position : Int32, @result_id : ValueId, @destination_id : ValueId, @source_id : ValueId, @byte_count_id : ValueId)
+      super(position)
+    end
+
+    def used_values : Array(ValueId)
+      [@destination_id, @source_id, @byte_count_id]
+    end
+
+    def result_value_id : ValueId?
+      @result_id
+    end
+
+    def call_boundary? : Bool
+      true
+    end
+
+    def emit(context : X86_64EmissionContext) : Nil
+      context.emit_copy_memory(self)
+    end
+  end
+
   class MachineAllocate < MachineInstruction
     getter result_id : ValueId
     getter exception_id : ValueId
@@ -1203,6 +1230,18 @@ module Smalang
       result_id = instruction.result_id
       raise X86_64BackendFailure.new("heap.free is missing its unit result") unless result_id
       @instructions << MachineHeapFree.new(@instructions.size, result_id, instruction.address_id, instruction.byte_size_id, instruction.alignment)
+    end
+
+    def visit(instruction : IrCopyMemoryInstruction) : Nil
+      result_id = instruction.result_id
+      raise X86_64BackendFailure.new("copy.memory is missing its unit result") unless result_id
+      @instructions << MachineCopyMemory.new(
+        @instructions.size,
+        result_id,
+        instruction.destination_id,
+        instruction.source_id,
+        instruction.byte_count_id
+      )
     end
 
     def visit(instruction : IrAddInstruction) : Nil
@@ -1975,6 +2014,18 @@ module Smalang
       write_modrm(0b11_u8, right, left)
     end
 
+    def clear_direction_flag : Nil
+      @buffer.write_u8(0xfc_u8)
+    end
+
+    def set_direction_flag : Nil
+      @buffer.write_u8(0xfd_u8)
+    end
+
+    def repeat_move_bytes : Nil
+      @buffer.write_bytes([0xf3_u8, 0xa4_u8])
+    end
+
     def shift_left_register(register : X86_64Register, amount : UInt8) : Nil
       write_rex(true, X86_64Register::Rax, register)
       @buffer.write_u8(0xc1_u8)
@@ -2561,6 +2612,58 @@ module Smalang
       @code.move_register(X86_64Register::Rsi, X86_64Register::Rax)
       @code.move_immediate(X86_64Register::Rax, X86_64RuntimeEmitter::UNMAP_SYSCALL)
       @code.emit_syscall
+      restore_call_spills(spills)
+    end
+
+    def emit_copy_memory(copy : MachineCopyMemory) : Nil
+      spills = @allocation.call_spills_at(copy.position)
+      save_call_spills(spills)
+
+      location(copy.destination_id).load_to(@code, X86_64Register::R10, @frame)
+      location(copy.source_id).load_to(@code, X86_64Register::R11, @frame)
+      location(copy.byte_count_id).load_to(@code, X86_64Register::Rax, @frame)
+
+      zero_length = @code.new_label
+      forward_copy = @code.new_label
+      backward_copy = @code.new_label
+      done = @code.new_label
+
+      @code.test_register(X86_64Register::Rax)
+      @code.jump_if_zero_to(zero_length)
+      @code.compare_registers(X86_64Register::R10, X86_64Register::R11)
+      @code.jump_if_below_to(forward_copy)
+      @code.jump_if_equal_to(forward_copy)
+
+      @code.move_register(X86_64Register::Rcx, X86_64Register::R10)
+      @code.subtract_register(X86_64Register::Rcx, X86_64Register::R11)
+      @code.compare_registers(X86_64Register::Rcx, X86_64Register::Rax)
+      @code.jump_if_below_to(backward_copy)
+
+      @code.mark_label(forward_copy)
+      @code.move_register(X86_64Register::Rdi, X86_64Register::R10)
+      @code.move_register(X86_64Register::Rsi, X86_64Register::R11)
+      @code.move_register(X86_64Register::Rcx, X86_64Register::Rax)
+      @code.clear_direction_flag
+      @code.repeat_move_bytes
+      @code.jump_to(done)
+
+      @code.mark_label(backward_copy)
+      @code.move_register(X86_64Register::Rdi, X86_64Register::R10)
+      @code.move_register(X86_64Register::Rsi, X86_64Register::R11)
+      @code.move_register(X86_64Register::Rcx, X86_64Register::Rax)
+      @code.add_register(X86_64Register::Rdi, X86_64Register::Rcx)
+      @code.add_register(X86_64Register::Rsi, X86_64Register::Rcx)
+      @code.move_immediate(X86_64Register::Rcx, 1_u64)
+      @code.subtract_register(X86_64Register::Rdi, X86_64Register::Rcx)
+      @code.subtract_register(X86_64Register::Rsi, X86_64Register::Rcx)
+      @code.move_register(X86_64Register::Rcx, X86_64Register::Rax)
+      @code.set_direction_flag
+      @code.repeat_move_bytes
+      @code.clear_direction_flag
+      @code.jump_to(done)
+
+      @code.mark_label(zero_length)
+      @code.mark_label(done)
       restore_call_spills(spills)
     end
 

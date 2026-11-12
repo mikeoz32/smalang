@@ -140,6 +140,30 @@ describe Smalang::SemanticAnalyzer do
     end
   end
 
+  it "checks copy_memory pointer, size, unsafe, and statement contracts" do
+    accepted = SemanticSpecHelpers.analyze(
+      "def main() -> int:\n    unsafe:\n        source: ptr[uint8] = alloc_stack(42)\n        destination: ptr[uint8] = alloc_stack(0)\n        copy_memory(destination, source, 1)\n    return 0\n"
+    )
+    accepted.success?.should eq(true)
+
+    invalid_programs = [
+      {"def attempt(destination: ptr[uint8], source: ptr[uint8], bytes: uint) -> int:\n    copy_memory(destination, source, bytes)\n    return 0\n\ndef main() -> int:\n    return 0\n", "unsafe operation 'copy_memory' requires an unsafe block"},
+      {"def main() -> int:\n    unsafe:\n        source: ptr[uint8] = alloc_stack(42)\n        destination: ptr[uint8] = alloc_stack(0)\n        copy_memory(destination, source)\n    return 0\n", "copy_memory expects 3 arguments, got 2"},
+      {"def main() -> int:\n    unsafe:\n        source: ptr[uint8] = alloc_stack(42)\n        destination: ptr[uint8] = alloc_stack(0)\n        copy_memory(destination, source, 1, 2)\n    return 0\n", "copy_memory expects 3 arguments, got 4"},
+      {"def main() -> int:\n    unsafe:\n        source: ptr[int] = alloc_stack(42)\n        destination: ptr[uint8] = alloc_stack(0)\n        copy_memory(destination, source, 1)\n    return 0\n", "copy_memory source requires ptr[uint8], got ptr[int]"},
+      {"def main() -> int:\n    unsafe:\n        source: ptr[uint8] = alloc_stack(42)\n        destination: ptr[int] = alloc_stack(0)\n        copy_memory(destination, source, 1)\n    return 0\n", "copy_memory destination requires ptr[uint8], got ptr[int]"},
+      {"def main() -> int:\n    unsafe:\n        source: ptr[uint8] = alloc_stack(42)\n        destination: ptr[uint8] = alloc_stack(0)\n        copy_memory(destination, source, True)\n    return 0\n", "copy_memory byte count has type bool, expected uint"},
+      {"def main() -> int:\n    unsafe:\n        source: ptr[uint8] = alloc_stack(42)\n        destination: ptr[uint8] = alloc_stack(0)\n        result: int = copy_memory(destination, source, 1)\n    return result\n", "copy_memory must be a standalone statement"},
+      {"def copy_memory(destination: ptr[uint8], source: ptr[uint8], bytes: uint) -> int:\n    return 0\n\ndef main() -> int:\n    return 0\n", "function name 'copy_memory' is reserved for an unsafe memory operation"},
+    ]
+
+    invalid_programs.each do |source, expected_message|
+      result = SemanticSpecHelpers.analyze(source)
+      result.success?.should eq(false)
+      result.diagnostic.not_nil!.description.should eq(expected_message)
+    end
+  end
+
   it "accepts scalar and pointer layout queries as compile-time uint values" do
     layouts = [
       {"bool", 1_u64, 1_u64},

@@ -530,7 +530,7 @@ module Smalang
     end
 
     private def unsafe_memory_operation_name?(name : String) : Bool
-      name == "alloc" || name == "alloc_stack" || name == "offset" || name == "cast" || name == "stack_storage" || name == "heap_storage" || name == "heap_free" || name == "size_of" || name == "align_of" || name == "address_of" || name == "load" || name == "store" || name == "free"
+      name == "alloc" || name == "alloc_stack" || name == "offset" || name == "cast" || name == "stack_storage" || name == "heap_storage" || name == "heap_free" || name == "copy_memory" || name == "size_of" || name == "align_of" || name == "address_of" || name == "load" || name == "store" || name == "free"
     end
   end
 
@@ -895,6 +895,8 @@ module Smalang
       name = call.try { |expression| @context.parsed_module.source_file.slice(expression.callee) }
       if call && name == "heap_free"
         analyze_heap_free(call)
+      elsif call && name == "copy_memory"
+        analyze_copy_memory(call)
       else
         @context.report(node.span, "expression statements are not supported")
       end
@@ -1205,6 +1207,39 @@ module Smalang
       checked_heap_storage_alignment(alignment_id, "heap_free")
     end
 
+    private def analyze_copy_memory(node : CallExpr) : Nil
+      return unless require_unsafe_context(node.span, "copy_memory")
+      if node.type_argument
+        @context.report(node.span, "copy_memory does not accept a type argument")
+        return
+      end
+      unless node.arguments.count == 3
+        @context.report(node.span, "copy_memory expects 3 arguments, got #{node.arguments.count}")
+        return
+      end
+
+      byte_type_id = @context.type_table.id_for(AstType::UInt8)
+      expected_pointer_type_id = @context.type_table.pointer_type_id(byte_type_id)
+      ["destination", "source"].each_with_index do |argument_name, index|
+        address_id = @context.arena.child(node.arguments, index)
+        address_type_id = analyze_expression(address_id)
+        return if @context.diagnostic
+        unless address_type_id == expected_pointer_type_id
+          actual_type = address_type_id.try { |type_id| type_label(type_id) } || "unknown"
+          @context.report(@context.arena.node(address_id).span, "copy_memory #{argument_name} requires ptr[uint8], got #{actual_type}")
+          return
+        end
+      end
+
+      byte_count_id = @context.arena.child(node.arguments, 2)
+      byte_count_type_id = analyze_expression(byte_count_id, @context.type_table.uint_type_id)
+      return if @context.diagnostic
+      unless byte_count_type_id == @context.type_table.uint_type_id
+        actual_type = byte_count_type_id.try { |type_id| type_label(type_id) } || "unknown"
+        @context.report(@context.arena.node(byte_count_id).span, "copy_memory byte count has type #{actual_type}, expected uint")
+      end
+    end
+
     private def checked_heap_storage_alignment(alignment_id : NodeId, operation_name : String) : UInt64?
       alignment_type_id = analyze_expression(alignment_id, @context.type_table.uint_type_id)
       return nil if @context.diagnostic
@@ -1430,6 +1465,10 @@ module Smalang
       end
       if name == "heap_free"
         @context.report(node.span, "heap_free must be a standalone statement")
+        return
+      end
+      if name == "copy_memory"
+        @context.report(node.span, "copy_memory must be a standalone statement")
         return
       end
       if name == "size_of" || name == "align_of"
