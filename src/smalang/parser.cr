@@ -2,6 +2,32 @@ module Smalang
   alias NodeId = Int32
   alias AstTypeId = Int32
 
+  struct AstName
+    getter span : SourceSpan
+    getter synthetic_text : String?
+
+    def initialize(@span : SourceSpan)
+      @synthetic_text = nil
+    end
+
+    def initialize(@span : SourceSpan, @synthetic_text : String)
+    end
+
+    def text(source_file : SourceFile) : String
+      @synthetic_text || source_file.slice(@span)
+    end
+
+    def generated? : Bool
+      !@synthetic_text.nil?
+    end
+  end
+
+  class SourceFile
+    def slice(name : AstName) : String
+      name.text(self)
+    end
+  end
+
   enum AstType : UInt8
     Int
     UInt
@@ -65,6 +91,10 @@ module Smalang
     def type(id : AstTypeId) : AstTypeSyntax
       @types[id]
     end
+
+    def size : Int32
+      @types.size
+    end
   end
 
   enum BindingMutability : UInt8
@@ -75,6 +105,23 @@ module Smalang
   enum BinaryOperator : UInt8
     Add
     Subtract
+    Multiply
+  end
+
+  enum IntegerComparisonOperator : UInt8
+    Equal
+    NotEqual
+    LessThan
+    LessThanOrEqual
+    GreaterThan
+    GreaterThanOrEqual
+  end
+
+  enum RuntimeExceptionKind : UInt8
+    DivisionByZero
+    IndexOutOfBounds
+    OutOfMemory
+    InvalidArgument
   end
 
   abstract class SourceMatchPatternVisitor
@@ -136,34 +183,46 @@ module Smalang
 
   struct FunctionNode
     getter span : SourceSpan
-    getter name : SourceSpan
+    getter name : AstName
     getter return_type : AstTypeId
     getter parameters : NodeRange
     getter statements : NodeRange
     getter body : NodeId
 
-    def initialize(@span : SourceSpan, @name : SourceSpan, @return_type : AstTypeId, @parameters : NodeRange, @statements : NodeRange, @body : NodeId)
+    def initialize(@span : SourceSpan, name : SourceSpan, @return_type : AstTypeId, @parameters : NodeRange, @statements : NodeRange, @body : NodeId)
+      @name = AstName.new(name)
+    end
+
+    def initialize(@span : SourceSpan, @name : AstName, @return_type : AstTypeId, @parameters : NodeRange, @statements : NodeRange, @body : NodeId)
     end
   end
 
   struct ParameterNode
     getter span : SourceSpan
-    getter name : SourceSpan
+    getter name : AstName
     getter type : AstTypeId
     getter mutability : BindingMutability
 
-    def initialize(@span : SourceSpan, @name : SourceSpan, @type : AstTypeId, @mutability : BindingMutability)
+    def initialize(@span : SourceSpan, name : SourceSpan, @type : AstTypeId, @mutability : BindingMutability)
+      @name = AstName.new(name)
+    end
+
+    def initialize(@span : SourceSpan, @name : AstName, @type : AstTypeId, @mutability : BindingMutability)
     end
   end
 
   struct VariableDeclarationNode
     getter span : SourceSpan
-    getter name : SourceSpan
+    getter name : AstName
     getter type : AstTypeId
     getter mutability : BindingMutability
     getter initializer : NodeId
 
-    def initialize(@span : SourceSpan, @name : SourceSpan, @type : AstTypeId, @mutability : BindingMutability, @initializer : NodeId)
+    def initialize(@span : SourceSpan, name : SourceSpan, @type : AstTypeId, @mutability : BindingMutability, @initializer : NodeId)
+      @name = AstName.new(name)
+    end
+
+    def initialize(@span : SourceSpan, @name : AstName, @type : AstTypeId, @mutability : BindingMutability, @initializer : NodeId)
     end
   end
 
@@ -311,25 +370,39 @@ module Smalang
 
   struct CallExpr
     getter span : SourceSpan
-    getter callee : SourceSpan
+    getter callee : AstName
     getter arguments : NodeRange
     getter type_argument : AstTypeId?
 
-    def initialize(@span : SourceSpan, @callee : SourceSpan, @arguments : NodeRange, @type_argument : AstTypeId? = nil)
+    def initialize(@span : SourceSpan, callee : SourceSpan, @arguments : NodeRange, @type_argument : AstTypeId? = nil)
+      @callee = AstName.new(callee)
+    end
+
+    def initialize(@span : SourceSpan, @callee : AstName, @arguments : NodeRange, @type_argument : AstTypeId? = nil)
     end
   end
 
   struct IdentifierExpr
     getter span : SourceSpan
+    getter name : AstName
 
     def initialize(@span : SourceSpan)
+      @name = AstName.new(@span)
+    end
+
+    def initialize(@span : SourceSpan, @name : AstName)
     end
   end
 
   struct IntegerLiteralExpr
     getter span : SourceSpan
+    getter synthetic_value : Int128?
 
     def initialize(@span : SourceSpan)
+      @synthetic_value = nil
+    end
+
+    def initialize(@span : SourceSpan, @synthetic_value : Int128)
     end
   end
 
@@ -341,6 +414,50 @@ module Smalang
     end
   end
 
+  struct TypeOperandExpr
+    getter span : SourceSpan
+    getter type_id : AstTypeId
+
+    def initialize(@span : SourceSpan, @type_id : AstTypeId)
+    end
+  end
+
+  struct SequenceExpr
+    getter span : SourceSpan
+    getter statements : NodeRange
+    getter value : NodeId
+
+    def initialize(@span : SourceSpan, @statements : NodeRange, @value : NodeId)
+    end
+  end
+
+  struct IntegerCompareExpr
+    getter span : SourceSpan
+    getter operator : IntegerComparisonOperator
+    getter left : NodeId
+    getter right : NodeId
+
+    def initialize(@span : SourceSpan, @operator : IntegerComparisonOperator, @left : NodeId, @right : NodeId)
+    end
+  end
+
+  struct RuntimeGuardStatementNode
+    getter span : SourceSpan
+    getter condition : NodeId
+    getter exception_kind : RuntimeExceptionKind
+
+    def initialize(@span : SourceSpan, @condition : NodeId, @exception_kind : RuntimeExceptionKind)
+    end
+  end
+
+  struct UnsafeExpr
+    getter span : SourceSpan
+    getter value : NodeId
+
+    def initialize(@span : SourceSpan, @value : NodeId)
+    end
+  end
+
   struct ErrorNode
     getter span : SourceSpan
     getter recovered_node : NodeId?
@@ -349,7 +466,7 @@ module Smalang
     end
   end
 
-  alias AstNode = ModuleNode | FunctionNode | ParameterNode | VariableDeclarationNode | AssignmentNode | ReturnNode | UnsafeBlockNode | CallStatementNode | AllocateExpr | StackAllocateExpr | PointerOffsetExpr | LoadExpr | StoreExpr | FreeExpr | StoreStatementNode | FreeStatementNode | MatchExpressionNode | MatchCaseNode | SourceMatchPatternNode | BinaryExpr | ArrayLiteralExpr | IndexExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | ErrorNode
+  alias AstNode = ModuleNode | FunctionNode | ParameterNode | VariableDeclarationNode | AssignmentNode | ReturnNode | UnsafeBlockNode | CallStatementNode | AllocateExpr | StackAllocateExpr | PointerOffsetExpr | LoadExpr | StoreExpr | FreeExpr | StoreStatementNode | FreeStatementNode | MatchExpressionNode | MatchCaseNode | SourceMatchPatternNode | BinaryExpr | ArrayLiteralExpr | IndexExpr | CallExpr | IdentifierExpr | IntegerLiteralExpr | BooleanLiteralExpr | TypeOperandExpr | SequenceExpr | IntegerCompareExpr | RuntimeGuardStatementNode | UnsafeExpr | ErrorNode
 
   abstract class AstVisitor
     abstract def visit(node : ModuleNode) : Nil
@@ -378,6 +495,22 @@ module Smalang
     abstract def visit(node : CallExpr) : Nil
     abstract def visit(node : IdentifierExpr) : Nil
     abstract def visit(node : IntegerLiteralExpr) : Nil
+
+    def visit(node : TypeOperandExpr) : Nil
+    end
+
+    def visit(node : SequenceExpr) : Nil
+    end
+
+    def visit(node : IntegerCompareExpr) : Nil
+    end
+
+    def visit(node : RuntimeGuardStatementNode) : Nil
+    end
+
+    def visit(node : UnsafeExpr) : Nil
+    end
+
     abstract def visit(node : BooleanLiteralExpr) : Nil
     abstract def visit(node : ErrorNode) : Nil
   end
@@ -527,6 +660,36 @@ module Smalang
   end
 
   struct BooleanLiteralExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct TypeOperandExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct SequenceExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct IntegerCompareExpr
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct RuntimeGuardStatementNode
+    def accept(visitor : AstVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  struct UnsafeExpr
     def accept(visitor : AstVisitor) : Nil
       visitor.visit(self)
     end
@@ -1042,13 +1205,20 @@ module Smalang
       when TokenKind::Match
         parse_match_expression(arena)
       when TokenKind::Identifier
-        name = advance.span
-        if @tokens.source_file.slice(name) == "cast" && generic_type_call_follows?
-          parse_cast_call(arena, name)
-        elsif current_token.kind == TokenKind::LeftParen
-          parse_call(arena, name)
+        name = current_token.span
+        if allow_type_names && @tokens.source_file.slice(name) == "array"
+          type_id = parse_type(@type_arena.not_nil!)
+          type = @type_arena.not_nil!.type(type_id)
+          arena.add(TypeOperandExpr.new(type.span, type_id))
         else
-          arena.add(IdentifierExpr.new(name))
+          advance
+          if @tokens.source_file.slice(name) == "cast" && generic_type_call_follows?
+            parse_cast_call(arena, name)
+          elsif current_token.kind == TokenKind::LeftParen
+            parse_call(arena, name)
+          else
+            arena.add(IdentifierExpr.new(name))
+          end
         end
       when TokenKind::IntType, TokenKind::UIntType, TokenKind::BoolType, TokenKind::Int8Type, TokenKind::UInt8Type, TokenKind::Int16Type, TokenKind::UInt16Type, TokenKind::Int32Type, TokenKind::UInt32Type, TokenKind::Int64Type, TokenKind::UInt64Type
         fail("expected an expression, found #{current_token.kind}") unless allow_type_names

@@ -39,7 +39,6 @@ module Smalang
       Int64
       UInt64
       Unit
-      Array
       Pointer
     end
 
@@ -120,8 +119,6 @@ module Smalang
         0_u128
       when Kind::Pointer
         8_u128
-      when Kind::Array
-        nil
       end
     end
 
@@ -142,10 +139,6 @@ module Smalang
       nil
     end
 
-    def valid_array_element_type? : ::Bool
-      self != IrType::Unit && self != IrType::Exception
-    end
-
     def fixed_width_constant_fits?(value : Int128) : ::Bool
       width = fixed_bit_width
       return false unless width
@@ -161,53 +154,6 @@ module Smalang
 
     def ==(other : IrType) : ::Bool
       self.class == other.class && @kind == other.kind
-    end
-  end
-
-  class IrArrayType < IrType
-    getter element_type : IrType
-    getter length : UInt128
-
-    def initialize(@element_type : IrType, @length : UInt128)
-      super(Kind::Array)
-    end
-
-    def label : String
-      "array[#{@element_type.label}, #{@length}]"
-    end
-
-    def zero_sized? : ::Bool
-      @length == 0 || @element_type.zero_sized?
-    end
-
-    def storage_size : UInt128?
-      element_size = @element_type.storage_size
-      return nil unless element_size
-      return 0_u128 if @length == 0
-      return nil if element_size > UInt128::MAX // @length
-      element_size * @length
-    end
-
-    def alignment : UInt128
-      @element_type.alignment
-    end
-
-    def ==(other : IrType) : ::Bool
-      other_array = other.as?(IrArrayType)
-      !!other_array && @length == other_array.length && @element_type == other_array.element_type
-    end
-
-    def valid_array_element_type? : ::Bool
-      valid_element_type?
-    end
-
-    def valid_element_type? : ::Bool
-      @element_type.valid_array_element_type?
-    end
-
-    def signature_error(subject : String) : String?
-      return nil if valid_element_type?
-      "#{subject} has an array type with unsupported elements"
     end
   end
 
@@ -239,10 +185,6 @@ module Smalang
       @pointee_type.integer? || @pointee_type == IrType::Bool
     end
 
-    def valid_array_element_type? : ::Bool
-      false
-    end
-
     def signature_error(subject : String) : String?
       return nil if valid_pointee_type?
       "#{subject} has pointer type #{label} with unsupported pointee"
@@ -254,6 +196,27 @@ module Smalang
     IndexOutOfBounds
     OutOfMemory
     InvalidArgument
+  end
+
+  enum IrIntegerComparison : UInt8
+    Equal
+    NotEqual
+    LessThan
+    LessThanOrEqual
+    GreaterThan
+    GreaterThanOrEqual
+
+    def mnemonic(type : IrType) : String
+      comparison = case self
+                   when Equal              then "eq"
+                   when NotEqual           then "ne"
+                   when LessThan           then type.signed? ? "slt" : "ult"
+                   when LessThanOrEqual    then type.signed? ? "sle" : "ule"
+                   when GreaterThan        then type.signed? ? "sgt" : "ugt"
+                   when GreaterThanOrEqual then type.signed? ? "sge" : "uge"
+                   end
+      "icmp.#{comparison}"
+    end
   end
 
   struct IrSourceLocation
@@ -422,14 +385,11 @@ module Smalang
     abstract def visit(operation : IrHeapStorageOperation, instruction : IrInvokeInstruction) : Nil
     abstract def visit(operation : IrDivideOperation, instruction : IrInvokeInstruction) : Nil
     abstract def visit(operation : IrRemainderOperation, instruction : IrInvokeInstruction) : Nil
-    abstract def visit(operation : IrArrayGetOperation, instruction : IrInvokeInstruction) : Nil
-    abstract def visit(operation : IrArraySetOperation, instruction : IrInvokeInstruction) : Nil
   end
 
   abstract class IrInstructionVisitor < IrInvokeOperationVisitor
     abstract def visit(instruction : IrConstantInstruction) : Nil
     abstract def visit(instruction : IrUnitConstantInstruction) : Nil
-    abstract def visit(instruction : IrArrayLiteralInstruction) : Nil
     abstract def visit(instruction : IrStackAllocateInstruction) : Nil
     abstract def visit(instruction : IrStackStorageInstruction) : Nil
     abstract def visit(instruction : IrPointerOffsetInstruction) : Nil
@@ -441,10 +401,12 @@ module Smalang
     abstract def visit(instruction : IrAddInstruction) : Nil
     abstract def visit(instruction : IrSubtractInstruction) : Nil
     abstract def visit(instruction : IrMultiplyInstruction) : Nil
+    abstract def visit(instruction : IrIntegerCompareInstruction) : Nil
     abstract def visit(instruction : IrReturnInstruction) : Nil
     abstract def visit(instruction : IrPhiInstruction) : Nil
     abstract def visit(instruction : IrJumpInstruction) : Nil
     abstract def visit(instruction : IrBranchInstruction) : Nil
+    abstract def visit(instruction : IrRaiseInstruction) : Nil
     abstract def visit(instruction : IrInvokeInstruction) : Nil
     abstract def visit(instruction : IrResumeExceptionInstruction) : Nil
     abstract def visit(instruction : IrExceptionDispatchInstruction) : Nil
@@ -544,57 +506,6 @@ module Smalang
 
     def expression : String
       "(%v#{@result_id.not_nil!} unit (unit))"
-    end
-
-    def accept(visitor : IrInstructionVisitor) : Nil
-      visitor.visit(self)
-    end
-  end
-
-  class IrArrayLiteralInstruction < IrInstruction
-    @elements : Array(ValueId)
-
-    def initialize(id : InstructionId, block_id : BlockId, result_id : ValueId, result_type : IrArrayType, elements : Array(ValueId))
-      super(id, block_id, result_id, result_type)
-      @elements = elements.dup
-    end
-
-    def elements : Array(ValueId)
-      @elements.dup
-    end
-
-    def used_values : Array(ValueId)
-      @elements.dup
-    end
-
-    def memory_effects : IrMemoryEffects
-      IrMemoryEffects::ALLOCATE_WRITE
-    end
-
-    def terminator? : Bool
-      false
-    end
-
-    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
-      array_type = @result_type.as?(IrArrayType)
-      return [context.error("array literal result must have an array type")] of String unless array_type
-      errors = [] of String
-      errors << context.error("array element type #{array_type.element_type.label} is not supported") unless array_type.valid_element_type?
-      if @elements.size.to_u128 != array_type.length
-        errors << context.error("array literal has #{@elements.size} elements, expected #{array_type.length}")
-      end
-      operand_types.each_with_index do |type, index|
-        next unless type
-        if type != array_type.element_type
-          errors << context.error("array literal element #{index} has type #{type.label}, expected #{array_type.element_type.label}")
-        end
-      end
-      errors
-    end
-
-    def expression : String
-      elements = @elements.map { |value_id| "%v#{value_id}" }.join(" ")
-      "(%v#{@result_id.not_nil!} #{@result_type.not_nil!.label} (array #{elements}))"
     end
 
     def accept(visitor : IrInstructionVisitor) : Nil
@@ -1069,6 +980,57 @@ module Smalang
     end
   end
 
+  class IrIntegerCompareInstruction < IrInstruction
+    getter predicate : IrIntegerComparison
+    getter left : ValueId
+    getter right : ValueId
+    getter operand_type : IrType
+
+    def initialize(
+      id : InstructionId,
+      block_id : BlockId,
+      result_id : ValueId,
+      @predicate : IrIntegerComparison,
+      @left : ValueId,
+      @right : ValueId,
+      @operand_type : IrType,
+    )
+      super(id, block_id, result_id, IrType::Bool)
+    end
+
+    def used_values : Array(ValueId)
+      [@left, @right]
+    end
+
+    def terminator? : Bool
+      false
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      errors = [] of String
+      left_type = operand_types[0]?
+      right_type = operand_types[1]?
+      unless @operand_type.integer?
+        errors << context.error("integer comparison requires integer operands, got #{@operand_type.label}")
+      end
+      if left_type && left_type != @operand_type
+        errors << context.error("integer comparison left operand has type #{left_type.label}, expected #{@operand_type.label}")
+      end
+      if right_type && right_type != @operand_type
+        errors << context.error("integer comparison right operand has type #{right_type.label}, expected #{@operand_type.label}")
+      end
+      errors
+    end
+
+    def expression : String
+      "(%v#{@result_id.not_nil!} bool (#{@predicate.mnemonic(@operand_type)} %v#{@left} %v#{@right}))"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
   class IrReturnInstruction < IrInstruction
     getter value_id : ValueId
 
@@ -1242,97 +1204,6 @@ module Smalang
         errors << context.error("heap.storage alignment must be greater than zero")
       elsif (@alignment & (@alignment - 1_u64)) != 0
         errors << context.error("heap.storage alignment must be a power of two")
-      end
-      errors
-    end
-
-    def accept(visitor : IrInvokeOperationVisitor, instruction : IrInvokeInstruction) : Nil
-      visitor.visit(self, instruction)
-    end
-  end
-
-  class IrArrayGetOperation < IrInvokeOperation
-    getter array_id : ValueId
-    getter index_id : ValueId
-    getter array_type : IrArrayType
-
-    def initialize(@array_id : ValueId, @index_id : ValueId, @array_type : IrArrayType)
-    end
-
-    def used_values : Array(ValueId)
-      [@array_id, @index_id]
-    end
-
-    def memory_effects : IrMemoryEffects
-      IrMemoryEffects::READ
-    end
-
-    def result_type : IrType
-      @array_type.element_type
-    end
-
-    def expression : String
-      "(array.get %v#{@array_id} %v#{@index_id})"
-    end
-
-    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
-      errors = [] of String
-      errors << context.error("array.get uses an array type with an unsupported element type") unless @array_type.valid_element_type?
-      array_type = operand_types[0]?
-      index_type = operand_types[1]?
-      if array_type && array_type != @array_type
-        errors << context.error("array.get base has type #{array_type.label}, expected #{@array_type.label}")
-      end
-      if index_type && index_type != IrType::Usize
-        errors << context.error("array.get index must have type usize, got #{index_type.label}")
-      end
-      errors
-    end
-
-    def accept(visitor : IrInvokeOperationVisitor, instruction : IrInvokeInstruction) : Nil
-      visitor.visit(self, instruction)
-    end
-  end
-
-  class IrArraySetOperation < IrInvokeOperation
-    getter array_id : ValueId
-    getter index_id : ValueId
-    getter value_id : ValueId
-    getter array_type : IrArrayType
-
-    def initialize(@array_id : ValueId, @index_id : ValueId, @value_id : ValueId, @array_type : IrArrayType)
-    end
-
-    def used_values : Array(ValueId)
-      [@array_id, @index_id, @value_id]
-    end
-
-    def memory_effects : IrMemoryEffects
-      IrMemoryEffects::WRITE
-    end
-
-    def result_type : IrType
-      @array_type
-    end
-
-    def expression : String
-      "(array.set %v#{@array_id} %v#{@index_id} %v#{@value_id})"
-    end
-
-    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
-      errors = [] of String
-      errors << context.error("array.set uses an array type with an unsupported element type") unless @array_type.valid_element_type?
-      array_type = operand_types[0]?
-      index_type = operand_types[1]?
-      value_type = operand_types[2]?
-      if array_type && array_type != @array_type
-        errors << context.error("array.set base has type #{array_type.label}, expected #{@array_type.label}")
-      end
-      if index_type && index_type != IrType::Usize
-        errors << context.error("array.set index must have type usize, got #{index_type.label}")
-      end
-      if value_type && value_type != @array_type.element_type
-        errors << context.error("array.set value has type #{value_type.label}, expected #{@array_type.element_type.label}")
       end
       errors
     end
@@ -1531,6 +1402,60 @@ module Smalang
 
     def dump(function : IrFunction) : String
       "(branch %v#{@condition_id} @#{function.block_name(@true_block_id)} @#{function.block_name(@false_block_id)})"
+    end
+
+    def accept(visitor : IrInstructionVisitor) : Nil
+      visitor.visit(self)
+    end
+  end
+
+  class IrRaiseInstruction < IrInstruction
+    getter exception_kind : IrExceptionKind
+    getter exception_successor : BlockId
+    getter exception_result_id : ValueId
+    getter source_location : IrSourceLocation
+
+    def initialize(
+      id : InstructionId,
+      block_id : BlockId,
+      @exception_kind : IrExceptionKind,
+      @exception_successor : BlockId,
+      @exception_result_id : ValueId,
+      @source_location : IrSourceLocation,
+    )
+      super(id, block_id, nil, nil)
+    end
+
+    def used_values : Array(ValueId)
+      [] of ValueId
+    end
+
+    def successor_block_ids : Array(BlockId)
+      [@exception_successor]
+    end
+
+    def value_definitions(instruction_index : Int32) : Array(IrValueDefinition)
+      [IrValueDefinition.new(@exception_result_id, IrType::Exception, @exception_successor, -1, @block_id)] of IrValueDefinition
+    end
+
+    def memory_effects : IrMemoryEffects
+      IrMemoryEffects::ALLOCATE_WRITE
+    end
+
+    def terminator? : Bool
+      true
+    end
+
+    def validate(context : IrVerificationContext, operand_types : Array(IrType?)) : Array(String)
+      [] of String
+    end
+
+    def expression : String
+      "(raise #{@exception_kind.to_s.underscore.gsub('_', '-')} (exception @#{@exception_successor} %v#{@exception_result_id}) #{@source_location.dump})"
+    end
+
+    def dump(function : IrFunction) : String
+      "(raise #{@exception_kind.to_s.underscore.gsub('_', '-')} (exception @#{function.block_name(@exception_successor)} %v#{@exception_result_id}) #{@source_location.dump})"
     end
 
     def accept(visitor : IrInstructionVisitor) : Nil
@@ -1888,12 +1813,6 @@ module Smalang
       end
     end
 
-    def emit_array_literal(block_id : BlockId, type : IrArrayType, elements : Array(ValueId)) : ValueId
-      append_result(block_id, type) do |instruction_id, result_id|
-        IrArrayLiteralInstruction.new(instruction_id, block_id, result_id, type, elements)
-      end
-    end
-
     def emit_stack_allocate(block_id : BlockId, initial_value_id : ValueId, pointer_type : IrPointerType) : ValueId
       append_result(block_id, pointer_type) do |instruction_id, result_id|
         IrStackAllocateInstruction.new(instruction_id, block_id, result_id, initial_value_id, pointer_type)
@@ -1967,6 +1886,18 @@ module Smalang
       end
     end
 
+    def emit_integer_compare(
+      block_id : BlockId,
+      predicate : IrIntegerComparison,
+      left : ValueId,
+      right : ValueId,
+    ) : ValueId
+      operand_type = value_type(left) || raise IrBuildFailure.new("integer comparison left operand is undefined")
+      append_result(block_id, IrType::Bool) do |instruction_id, result_id|
+        IrIntegerCompareInstruction.new(instruction_id, block_id, result_id, predicate, left, right, operand_type)
+      end
+    end
+
     def emit_invoke_call(
       block_id : BlockId,
       target : IrCallTarget,
@@ -2036,31 +1967,6 @@ module Smalang
       append_invoke(block_id, IrRemainderOperation.new(type, left, right), normal_successor, exception_successor, source_location)
     end
 
-    def emit_invoke_array_get(
-      block_id : BlockId,
-      array_id : ValueId,
-      index_id : ValueId,
-      type : IrArrayType,
-      normal_successor : BlockId,
-      exception_successor : BlockId,
-      source_location : IrSourceLocation? = nil,
-    ) : IrInvokeResults
-      append_invoke(block_id, IrArrayGetOperation.new(array_id, index_id, type), normal_successor, exception_successor, source_location)
-    end
-
-    def emit_invoke_array_set(
-      block_id : BlockId,
-      array_id : ValueId,
-      index_id : ValueId,
-      value_id : ValueId,
-      type : IrArrayType,
-      normal_successor : BlockId,
-      exception_successor : BlockId,
-      source_location : IrSourceLocation? = nil,
-    ) : IrInvokeResults
-      append_invoke(block_id, IrArraySetOperation.new(array_id, index_id, value_id, type), normal_successor, exception_successor, source_location)
-    end
-
     def emit_phi(block_id : BlockId, type : IrType, incoming : Array(IrPhiIncoming)) : ValueId
       append_result(block_id, type) do |instruction_id, result_id|
         IrPhiInstruction.new(instruction_id, block_id, result_id, type, incoming)
@@ -2077,6 +1983,29 @@ module Smalang
       append_terminator(block_id) do |instruction_id|
         IrBranchInstruction.new(instruction_id, block_id, condition_id, true_block_id, false_block_id)
       end
+    end
+
+    def emit_raise(
+      block_id : BlockId,
+      exception_kind : IrExceptionKind,
+      exception_successor : BlockId,
+      source_location : IrSourceLocation,
+    ) : ValueId
+      block = require_block(block_id)
+      require_block(exception_successor)
+      instruction_id = @instructions.size
+      exception_result_id = @values.size
+      @instructions << IrRaiseInstruction.new(
+        instruction_id,
+        block_id,
+        exception_kind,
+        exception_successor,
+        exception_result_id,
+        source_location
+      )
+      @values << IrValueInfo.new(IrType::Exception, instruction_id, exception_successor, block_id)
+      block.append_instruction(instruction_id)
+      exception_result_id
     end
 
     def emit_resume_exception(block_id : BlockId, exception_id : ValueId) : Nil
@@ -2511,6 +2440,26 @@ module Smalang
             worklist,
             diagnostics
           )
+          exceptional_state = state.dup
+          add_exception_owner(
+            context,
+            terminator.exception_result_id,
+            terminator.exception_successor,
+            exceptional_state,
+            diagnostics
+          )
+          enqueue_exception_ownership_edge(
+            context,
+            function,
+            block_id,
+            terminator.exception_successor,
+            exceptional_state,
+            block_instructions,
+            reachable_blocks,
+            worklist,
+            diagnostics
+          )
+        when IrRaiseInstruction
           exceptional_state = state.dup
           add_exception_owner(
             context,

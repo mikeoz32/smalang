@@ -13,90 +13,57 @@ FIXED_WIDTH_IR_TYPES = [
 ]
 
 describe Smalang::IrModule do
-  it "represents fixed arrays as recursive, inline IR types" do
-    byte_array = Smalang::IrArrayType.new(Smalang::IrType::Int8, 3_u128)
-    nested_array = Smalang::IrArrayType.new(byte_array, 2_u128)
-    empty_array = Smalang::IrArrayType.new(Smalang::IrType::Usize, 0_u128)
-
-    byte_array.label.should eq("array[int8, 3]")
-    byte_array.storage_size.should eq(3_u128)
-    nested_array.label.should eq("array[array[int8, 3], 2]")
-    nested_array.storage_size.should eq(6_u128)
-    empty_array.zero_sized?.should be_true
-    empty_array.storage_size.should eq(0_u128)
-    Smalang::IrArrayType.new(Smalang::IrType::Unit, 1_u128).valid_element_type?.should be_false
-  end
-
-  it "dumps typed array literals and checked indexed reads in s notation" do
+  it "represents generic integer comparisons and explicit raises in s notation" do
     ir = Smalang::IrModule.new
-    array_type = Smalang::IrArrayType.new(Smalang::IrType::Isize, 2_u128)
-    function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    function = ir.add_function("checked", [Smalang::IrType::Usize, Smalang::IrType::Usize], Smalang::IrType::Isize)
     entry = function.entry_block_id
-    first = function.emit_constant(entry, Smalang::IrType::Isize, 10)
-    second = function.emit_constant(entry, Smalang::IrType::Isize, 20)
-    array = function.emit_array_literal(entry, array_type, [first, second])
-    index = function.emit_constant(entry, Smalang::IrType::Usize, 1)
-    normal = function.add_block("normal")
+    in_range = function.add_block("in_range")
+    failed = function.add_block("failed")
     unwind = function.add_block("unwind")
-    result = function.emit_invoke_array_get(entry, array, index, array_type, normal, unwind)
-    function.emit_return(normal, result.value_id)
-    function.emit_resume_exception(unwind, result.exception_id)
+    comparison = function.emit_integer_compare(
+      entry,
+      Smalang::IrIntegerComparison::LessThan,
+      function.parameters[0].value_id,
+      function.parameters[1].value_id
+    )
+    function.emit_branch(entry, comparison, in_range, failed)
+
+    zero = function.emit_constant(in_range, Smalang::IrType::Isize, 0)
+    function.emit_return(in_range, zero)
+    exception = function.emit_raise(
+      failed,
+      Smalang::IrExceptionKind::IndexOutOfBounds,
+      unwind,
+      Smalang::IrSourceLocation.new("bounds.py", 7)
+    )
+    function.emit_resume_exception(unwind, exception)
 
     dump = Smalang::IrSExpressionDumper.new.dump(ir)
-    dump.should contain("(%v2 array[isize, 2] (array %v0 %v1))")
-    dump.should contain("(invoke (array.get %v2 %v3) (normal @normal %v4) (exception @unwind %v5)")
+    dump.should contain("(icmp.ult %v0 %v1)")
+    dump.should contain("(raise index-out-of-bounds")
+    dump.should contain("@unwind %v4")
+    dump.should contain("bounds.py")
     ir.verify.should be_empty
   end
 
-  it "verifies and dumps checked indexed array updates" do
+  it "rejects integer comparisons with mismatched operand types" do
     ir = Smalang::IrModule.new
-    array_type = Smalang::IrArrayType.new(Smalang::IrType::Isize, 2_u128)
-    function = ir.add_function("replace", Array(Smalang::IrType).new, array_type)
-    entry = function.entry_block_id
-    first = function.emit_constant(entry, Smalang::IrType::Isize, 10)
-    second = function.emit_constant(entry, Smalang::IrType::Isize, 20)
-    array = function.emit_array_literal(entry, array_type, [first, second])
-    index = function.emit_constant(entry, Smalang::IrType::Usize, 1)
-    replacement = function.emit_constant(entry, Smalang::IrType::Isize, 42)
-    normal = function.add_block("normal")
-    unwind = function.add_block("unwind")
-    result = function.emit_invoke_array_set(entry, array, index, replacement, array_type, normal, unwind)
-    function.emit_return(normal, result.value_id)
-    function.emit_resume_exception(unwind, result.exception_id)
-
-    Smalang::IrSExpressionDumper.new.dump(ir).should contain("(invoke (array.set %v2 %v3 %v4)")
-    ir.verify.should be_empty
-  end
-
-  it "rejects arrays containing IR-only unit values" do
-    ir = Smalang::IrModule.new
-    array_type = Smalang::IrArrayType.new(Smalang::IrType::Unit, 1_u128)
-    parameter_types = Array(Smalang::IrType).new
-    parameter_types << array_type
-    function = ir.add_function("invalid", parameter_types, Smalang::IrType::Isize)
-    value = function.emit_constant(function.entry_block_id, Smalang::IrType::Isize, 0)
-    function.emit_return(function.entry_block_id, value)
-
-    ir.verify.join("\n").should contain("array type with unsupported elements")
-  end
-
-  it "rejects raw pointers as inline array elements" do
-    ir = Smalang::IrModule.new
-    pointer_type = Smalang::IrPointerType.new(Smalang::IrType::Int64)
-    array_type = Smalang::IrArrayType.new(pointer_type, 1_u128)
-    parameter_types = [] of Smalang::IrType
-    parameter_types << array_type
-    function = ir.add_function("invalid", parameter_types, Smalang::IrType::Isize)
-    result = function.emit_constant(function.entry_block_id, Smalang::IrType::Isize, 0)
+    function = ir.add_function("invalid", [Smalang::IrType::Usize, Smalang::IrType::Isize], Smalang::IrType::Bool)
+    result = function.emit_integer_compare(
+      function.entry_block_id,
+      Smalang::IrIntegerComparison::LessThan,
+      function.parameters[0].value_id,
+      function.parameters[1].value_id
+    )
     function.emit_return(function.entry_block_id, result)
 
-    ir.verify.join("\n").should contain("array type with unsupported elements")
+    ir.verify.join(" ").should contain("integer comparison right operand has type isize, expected usize")
   end
 
   it "rejects pointer signatures with unsupported pointee types" do
     pointer_types = [
       Smalang::IrPointerType.new(Smalang::IrType::Unit),
-      Smalang::IrPointerType.new(Smalang::IrArrayType.new(Smalang::IrType::Int64, 2_u128)),
+      Smalang::IrPointerType.new(Smalang::IrType::Exception),
     ]
 
     pointer_types.each do |pointer_type|
@@ -126,7 +93,7 @@ describe Smalang::IrModule do
   it "rejects stack allocation with a non-scalar pointee type" do
     pointer_types = [
       Smalang::IrPointerType.new(Smalang::IrType::Unit),
-      Smalang::IrPointerType.new(Smalang::IrArrayType.new(Smalang::IrType::Isize, 2_u128)),
+      Smalang::IrPointerType.new(Smalang::IrType::Exception),
     ]
 
     pointer_types.each do |pointer_type|

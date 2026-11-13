@@ -24,6 +24,66 @@ module BackendPointerOffsetSpecHelpers
 end
 
 describe Smalang::X86_64Backend do
+  it "executes signed and unsigned integer comparisons" do
+    checks = [] of Tuple(Smalang::IrType, Smalang::IrIntegerComparison, Int128, Int128, Bool)
+    checks << {Smalang::IrType::Isize, Smalang::IrIntegerComparison::Equal, 5_i128, 5_i128, true}
+    checks << {Smalang::IrType::Isize, Smalang::IrIntegerComparison::NotEqual, 5_i128, 5_i128, false}
+    checks << {Smalang::IrType::Isize, Smalang::IrIntegerComparison::LessThan, -1_i128, 0_i128, true}
+    checks << {Smalang::IrType::Isize, Smalang::IrIntegerComparison::LessThanOrEqual, 1_i128, 0_i128, false}
+    checks << {Smalang::IrType::Isize, Smalang::IrIntegerComparison::GreaterThan, 1_i128, 0_i128, true}
+    checks << {Smalang::IrType::Isize, Smalang::IrIntegerComparison::GreaterThanOrEqual, -1_i128, 0_i128, false}
+    checks << {Smalang::IrType::UInt64, Smalang::IrIntegerComparison::Equal, UInt64::MAX.to_i128, UInt64::MAX.to_i128, true}
+    checks << {Smalang::IrType::UInt64, Smalang::IrIntegerComparison::NotEqual, UInt64::MAX.to_i128, UInt64::MAX.to_i128, false}
+    checks << {Smalang::IrType::UInt64, Smalang::IrIntegerComparison::LessThan, 0_i128, UInt64::MAX.to_i128, true}
+    checks << {Smalang::IrType::UInt64, Smalang::IrIntegerComparison::LessThanOrEqual, UInt64::MAX.to_i128, 0_i128, false}
+    checks << {Smalang::IrType::UInt64, Smalang::IrIntegerComparison::GreaterThan, UInt64::MAX.to_i128, 0_i128, true}
+    checks << {Smalang::IrType::UInt64, Smalang::IrIntegerComparison::GreaterThanOrEqual, 0_i128, UInt64::MAX.to_i128, false}
+
+    ir = Smalang::IrModule.new
+    function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    current_block = function.entry_block_id
+    checks.each_with_index do |(type, predicate, left_value, right_value, expected), index|
+      left = function.emit_constant(current_block, type, left_value)
+      right = function.emit_constant(current_block, type, right_value)
+      condition = function.emit_integer_compare(current_block, predicate, left, right)
+      passed = function.add_block("comparison_passed_#{index}")
+      failed = function.add_block("comparison_failed_#{index}")
+      if expected
+        function.emit_branch(current_block, condition, passed, failed)
+      else
+        function.emit_branch(current_block, condition, failed, passed)
+      end
+      failure_code = function.emit_constant(failed, Smalang::IrType::Isize, 1)
+      function.emit_return(failed, failure_code)
+      current_block = passed
+    end
+    success_code = function.emit_constant(current_block, Smalang::IrType::Isize, 0)
+    function.emit_return(current_block, success_code)
+
+    ir.verify.should be_empty
+    BackendSpecHelpers.link_and_run(ir).should eq(0)
+  end
+
+  it "raises an owned exception through an explicit exceptional CFG edge" do
+    ir = Smalang::IrModule.new
+    function = ir.add_function("main", Array(Smalang::IrType).new, Smalang::IrType::Isize)
+    entry = function.entry_block_id
+    unwind = function.add_block("unwind")
+    exception = function.emit_raise(
+      entry,
+      Smalang::IrExceptionKind::IndexOutOfBounds,
+      unwind,
+      Smalang::IrSourceLocation.new("raise_spec.py", 17)
+    )
+    function.emit_resume_exception(unwind, exception)
+
+    ir.verify.should be_empty
+    result = BackendSpecHelpers.link_and_capture(ir)
+    result[:exit_code].should eq(1)
+    result[:stderr].should contain("Uncaught exception: IndexOutOfBounds")
+    result[:stderr].should contain("at main (raise_spec.py:17)")
+  end
+
   it "emits a linkable object for typed IR with an internal call" do
     ir = Smalang::IrModule.new
     increment = ir.add_function(

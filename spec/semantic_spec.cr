@@ -164,7 +164,7 @@ describe Smalang::SemanticAnalyzer do
     end
   end
 
-  it "accepts scalar and pointer layout queries as compile-time uint values" do
+  it "accepts scalar, pointer, and recursive array layout queries as compile-time uint values" do
     layouts = [
       {"bool", 1_u64, 1_u64},
       {"int", 8_u64, 8_u64},
@@ -189,10 +189,16 @@ describe Smalang::SemanticAnalyzer do
     source_lines << "        pointer_alignment: uint = align_of(ptr[bool])"
     source_lines << "        bool_pointer_size: uint = size_of(ptr[bool])"
     source_lines << "        int_pointer_alignment: uint = align_of(ptr[int])"
+    source_lines << "        byte_array_size: uint = size_of(array[int8, 4])"
+    source_lines << "        byte_array_alignment: uint = align_of(array[int8, 4])"
+    source_lines << "        nested_array_size: uint = size_of(array[array[uint32, 3], 2])"
+    source_lines << "        nested_array_alignment: uint = align_of(array[array[uint32, 3], 2])"
+    source_lines << "        empty_array_size: uint = size_of(array[int, 0])"
+    source_lines << "        empty_array_alignment: uint = align_of(array[int, 0])"
     source_lines << "        storage: ptr[uint8] = stack_storage(size_of(uint64), align_of(uint64))"
     source_lines << "        storage_sum: ptr[uint8] = stack_storage(size_of(uint64) + align_of(uint64), align_of(uint64))"
     source_lines << "        storage_difference: ptr[uint8] = stack_storage(size_of(uint64) - align_of(uint32), align_of(uint64))"
-    expected_values.concat([8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 4_u64, 8_u64])
+    expected_values.concat([8_u64, 8_u64, 8_u64, 8_u64, 4_u64, 1_u64, 24_u64, 4_u64, 0_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 8_u64, 4_u64, 8_u64])
     source_lines << "    return 0"
     source = source_lines.join("\n") + "\n"
 
@@ -222,6 +228,7 @@ describe Smalang::SemanticAnalyzer do
       {"def main() -> int:\n    unsafe:\n        value: uint = size_of(missing_type)\n    return 0\n", "size_of expects a supported type name"},
       {"def main() -> int:\n    unsafe:\n        value: uint = size_of(42)\n    return 0\n", "size_of expects a supported type name"},
       {"def main() -> int:\n    unsafe:\n        value: uint = size_of(ptr[ptr[int]])\n    return 0\n", "size_of expects a supported type name"},
+      {"def main() -> int:\n    unsafe:\n        value: uint = size_of(array[ptr[int], 1])\n    return 0\n", "size_of expects a supported type name"},
       {"def main() -> int:\n    unsafe:\n        storage: ptr[uint8] = stack_storage(size_of(int) + 18446744073709551615, 8)\n    return 0\n", "stack_storage byte size constant expression overflows uint"},
       {"def size_of(type_name: int) -> uint:\n    return 1\n\ndef main() -> int:\n    return 0\n", "function name 'size_of' is reserved for an unsafe memory operation"},
       {"def align_of(type_name: int) -> uint:\n    return 1\n\ndef main() -> int:\n    return 0\n", "function name 'align_of' is reserved for an unsafe memory operation"},

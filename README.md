@@ -76,7 +76,7 @@ def calculate(start: int, delta: mut[int]) -> int:
 
 Індекс має тип `uint`. Відомий під час компіляції вихід за межі відхиляється компілятором; динамічний індекс перевіряється під час виконання й породжує runtime-виняток. Від'ємна індексація не входить до початкової моделі. Глобальні масиви потребуватимуть статичної пам'яті; цей зріз реалізує локальні масиви на стеку. Типи, що завеликі для x86_64 stack-frame addressing, відхиляються під час компіляції. Деталі рішення записані в [ADR 0001](docs/adr/0001-fixed-size-arrays.md).
 
-Приклад вкладених масивів, зміни елемента через `mut` і копіювання значення є в `examples/fixed_arrays.py`.
+Приклади масивів розділені за поведінкою: `examples/fixed_arrays.py` показує вкладення, мутацію й копіювання через функції; `examples/fixed_arrays_value_copy.py` — незалежність копій цілого масиву та вкладеного рядка; `examples/fixed_arrays_function_values.py` — вкладені аргументи/результати та змішані register/stack аргументи; `examples/fixed_arrays_empty.py` — передавання й повернення нульових масивів; `examples/fixed_arrays_evaluation_order.py` — порядок RHS та індексів; `examples/fixed_arrays_scalar_types.py` — читання елементів кожного підтримуваного scalar type. `examples/fixed_arrays_bounds_error.py` навмисно завершується з `IndexOutOfBounds` і показує source-level stack trace.
 
 ## Raw-вказівники та unsafe-пам'ять
 
@@ -111,14 +111,14 @@ def choose(value: bool) -> int:
 
 Фіксовані типи проходять через IR lowering, typed IR і backend. У typed IR `int8`/`uint8`, `int16`/`uint16`, `int32`/`uint32` та `int64`/`uint64` залишаються окремими від `isize`/`usize` типами.
 
-## Архітектурний напрямок
+## Архітектура компілятора
 
-Для масивів узгоджено наступний етап: після source semantic checks окремий AST-to-AST pass розгортає масиви в низькорівневі операції сховища, адресації, доступу й копіювання пам'яті в межах тієї самої моделі AST. Частина цих примітивів уже має явний unsafe API: `alloc_stack`, `stack_storage`, `offset` і `cast`; решта додається окремими кроками. AST-to-IR lowering працюватиме з отриманими простими вузлами; source-контракт масивів, включно з копіюванням за значенням і перевірками меж, зберігається. Напрямок і каталог потрібних операцій записані в [ADR 0004](adr/0004-array-desugaring-and-memory-primitives.md); AST-to-AST міграцію ще не реалізовано. Наведений далі потік описує чинний компілятор.
+Після source semantic checks ordered AST-to-AST pass pipeline виконує перетворення, повторно запускаючи semantic analysis після кожного проходу й передаючи оновлені semantic facts наступному. Перший зареєстрований прохід розгортає локальні масиви у byte storage, типізовані scalar load/store, байтову адресацію та `copy_memory`. Копіювання за значенням для присвоєнь, параметрів і результатів функцій зберігається; динамічні індекси перевіряються загальними IR compare, branch і `raise` операціями. Прохід створює окремі AST і type-arena. Typed IR і backend не мають спеціальних типів або операцій для масивів. Глобальні масиви залишаються поза реалізованим зрізом. Рішення записане в [ADR 0004](adr/0004-array-desugaring-and-memory-primitives.md).
 
 Потік компіляції:
 
 ```text
-код smalang → lexer → parser + AST → semantic analysis → AST-to-IR lowering → typed IR → власний backend Linux x86_64 → нативний бінарник
+код smalang → lexer → parser + AST → source semantic analysis → AST-to-AST lowering і перевірка → AST-to-IR lowering → typed IR → власний backend Linux x86_64 → нативний бінарник
 ```
 
 IR буде власним і не залежатиме від конкретної архітектури чи WebAssembly. Його зручно читати у WAT-подібній формі S-expression, але це буде лише запозичення текстового стилю: команди й семантика IR належатимуть smalang. WAT сам по собі є текстовим поданням саме WebAssembly, а не універсальним IR ([специфікація](https://webassembly.github.io/spec/core/text/conventions.html)).

@@ -1,6 +1,8 @@
 require "./semantic"
 require "./ir"
 require "./match_core"
+require "./ast_pass_pipeline"
+require "./array_ast_lowering"
 
 module Smalang
   class IrLoweringDiagnostic
@@ -64,16 +66,9 @@ module Smalang
 
     def ir_type_for(type_id : TypeId, span : SourceSpan) : IrType?
       type_table = @semantic_module.type_table
-      if array_type = type_table.array_type(type_id)
-        element_type = ir_type_for(array_type.element_type_id, span)
-        return nil unless element_type
-        ir_array_type = IrArrayType.new(element_type, array_type.length)
-        storage_size = ir_array_type.storage_size
-        if array_type.length > Int32::MAX || !storage_size || storage_size > Int32::MAX
-          report(span, "array type exceeds x86_64 stack frame or index limits")
-          return nil
-        end
-        return ir_array_type
+      if type_table.array_type(type_id)
+        report(span, "array type remained after AST lowering")
+        return nil
       end
       if pointer_type = type_table.pointer_type(type_id)
         pointee_type = ir_type_for(pointer_type.pointee_type_id, span)
@@ -108,6 +103,10 @@ module Smalang
     def report(span : SourceSpan, description : String) : Nil
       return if @diagnostic
       @diagnostic = IrLoweringDiagnostic.new(parsed_module.source_file, span, description)
+    end
+
+    def report(name : AstName, description : String) : Nil
+      report(name.span, description)
     end
 
     def report_module(description : String) : Nil
@@ -279,12 +278,12 @@ module Smalang
           return
         end
 
-        type = @context.ir_type_for(type_id, node.name)
+        type = @context.ir_type_for(type_id, node.name.span)
         return unless type
         parameter_types << type
       end
 
-      result_type = @context.ir_type_for(function_symbol.result_type_id, node.name)
+      result_type = @context.ir_type_for(function_symbol.result_type_id, node.name.span)
       return unless result_type
 
       name = @context.parsed_module.source_file.slice(node.name)
@@ -364,7 +363,7 @@ module Smalang
 
         parameter_value_id = parameters[index].value_id
         if @context.semantic_module.address_taken?(parameter_symbol_id)
-          pointer_type = binding_pointer_type(parameter_symbol_id, parameter_node.name)
+          pointer_type = binding_pointer_type(parameter_symbol_id, parameter_node.name.span)
           return unless pointer_type
           address_id = function.emit_stack_allocate(function.entry_block_id, parameter_value_id, pointer_type)
           @binding_addresses_by_symbol[parameter_symbol_id] = address_id
@@ -490,7 +489,7 @@ module Smalang
       end
 
       if @context.semantic_module.address_taken?(symbol_id)
-        pointer_type = binding_pointer_type(symbol_id, node.name)
+        pointer_type = binding_pointer_type(symbol_id, node.name.span)
         return unless pointer_type
         function = @current_function
         unless function
@@ -526,17 +525,8 @@ module Smalang
         else
           @binding_values_by_symbol[symbol_id] = value_id
         end
-      elsif index = target.as?(IndexExpr)
-        value_id = lower_expression(node.value)
-        return unless value_id
-        updated_array_id = lower_index_assignment(index, value_id)
-        return unless updated_array_id
-        symbol_id = @context.semantic_module.symbol_for(current_node_id)
-        unless symbol_id
-          @context.report(target.span, "missing semantic binding for indexed assignment")
-          return
-        end
-        @binding_values_by_symbol[symbol_id] = updated_array_id
+      elsif target.is_a?(IndexExpr)
+        @context.report(target.span, "indexed assignment remained after AST lowering")
       else
         @context.report(target.span, "invalid assignment target")
       end
@@ -607,52 +597,83 @@ module Smalang
                                function.emit_add(current_block_id, type, left, right)
                              when BinaryOperator::Subtract
                                function.emit_subtract(current_block_id, type, left, right)
+                             when BinaryOperator::Multiply
+                               function.emit_multiply(current_block_id, type, left, right)
                              end
     end
 
-    def visit(node : ArrayLiteralExpr) : Nil
+    def visit(node : SequenceExpr) : Nil
+      node.statements.count.times do |index|
+        return if @context.diagnostic
+        visit_node(@context.parsed_module.arena.child(node.statements, index))
+      end
+      @expression_value_id = lower_expression(node.value)
+    end
+
+    def visit(node : IntegerCompareExpr) : Nil
+      left_id = lower_expression(node.left)
+      return unless left_id
+      right_id = lower_expression(node.right)
+      return unless right_id
+
+      operand_type_id = @context.type_of(node.left)
+      return unless operand_type_id
+      operand_type = @context.ir_type_for(operand_type_id, node.span)
+      return unless operand_type
+
+      predicate = case node.operator
+                  when IntegerComparisonOperator::Equal              then IrIntegerComparison::Equal
+                  when IntegerComparisonOperator::NotEqual           then IrIntegerComparison::NotEqual
+                  when IntegerComparisonOperator::LessThan           then IrIntegerComparison::LessThan
+                  when IntegerComparisonOperator::LessThanOrEqual    then IrIntegerComparison::LessThanOrEqual
+                  when IntegerComparisonOperator::GreaterThan        then IrIntegerComparison::GreaterThan
+                  when IntegerComparisonOperator::GreaterThanOrEqual then IrIntegerComparison::GreaterThanOrEqual
+                  else
+                    raise "unsupported integer comparison"
+                  end
+      @expression_value_id = @current_function.not_nil!.emit_integer_compare(current_block_id, predicate, left_id, right_id)
+    end
+
+    def visit(node : RuntimeGuardStatementNode) : Nil
+      condition_id = lower_expression(node.condition)
+      return unless condition_id
       function = @current_function
       unless function
-        @context.report(node.span, "array literal is not inside a function")
-        return
-      end
-      type_id = @context.type_of(current_node_id)
-      return unless type_id
-      type = @context.ir_type_for(type_id, node.span).as?(IrArrayType)
-      unless type
-        @context.report(node.span, "array literal has no IR array type")
+        @context.report(node.span, "runtime guard is not inside a function")
         return
       end
 
-      elements = Array(ValueId).new(node.elements.count)
-      node.elements.count.times do |index|
-        source_element_id = @context.parsed_module.arena.child(node.elements, index)
-        element_id = lower_array_literal_element(source_element_id, type.element_type)
-        return unless element_id
-        elements << element_id
-      end
-      @expression_value_id = function.emit_array_literal(current_block_id, type, elements)
+      success_block = function.add_block("guard_success_#{function.block_count}")
+      raise_block = function.add_block("guard_raise_#{function.block_count}")
+      unwind_block = function.add_block("guard_unwind_#{function.block_count}")
+      function.emit_branch(current_block_id, condition_id, success_block, raise_block)
+      exception_kind = case node.exception_kind
+                       when RuntimeExceptionKind::DivisionByZero   then IrExceptionKind::DivisionByZero
+                       when RuntimeExceptionKind::IndexOutOfBounds then IrExceptionKind::IndexOutOfBounds
+                       when RuntimeExceptionKind::OutOfMemory      then IrExceptionKind::OutOfMemory
+                       when RuntimeExceptionKind::InvalidArgument  then IrExceptionKind::InvalidArgument
+                       else
+                         raise "unsupported runtime exception"
+                       end
+      exception_id = function.emit_raise(raise_block, exception_kind, unwind_block, @context.source_location(node.span))
+      function.emit_resume_exception(unwind_block, exception_id)
+      @current_block_id = success_block
+    end
+
+    def visit(node : UnsafeExpr) : Nil
+      @expression_value_id = lower_expression(node.value)
+    end
+
+    def visit(node : TypeOperandExpr) : Nil
+      @context.report(node.span, "type operand cannot be lowered as a runtime value")
+    end
+
+    def visit(node : ArrayLiteralExpr) : Nil
+      @context.report(node.span, "array literal remained after AST lowering")
     end
 
     def visit(node : IndexExpr) : Nil
-      array_id = lower_expression(node.array)
-      return unless array_id
-      index_id = lower_expression(node.index)
-      return unless index_id
-      type_id = @context.type_of(node.array)
-      return unless type_id
-      array_type = @context.ir_type_for(type_id, @context.parsed_module.arena.node(node.array).span).as?(IrArrayType)
-      unless array_type
-        @context.report(node.span, "indexed expression has no IR array type")
-        return
-      end
-      function = @current_function
-      unless function
-        @context.report(node.span, "indexing is not inside a function")
-        return
-      end
-      result = emit_array_get(function, array_id, index_id, array_type, node.span)
-      @expression_value_id = result
+      @context.report(node.span, "array indexing remained after AST lowering")
     end
 
     def visit(node : CallExpr) : Nil
@@ -1009,8 +1030,7 @@ module Smalang
     end
 
     def visit(node : IntegerLiteralExpr) : Nil
-      text = @context.parsed_module.source_file.slice(node.span)
-      value = text.to_i128?
+      value = node.synthetic_value || @context.parsed_module.source_file.slice(node.span).to_i128?
       unless value
         @context.report(node.span, "integer literal cannot be represented by the current IR")
         return
@@ -1052,150 +1072,28 @@ module Smalang
       @expression_value_id
     end
 
-    private def lower_index_assignment(target : IndexExpr, value_id : ValueId) : ValueId?
-      array_node = @context.parsed_module.arena.node(target.array)
-      array_id = lower_expression(target.array)
-      return nil unless array_id
-      index_id = lower_expression(target.index)
-      return nil unless index_id
-      array_type_id = @context.type_of(target.array)
-      return nil unless array_type_id
-      array_type = @context.ir_type_for(array_type_id, array_node.span).as?(IrArrayType)
-      unless array_type
-        @context.report(target.span, "indexed assignment base has no IR array type")
-        return nil
-      end
-      function = @current_function
-      unless function
-        @context.report(target.span, "indexed assignment is not inside a function")
-        return nil
-      end
-
-      updated = emit_array_set(function, array_id, index_id, value_id, array_type, target.span)
-      return nil unless updated
-      if parent = array_node.as?(IndexExpr)
-        lower_index_assignment(parent, updated)
-      else
-        updated
-      end
-    end
-
-    private def lower_array_literal_element(node_id : NodeId, type : IrType) : ValueId?
-      return lower_expression(node_id) if type.is_a?(IrArrayType)
-      semantic_type_id = @context.type_of(node_id)
-      return nil unless semantic_type_id
-      ir_type = @context.ir_type_for(semantic_type_id, @context.parsed_module.arena.node(node_id).span)
-      return nil unless ir_type
-      value = constant_literal_value(node_id, type)
-      unless value
-        @context.report(node_id, "array literal element is not a supported compile-time constant")
-        return nil
-      end
-      function = @current_function
-      unless function
-        @context.report(node_id, "array literal is not inside a function")
-        return nil
-      end
-      function.emit_constant(current_block_id, ir_type, value)
-    end
-
-    private def constant_literal_value(node_id : NodeId, type : IrType) : Int128?
-      bits = constant_literal_bits(node_id, type)
-      return nil unless bits
-      return bits.to_i128 unless type.integer?
-
-      width = integer_bit_width(type)
-      mask = width == 64 ? UInt64::MAX : (1_u64 << width) - 1
-      if type.signed? && (bits & (1_u64 << (width - 1))) != 0
-        bits.to_i128 - (1_i128 << width)
-      else
-        bits.to_i128 & mask.to_i128
-      end
-    end
-
-    private def constant_literal_bits(node_id : NodeId, type : IrType) : UInt64?
-      case node = @context.parsed_module.arena.node(node_id)
-      when IntegerLiteralExpr
-        @context.parsed_module.source_file.slice(node.span).to_u64?
-      when BooleanLiteralExpr
-        node.value ? 1_u64 : 0_u64
-      when BinaryExpr
-        left = constant_literal_bits(node.left, type)
-        right = constant_literal_bits(node.right, type)
-        return nil unless left && right
-        bits = case node.operator
-               when BinaryOperator::Add
-                 left &+ right
-               when BinaryOperator::Subtract
-                 left &- right
-               else
-                 return nil
-               end
-        width = integer_bit_width(type)
-        mask = width == 64 ? UInt64::MAX : (1_u64 << width) - 1
-        bits & mask
-      else
-        nil
-      end
-    end
-
-    private def integer_bit_width(type : IrType) : Int32
-      type.fixed_bit_width || 64
-    end
-
-    private def emit_array_get(function : IrFunction, array_id : ValueId, index_id : ValueId, type : IrArrayType, span : SourceSpan) : ValueId?
-      normal_block = function.add_block("array_get_normal_#{function.block_count}")
-      unwind_block = function.add_block("array_get_unwind_#{function.block_count}")
-      result = function.emit_invoke_array_get(
-        current_block_id,
-        array_id,
-        index_id,
-        type,
-        normal_block,
-        unwind_block,
-        @context.source_location(span)
-      )
-      function.emit_resume_exception(unwind_block, result.exception_id)
-      @current_block_id = normal_block
-      result.value_id
-    end
-
-    private def emit_array_set(
-      function : IrFunction,
-      array_id : ValueId,
-      index_id : ValueId,
-      value_id : ValueId,
-      type : IrArrayType,
-      span : SourceSpan,
-    ) : ValueId?
-      normal_block = function.add_block("array_set_normal_#{function.block_count}")
-      unwind_block = function.add_block("array_set_unwind_#{function.block_count}")
-      result = function.emit_invoke_array_set(
-        current_block_id,
-        array_id,
-        index_id,
-        value_id,
-        type,
-        normal_block,
-        unwind_block,
-        @context.source_location(span)
-      )
-      function.emit_resume_exception(unwind_block, result.exception_id)
-      @current_block_id = normal_block
-      result.value_id
-    end
-
     private def current_block_id : BlockId
       @current_block_id.not_nil!
     end
   end
 
   class IrLowerer
-    def initialize(@semantic_module : SemanticModule)
+    @ast_pass_pipeline : AstPassPipeline
+
+    def initialize(@semantic_module : SemanticModule, ast_pass_pipeline : AstPassPipeline? = nil)
+      @ast_pass_pipeline = ast_pass_pipeline || AstPassPipeline.new([ArrayAstLoweringPass.new] of AstPass)
     end
 
     def lower : IrLoweringResult
-      context = IrLoweringContext.new(@semantic_module)
+      pass_result = @ast_pass_pipeline.run(@semantic_module)
+      unless semantic_module = pass_result.semantic_module
+        diagnostic = pass_result.diagnostic
+        span = diagnostic.try(&.span) || @semantic_module.parsed_module.arena.node(@semantic_module.parsed_module.root_id).span
+        description = diagnostic.try(&.description) || "AST pass pipeline failed without a diagnostic"
+        return failure_result(span, description)
+      end
+
+      context = IrLoweringContext.new(semantic_module)
       IrFunctionDeclarationPass.new(context).run
       return failed_result(context) if context.diagnostic
 
@@ -1213,6 +1111,12 @@ module Smalang
 
     private def failed_result(context : IrLoweringContext) : IrLoweringResult
       IrLoweringResult.new(nil, context.diagnostic)
+    end
+
+    private def failure_result(span : SourceSpan, description : String) : IrLoweringResult
+      parsed_module = @semantic_module.parsed_module
+      diagnostic = IrLoweringDiagnostic.new(parsed_module.source_file, span, description)
+      IrLoweringResult.new(nil, diagnostic)
     end
   end
 end

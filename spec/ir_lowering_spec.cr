@@ -18,8 +18,10 @@ module IrLoweringSpecHelpers
     semantic_module = semantic_result.semantic_module.not_nil!
     parsed_module = semantic_module.parsed_module
     node_count = parsed_module.arena.size
+    type_count = parsed_module.type_arena.size
     result = Smalang::IrLowerer.new(semantic_module).lower
     parsed_module.arena.size.should eq(node_count)
+    parsed_module.type_arena.size.should eq(type_count)
     result
   end
 
@@ -35,6 +37,22 @@ module IrLoweringSpecHelpers
 end
 
 describe Smalang::IrLowerer do
+  it "lowers dynamic array reads to generic compare, branch, and raise IR" do
+    source = "def read(values: array[int, 3], index: uint) -> int:\n    return values[index]\n\ndef main() -> int:\n    values: array[int, 3] = [10, 20, 30]\n    return read(values, 1)\n"
+    result = IrLoweringSpecHelpers.lower(source)
+
+    result.success?.should eq(true)
+    ir = result.ir_module.not_nil!
+    ir.verify.should be_empty
+    dump = Smalang::IrSExpressionDumper.new.dump(ir)
+    dump.should contain("icmp.ult")
+    dump.should contain("raise index-out-of-bounds")
+    dump.should_not contain("array.get")
+    dump.should_not contain("array.set")
+    dump.should_not contain("array[")
+    BackendSpecHelpers.link_and_run(ir).should eq(20)
+  end
+
   it "allocates initialized scalar storage in the stack frame" do
     source = File.read("#{__DIR__}/../examples/unsafe_stack_allocation.py")
     result = IrLoweringSpecHelpers.lower(source)

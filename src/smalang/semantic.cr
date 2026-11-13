@@ -445,7 +445,7 @@ module Smalang
       symbol = SemanticFunctionSymbol.new(
         @symbols.size,
         declaration_id,
-        declaration.name,
+        declaration.name.span,
         parameter_types,
         result_type_id
       )
@@ -460,7 +460,7 @@ module Smalang
       symbol = SemanticParameterSymbol.new(
         @symbols.size,
         declaration_id,
-        declaration.name,
+        declaration.name.span,
         @type_table.id_for(declaration.type, @parsed_module.type_arena),
         declaration.mutability
       )
@@ -473,7 +473,7 @@ module Smalang
       symbol = SemanticLocalSymbol.new(
         @symbols.size,
         declaration_id,
-        declaration.name,
+        declaration.name.span,
         @type_table.id_for(declaration.type, @parsed_module.type_arena),
         declaration.mutability
       )
@@ -513,6 +513,10 @@ module Smalang
     def report(span : SourceSpan, description : String) : Nil
       return if @diagnostic
       @diagnostic = SemanticDiagnostic.new(@parsed_module.source_file, span, description)
+    end
+
+    def report(name : AstName, description : String) : Nil
+      report(name.span, description)
     end
 
     def finish : SemanticModule
@@ -816,7 +820,7 @@ module Smalang
       target = @context.arena.node(node.target)
       case target
       when IdentifierExpr
-        name = @context.parsed_module.source_file.slice(target.span)
+        name = @context.parsed_module.source_file.slice(target.name)
         binding = scope.resolve(name)
         unless binding
           @context.report(target.span, "unknown name '#{name}'")
@@ -885,6 +889,16 @@ module Smalang
           return if @context.diagnostic
           visit_node(@context.arena.child(node.statements, index))
         end
+      ensure
+        @unsafe_depth -= 1
+      end
+    end
+
+    def visit(node : UnsafeExpr) : Nil
+      @unsafe_depth += 1
+      begin
+        value_type = analyze_expression(node.value, @expected_type_id)
+        @context.set_type(current_node_id, value_type) if value_type
       ensure
         @unsafe_depth -= 1
       end
@@ -985,7 +999,7 @@ module Smalang
 
       argument_id = @context.arena.child(node.arguments, 0)
       type_id = type_operand_id(argument_id)
-      unless type_id
+      unless type_id && @context.type_table.supported_source_type?(type_id)
         @context.report(@context.arena.node(argument_id).span, "#{operation_name} expects a supported type name")
         return
       end
@@ -1007,14 +1021,16 @@ module Smalang
     private def type_operand_id(node_id : NodeId) : TypeId?
       case node = @context.arena.node(node_id)
       when IdentifierExpr
-        name = @context.parsed_module.source_file.slice(node.span)
+        name = @context.parsed_module.source_file.slice(node.name)
         @context.type_table.scalar_type_id(name)
       when IndexExpr
         pointer_name = @context.arena.node(node.array).as?(IdentifierExpr)
-        return nil unless pointer_name && @context.parsed_module.source_file.slice(pointer_name.span) == "ptr"
+        return nil unless pointer_name && @context.parsed_module.source_file.slice(pointer_name.name) == "ptr"
         pointee_type_id = type_operand_id(node.index)
         return nil unless pointee_type_id && @context.type_table.scalar_type(pointee_type_id)
         @context.type_table.pointer_type_id(pointee_type_id)
+      when TypeOperandExpr
+        @context.type_table.id_for(node.type_id, @context.parsed_module.type_arena)
       else
         nil
       end
@@ -1034,7 +1050,7 @@ module Smalang
         return
       end
 
-      name = @context.parsed_module.source_file.slice(identifier.span)
+      name = @context.parsed_module.source_file.slice(identifier.name)
       binding = @current_binding_scope.try(&.resolve(name))
       unless binding
         @context.report(identifier.span, "unknown name '#{name}'")
@@ -1278,7 +1294,7 @@ module Smalang
 
       case node = @context.arena.node(node_id)
       when IntegerLiteralExpr
-        @context.parsed_module.source_file.slice(node.span).to_u64?
+        integer_literal_value(node).try { |value| value <= UInt64::MAX ? value.to_u64 : nil }
       when BinaryExpr
         left = checked_constant_uint_value(node.left)
         right = checked_constant_uint_value(node.right)
@@ -1290,6 +1306,9 @@ module Smalang
         when BinaryOperator::Subtract
           return nil if left < right
           left - right
+        when BinaryOperator::Multiply
+          return nil if right != 0 && left > UInt64::MAX // right
+          left * right
         end
       else
         nil
@@ -1381,18 +1400,52 @@ module Smalang
       return if @context.diagnostic || left_type.nil? || right_type.nil?
 
       if left_type != right_type
-        operator = node.operator == BinaryOperator::Add ? "+" : "-"
+        operator = binary_operator_text(node.operator)
         @context.report(node.span, "operator '#{operator}' operands must have matching types")
         return
       end
 
       unless @context.type_table.supports_integer_arithmetic?(left_type)
-        operator = node.operator == BinaryOperator::Add ? "+" : "-"
+        operator = binary_operator_text(node.operator)
         @context.report(node.span, "operator '#{operator}' requires integer operands")
         return
       end
 
       @context.set_type(current_node_id, left_type)
+    end
+
+    def visit(node : SequenceExpr) : Nil
+      node.statements.count.times do |index|
+        return if @context.diagnostic
+        visit_node(@context.arena.child(node.statements, index))
+      end
+      value_type_id = analyze_expression(node.value, @expected_type_id)
+      @context.set_type(current_node_id, value_type_id) if value_type_id
+    end
+
+    def visit(node : IntegerCompareExpr) : Nil
+      left_type_id = analyze_expression(node.left)
+      return if @context.diagnostic
+      right_type_id = analyze_expression(node.right, left_type_id)
+      return if @context.diagnostic
+      unless left_type_id && left_type_id == right_type_id && @context.type_table.supports_integer_arithmetic?(left_type_id)
+        @context.report(node.span, "integer comparison requires matching integer operands")
+        return
+      end
+      @context.set_type(current_node_id, @context.type_table.bool_type_id)
+    end
+
+    def visit(node : RuntimeGuardStatementNode) : Nil
+      condition_type_id = analyze_expression(node.condition, @context.type_table.bool_type_id)
+      return if @context.diagnostic
+      unless condition_type_id == @context.type_table.bool_type_id
+        actual_type = condition_type_id.try { |type_id| type_label(type_id) } || "unknown"
+        @context.report(node.span, "runtime guard condition has type #{actual_type}, expected bool")
+      end
+    end
+
+    def visit(node : TypeOperandExpr) : Nil
+      @context.report(node.span, "type operand is only valid in size_of or align_of")
     end
 
     def visit(node : ArrayLiteralExpr) : Nil
@@ -1632,7 +1685,7 @@ module Smalang
     end
 
     def visit(node : IdentifierExpr) : Nil
-      name = @context.parsed_module.source_file.slice(node.span)
+      name = @context.parsed_module.source_file.slice(node.name)
       binding = @current_binding_scope.try(&.resolve(name))
       unless binding
         @context.report(node.span, "unknown name '#{name}'")
@@ -1647,6 +1700,18 @@ module Smalang
       expected_type_id = @expected_type_id
       return unless expected_type_id
 
+      if synthetic_value = node.synthetic_value
+        if synthetic_value < 0
+          scalar = @context.type_table.scalar_type(expected_type_id)
+          if scalar && scalar.signed && scalar.bit_width > 0 && synthetic_value >= -(1_i128 << (scalar.bit_width - 1))
+            @context.set_type(current_node_id, expected_type_id)
+          else
+            @context.report(node.span, "generated integer literal does not fit type #{type_label(expected_type_id)}")
+          end
+          return
+        end
+      end
+
       if @context.type_table.pointer_type(expected_type_id)
         @context.set_type(current_node_id, @context.type_table.int_type_id)
         return
@@ -1657,8 +1722,8 @@ module Smalang
         return
       end
 
-      literal_text = @context.parsed_module.source_file.slice(node.span)
-      literal_value = literal_text.to_u128?
+      literal_value = integer_literal_value(node)
+      literal_text = literal_value.try(&.to_s) || @context.parsed_module.source_file.slice(node.span)
       unless literal_value && @context.type_table.fits_nonnegative_literal?(expected_type_id, literal_value)
         @context.report(node.span, "literal #{literal_text} does not fit type #{type_label(expected_type_id)}")
         return
@@ -1698,9 +1763,13 @@ module Smalang
     end
 
     private def constant_uint_value(node_id : NodeId) : UInt128?
+      if known_value = @context.constant_uint_value(node_id)
+        return known_value.to_u128
+      end
+
       case node = @context.arena.node(node_id)
       when IntegerLiteralExpr
-        @context.parsed_module.source_file.slice(node.span).to_u128?
+        integer_literal_value(node)
       when BinaryExpr
         left = constant_uint_value(node.left)
         right = constant_uint_value(node.right)
@@ -1712,6 +1781,8 @@ module Smalang
           (left_value &+ right_value).to_u128
         when BinaryOperator::Subtract
           (left_value &- right_value).to_u128
+        when BinaryOperator::Multiply
+          (left_value &* right_value).to_u128
         end
       else
         nil
@@ -1721,7 +1792,7 @@ module Smalang
     private def mutable_array_binding(node_id : NodeId) : SemanticBindingSymbol?
       case node = @context.arena.node(node_id)
       when IdentifierExpr
-        name = @context.parsed_module.source_file.slice(node.span)
+        name = @context.parsed_module.source_file.slice(node.name)
         binding = @current_binding_scope.try(&.resolve(name))
         unless binding
           @context.report(node.span, "unknown name '#{name}'")
@@ -1737,6 +1808,23 @@ module Smalang
 
     private def binding_name(binding : SemanticBindingSymbol) : String
       @context.parsed_module.source_file.slice(binding.name_span)
+    end
+
+    private def integer_literal_value(node : IntegerLiteralExpr) : UInt128?
+      if value = node.synthetic_value
+        return nil if value < 0
+        return value.to_u128
+      end
+      @context.parsed_module.source_file.slice(node.span).to_u128?
+    end
+
+    private def binary_operator_text(operator : BinaryOperator) : String
+      case operator
+      when BinaryOperator::Add      then "+"
+      when BinaryOperator::Subtract then "-"
+      when BinaryOperator::Multiply then "*"
+      else                               raise "unsupported binary operator"
+      end
     end
 
     private def validate_boolean_match_cases(node : MatchExpressionNode) : Bool
@@ -1791,7 +1879,7 @@ module Smalang
         declaration = @parsed_module.arena.node(main.declaration_id).as(FunctionNode)
         return SemanticDiagnostic.new(
           @parsed_module.source_file,
-          declaration.name,
+          declaration.name.span,
           "main must have no parameters"
         )
       end
@@ -1800,7 +1888,7 @@ module Smalang
         declaration = @parsed_module.arena.node(main.declaration_id).as(FunctionNode)
         return SemanticDiagnostic.new(
           @parsed_module.source_file,
-          declaration.name,
+          declaration.name.span,
           "main must return int"
         )
       end

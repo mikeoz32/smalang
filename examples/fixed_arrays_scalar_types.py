@@ -1,0 +1,26 @@
+def main() -> int:
+    signed: array[int, 2] = [9223372036854775807 + 1, 0]
+    unsigned: array[uint, 2] = [18446744073709551615, 0]
+    flags: array[bool, 2] = [True, False]
+    signed_byte: array[int8, 2] = [127 + 1, 0]
+    unsigned_byte: array[uint8, 2] = [255, 0]
+    signed_half: array[int16, 2] = [32767 + 1, 0]
+    unsigned_half: array[uint16, 2] = [65535, 0]
+    signed_word: array[int32, 2] = [2147483647 + 1, 0]
+    unsigned_word: array[uint32, 2] = [4294967295, 0]
+    signed_wide: array[int64, 2] = [9223372036854775807 + 1, 0]
+    unsigned_wide: array[uint64, 2] = [18446744073709551615, 0]
+
+    signed_value: int = signed[0]
+    unsigned_value: uint = unsigned[0]
+    flag: bool = flags[0]
+    signed_byte_value: int8 = signed_byte[0]
+    unsigned_byte_value: uint8 = unsigned_byte[0]
+    signed_half_value: int16 = signed_half[0]
+    unsigned_half_value: uint16 = unsigned_half[0]
+    signed_word_value: int32 = signed_word[0]
+    unsigned_word_value: uint32 = unsigned_word[0]
+    signed_wide_value: int64 = signed_wide[0]
+    unsigned_wide_value: uint64 = unsigned_wide[0]
+
+    return signed_value - signed_value + 42
