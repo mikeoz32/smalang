@@ -52,6 +52,13 @@ describe "Smalang local arrays" do
     BackendSpecHelpers.link_and_run(lowered).should eq(47)
   end
 
+  it "returns array values selected from distinct locals by match" do
+    source = "def select(flag: bool) -> array[int, 2]:\n    first: array[int, 2] = [10, 20]\n    second: array[int, 2] = [30, 40]\n    return match flag:\n        case True: first\n        case False: second\n\ndef main() -> int:\n    first: array[int, 2] = select(True)\n    second: array[int, 2] = select(False)\n    return first[0] + first[1] + second[0] + second[1]\n"
+    lowered = ArraySpecHelpers.lower_successfully(source)
+
+    BackendSpecHelpers.link_and_run(lowered).should eq(100)
+  end
+
   it "compiles and runs the zero-length array example" do
     source = File.read(File.expand_path("../examples/fixed_arrays_empty.py", __DIR__))
     lowered = ArraySpecHelpers.lower_successfully(source)
@@ -426,6 +433,18 @@ describe "Smalang local arrays" do
 
     lowered.success?.should be_false
     lowered.diagnostic.not_nil!.description.should contain("array type exceeds x86_64 stack frame or index limits")
+  end
+
+  it "rejects oversized nested array dimensions even when their storage size is zero" do
+    ["array[array[int, 0], 2147483648]", "array[array[int, 2147483648], 0]"].each do |array_type|
+      source = "def consume(values: #{array_type}) -> int:\n    return 42\n\ndef main() -> int:\n    return 0\n"
+      semantic = ArraySpecHelpers.semantic_result(source)
+      semantic.success?.should be_true
+      lowered = Smalang::IrLowerer.new(semantic.semantic_module.not_nil!).lower
+
+      lowered.success?.should be_false
+      lowered.diagnostic.not_nil!.description.should contain("array type exceeds x86_64 stack frame or index limits")
+    end
   end
 
   it "reports a dynamic out-of-bounds index as a runtime exception" do

@@ -693,6 +693,9 @@ module Smalang
     end
 
     private def storage_size(type_id : TypeId, span : SourceSpan) : UInt64
+      validate_array_dimensions(type_id, span)
+      return 0_u64 if @failure
+
       size = @semantic.type_table.storage_size(type_id)
       unless size && size <= UInt64::MAX
         fail_at(span, "array storage size is not representable as uint")
@@ -703,6 +706,19 @@ module Smalang
         return 0_u64
       end
       size.to_u64
+    end
+
+    private def validate_array_dimensions(type_id : TypeId, span : SourceSpan) : Nil
+      return if @failure
+      array_type = @semantic.type_table.array_type(type_id)
+      return unless array_type
+
+      if array_type.length > Int32::MAX.to_u128
+        fail_at(span, "array type exceeds x86_64 stack frame or index limits")
+        return
+      end
+
+      validate_array_dimensions(array_type.element_type_id, span)
     end
 
     private def storage_alignment(type_id : TypeId, span : SourceSpan) : UInt64
